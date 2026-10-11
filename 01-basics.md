@@ -449,23 +449,39 @@ to save you from a wrong answer.
 | production tile | 2,200 GB/s | 33.55 MB burst | **MEASURED** |
 | **DMA engine** (flat 1-D copy) | **1,775.1 / 1,776.6 / 2,021.3 / 2,028.4 GB/s** | **16 / 64 / 256 / 1024 MB** | **MEASURED** |
 | TPC `memcpy_u8` D2D copy | 1,014 / 1,704 / 1,888 GB/s | 64 / 256 / 1024 MB | **MEASURED** |
-| single DMA node, C++ bench | 1,646 GB/s | 512 MiB operand | **MEASURED, but an OUTLIER — OPEN** |
+| single DMA node, C++ bench | **2,023 GB/s** *(1,646 retracted — see below)* | 512 MiB operand, flat 1-D (2-D control agrees to 0.03 %) | **MEASURED** |
 
 ### The DMA engine is a two-regime curve
 
 | size | DMA engine | vs the TPC stream envelope (2,147) |
 |---|---|---|
-| 16 MB | **1,775.1 GB/s** | −17.3 % |
-| 64 MB | **1,776.6 GB/s** | −17.2 % |
-| 256 MB | **2,021.3 GB/s** | −5.9 % |
-| 1024 MB | **2,028.4 GB/s** | −5.5 % |
+| 16 MB | **1,775 GB/s** | −17.3 % |
+| 64 MB | **1,777 GB/s** | −17.2 % |
+| 256 MB | **2,021 GB/s** | −5.9 % |
+| **512 MiB** | **2,023 GB/s** | −5.8 % |
+| 1024 MB | **2,028 GB/s** | −5.5 % |
 
-All four points passed their precondition (device busy ≥ 99.8 %). **MEASURED.**
+Every point is **DMA-engine**, measured as `2·bytes / device union`, and every point **passed its
+precondition**. **MEASURED.**
+
+**The curve is monotone in size, as it should be**, and the summary is two-regime:
+
+> **~1,776 GB/s at 16–64 MB (82.7 % of the TPC envelope) · ~2,025 GB/s at ≥256 MB (94.3 %).**
+
+> ### ⚠ RETRACTION — the 512 MiB point used to read 1,646 GB/s
+>
+> The 512 MiB row was **published as 1,646 GB/s** and has been **replaced by 2,023 GB/s**. The old
+> figure was **wrong for two independent reasons** (both below). It is recorded here rather than
+> silently swapped, because a corrected claim should show its history — see *"how a wrong curve
+> point survives"* below.
+>
+> **What is unchanged:** every other point, the two-regime shape, and the direction of every
+> comparison.
 
 Two things follow, and **you must say which comparison you mean**:
 
 - **Against the TPC *stream* envelope**, the DMA engine is **~17 % slower at ≤64 MB** and
-  **~5.5 % slower at ≥256 MB**. This is a real, size-dependent penalty, and the ≤64 MB band is
+  **~5.7 % slower at ≥256 MB**. This is a real, size-dependent penalty, and the ≤64 MB band is
   the band a small decode step actually lives in.
 - **Against the TPC *memcpy* path**, the DMA engine is **faster at every size measured**
   (1,776 vs 1,014 @64 MB; 2,021 vs 1,704 @256 MB; 2,028 vs 1,888 @1024 MB).
@@ -488,12 +504,66 @@ alone — which is exactly the failure mode §1.8's reading trap describes.
 called. A TPC copy shows up on the TPC tids; a real DMA transfer shows up on the DMA tids. See
 [`examples/01-basics/trace_engines.py`](examples/01-basics/trace_engines.py).
 
-### The 512 MiB outlier
+### Why the 512 MiB point was wrong, and how it survived
 
-The one C++ bench point (1,646 GB/s on a 512 MiB memcpy) sits **below** the measured 256 MB
-(2,021) and 1 GB (2,028) points. **Do not treat it as the ceiling.** Two untested explanations:
-its copy is **2-D** where the D2 measurements are flat **1-D**, and it **synchronises per
-repetition**, so its time includes launch latency. **OPEN.**
+The old 512 MiB figure (**1,646 GB/s**) was wrong for **two independent reasons**. Either one alone
+would have made it wrong; neither was checked.
+
+1. **A per-repetition wall time was read as a device time.** The C++ bench times **`launch → sync`
+   inside the repetition loop**, so its **622.1 µs** median is a *host* figure that carries the
+   per-repetition launch + sync cost. The device work is **530.5 µs** — and the tell is the
+   statistic this manual keeps insisting on: the DMA **union is identical (530.5 µs) whether you
+   sync once or per repetition**, because the union is blind to the host's sync pattern. The
+   ~90 µs difference is exactly the overhead the bench needs (530.5 + ~90 ≈ 620 µs ≈ its 622.1 µs
+   median). **That an overhead of this order is real was measured separately**, in a torch harness
+   that does the same copy: **322.9 µs per rep** on *that* path. Note the size — it is **3.5×**
+   the C++ bench's, so it **bounds the effect's existence without pinning the bench's number**, and
+   the two must not be quoted as the same quantity. **MEASURED**
+2. **An arithmetic slip in the record.** `1,073,741,824 B / 0.6221 ms` is **1,726 GB/s, not
+   1,646** — a further **4.6 %** error. 1,646 corresponds to **652.3 µs**, which is none of the
+   bench's min (608.1), median (622.1) or mean (635.2) — it was never a bench figure at all.
+
+*Source: `Archive/by-date/2026-10-11/dma_open_items/OPEN-ITEMS-c2-and-512MiB.md` §2 — the
+four-cell arm (`d2b.py`), the overhead harness (`d2b_ovh.py`) and the pre-committed falsifier
+(`D2b_PRE_COMMITTED_FALSIFIER.md`).*
+
+**A hypothesis that died with it.** The point had been attributed to the bench's copy being **2-D**
+where the other measurements are flat **1-D**. Measured directly: flat 1-D **2,022.9 GB/s** vs
+shaped 2-D **2,023.5 GB/s** — **0.03 % apart**. **The compiler flattens a contiguous 2-D memcpy.**
+So the *shape* hypothesis is **dead**, and the *sync* hypothesis is **live and sufficient**.
+
+> **How a wrong curve point survives — worth reading once.** This figure sat in the record through
+> several passes. It survived because:
+>
+> - **a timing artefact looked like a physical result.** "This size is slower" is a *plausible*
+>   finding, and the point arrived with a ready-made mechanism to blame — the bench's copy was
+>   **2-D** where every other point is flat **1-D** — so nothing about it invited doubt. **The
+>   mechanism was false** (0.03 % apart), and the anomaly it "explained" was not real.
+> - **the number was never re-derived.** The division was written once and copied. A **4.6 %**
+>   arithmetic slip is invisible to anyone who does not redo the division, and it is the **second
+>   time this session a figure survived because nobody re-derived it.**
+> - **two independent errors cancelled into one plausible-looking story.** The timing artefact
+>   produced a low number; the arithmetic error made it lower still; and the low number was then
+>   *explained* by a shape hypothesis that turned out to be false. **An explanation is not
+>   evidence for the thing it explains.**
+>
+> The manual's rule follows: **state a number's derivation, not just the number.** A figure whose
+> derivation is written down can be re-checked by a reader in a minute; a figure that is only
+> quoted cannot be re-checked at all.
+
+### The only remaining interpolation is below 16 MB — and it is not a DMA curve
+
+Every DMA-engine point we have is **≥ 16 MB**, and the curve is now monotone across them. **Below
+16 MB we have no DMA-engine measurement at all.**
+
+The only evidence in that range is a **TPC / GEMV** cliff — small-tile matmuls lose bandwidth
+sharply. **That is a TPC phenomenon and must NOT be read as a DMA-engine curve.** The two engines
+have different behaviour at small sizes, and the DMA engine passes its precondition at **16 MB**
+with **1,775 GB/s** — i.e. there is **no measured small-size collapse on the DMA engine**.
+
+> **The trap, stated plainly:** if you need a DMA-engine number for a transfer **below 16 MB**, we
+> do not have one. Do not substitute the TPC cliff for it. Either measure it, or bound the
+> conclusion to "≥ 16 MB".
 
 ### Consequence for any bandwidth-bound floor
 
@@ -598,8 +668,10 @@ That framing is the reusable part, and it explains a result that otherwise looks
 factor.** The model's error and the engine's own two-regime behaviour (§1.6) **agree in shape**,
 which is a good sign for both. **MEASURED**
 
-An earlier single figure ("1.21× optimistic") rested on a mislabelled TPC row and on the 512 MiB
-outlier; it is **replaced** by the pair above. **MEASURED**
+An earlier single figure ("1.21× optimistic") rested on a mislabelled TPC row **and on the
+since-retracted 1,646 GB/s point** (`2,080 / 1,646 = 1.264`). With the corrected 512 MiB value
+(**2,023 GB/s**) the model is only **~1.03× high** at that size — consistent with the ≥256 MB row
+above. The single figure is **replaced** by the size-dependent pair. **MEASURED**
 
 ### The TPC cost model
 
@@ -803,7 +875,7 @@ Stated here so the gaps are visible, and repeated inline above where they matter
 | 3 | **The DMA driver's exact round-robin queue-selection rule** | open — the queue *families* are now documented (§1.2); the *rule* is not. Note the raw thunk path takes a **caller-supplied queue index**, so the round-robin we measured must be chosen **above** the driver | symbol access into the runtime library that assigns the queue |
 | 4 | **Which queue family tids `4073/4082/4083` belong to** | **supported, not settled** — a third family (NIC) exists (§1.2), which is consistent with our split; the **tid→queue mapping was not given** | the profiler's `thread_name` for those tids, against the queue-name table |
 | 5 | **Are the per-TPC AXI rate limiters programmed?** — `mmDCORE0_TPC0_CFG_RD_RATE_LIMIT` `0x400BDA8` / `WR_RATE_LIMIT` `0x400BDAC` exist with `ENABLE` (bit 0) / `SATURATION` (bits 1–8) / `TIMEOUT` (bits 9–16); likewise QMAN `HBW_RD_RATE_LIM_CFG_0/1`, `LBW_WR_RATE_LIM_CFG_0/1` and the XBAR limiters. The corpus found **no programmed values**. | **NEW, open.** If they *are* programmed they would cap per-TPC bandwidth and could explain part of the **2,147 GB/s measured vs 2,450 GB/s nominal** gap | read the registers on a live device, or find the firmware init sequence that writes them |
-| 6 | **The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations | open; a **third** possibility (a rate limiter, item 5) is now visible | a 2-D vs flat-1-D copy at 512 MiB, and a per-rep sync breakdown |
+| ~~6~~ | ~~**The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations.~~ **CLOSED — RESOLVED 2026-10-11.** The figure was **wrong for two independent reasons**: a **per-repetition `launch → sync`** wall time read as a device time (bench median **622.1 µs** against a device union of **530.5 µs**, a ~90 µs per-rep overhead; the **union is identical** whether you sync once or per rep), **and** a **4.6 % arithmetic slip** (`1,073,741,824 / 0.6221 ms` = **1,726**, not 1,646). Corrected value: **2,023 GB/s**, and the curve is **monotone in size**. The 2-D-vs-1-D shape hypothesis is **refuted** (0.03 % apart). See §1.6. | — **done.** *The remaining DMA gap is **below 16 MB**, where we have **no DMA-engine measurement** — and the TPC/GEMV cliff must not be substituted for it.* |
 | 7 | **The MME rate's absolute value — a 2× unit ambiguity** | open | the artifact's own label reads "215 TFLOPS" where the arithmetic gives 430; settling the unit convention settles the number |
 | 8 | **The MME rate at shapes other than the 4096³ family** | open | a rate sweep across shapes, each arm asserting `device_busy ≥ 80 %` |
 | 9 | **`per_op_cost`** — the per-op fixed cost term | open; **the corpus does not define one** | a direct measurement; four candidate meanings exist, three orders of magnitude apart |

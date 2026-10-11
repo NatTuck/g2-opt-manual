@@ -130,7 +130,8 @@ saturation target until that ambiguity is settled.** The clock behind it is sour
 is accurate to 0.5 %**. **MEASURED**; the `262144` constant itself is **INFERRED** (it is absent from
 the binary).
 
-**The structural prefill moves follow from §3 of Chapter 2 (the overlap law):**
+**The structural prefill moves follow from the `MAX` rule — **Chapter 2 §2.6** — whose precondition is
+the four-condition overlap law (**Chapter 2 §2.2**):**
 
 1. **Co-schedule MME with TPC in one recipe** — they share only HBM, which the MME barely touches
    (13 %), and absorb **82 %** of each other. This is the highest-value prefill scheduling move.
@@ -192,9 +193,21 @@ bytes through the DMA engine instead of the TPCs costs 14–24 %"* — is WITHDR
 >    kernel events, **zero** DMA-engine events). Under `torch.compile` the same op **does** go to the
 >    engine. **Whether an op reaches the DMA engine depends on whether it is inside a compiled
 >    region** — check, do not assume. **MEASURED**
-> 2. **A 512 MiB C++ bench point reading 1,646 GB/s sits BELOW the measured 256 MB (2,021) and 1 GB
->    (2,028) points.** It is an **OUTLIER and is OPEN** (two untested explanations: 2-D vs flat 1-D
->    memcpy, and per-rep sync including launch latency). **Do not treat it as the ceiling.** **OPEN**
+> 2. ~~**A 512 MiB C++ bench point reading 1,646 GB/s sits BELOW the measured 256 MB (2,021) and 1 GB
+>    (2,028) points.**~~ **CLOSED — RESOLVED 2026-10-11. The point is RETRACTED and the curve is
+>    monotone.** Two independent reasons, either of them sufficient: **(a)** the bench times
+>    `launch → sync` **inside its repetition loop**, so its **622.1 µs** median is a *host* figure
+>    carrying the per-rep launch+sync cost — the device union is **530.5 µs** and is *identical*
+>    whether you sync once or per rep, and the ~90 µs difference is exactly the overhead it needs
+>    (530.5 + ~90 ≈ 620 ≈ 622.1); **(b)** an **arithmetic slip**: `1,073,741,824 B / 0.6221 ms` is
+>    **1,726 GB/s, not 1,646**, and 1,646 corresponds to **652.3 µs**, which is none of the bench's
+>    min (608.1) / median (622.1) / mean (635.2) — **it was never a bench figure at all.** The
+>    **corrected point is 2,023 GB/s** (flat 1-D **2,022.9** vs shaped 2-D **2,023.5** — **0.03 %
+>    apart**, so the 2-D hypothesis is **dead**: the GC flattens a contiguous 2-D memcpy).
+>    **MEASURED.** *Artifact: `Archive/by-date/2026-10-11/dma_open_items/OPEN-ITEMS-c2-and-512MiB.md`
+>    §2 (the four-cell arm `d2b.py`, the overhead harness `d2b_ovh.py`, the pre-committed falsifier
+>    `D2b_PRE_COMMITTED_FALSIFIER.md`).* **⇒ Do not carve an outlier out of this curve.** Full
+>    treatment, including how the wrong point survived four passes: **Chapter 1**.
 
 ### 3.2.3 The general lesson
 
@@ -491,6 +504,33 @@ is carried **in the scale tensor**, per op.
     mismatches.
   - **`0x80`** — the device reads it as `±0.0`, exactly as `e4m3fn` does.
   - everything else: the two agree on every `|v| ≤ 240`.
+
+> ### ⚠ CPU torch and the HPU DISAGREE about the `E=15` bin — and the HPU is the one that matters
+>
+> **This is measured, not inferred** (a device probe that casts the same bytes both ways):
+>
+> | byte | **CPU torch `float8_e4m3fn` reads** | **HPU reads** |
+> |---|---|---|
+> | `0x78` | **256** | **+inf** |
+> | `0x7C` | **384** | **NaN** |
+> | `0x7E` | **448** | **NaN** |
+> | `0x7F` | NaN | NaN |
+>
+> **CPU `e4m3fn` treats the whole `E=15` bin as *finite* (up to 448) and reserves only `0x7F` for
+> NaN. The HPU reserves the entire bin**, with `M == 0 → ±inf` and `M != 0 → NaN`. **MEASURED**
+>
+> **⇒ Any fp8 reasoning done from CPU byte behaviour is reasoning about the wrong decoder.** A port
+> that validates its fp8 handling on CPU — or that reasons from `torch.finfo(torch.float8_e4m3fn)` —
+> will compute the **wrong poison set**, and will be **confident** about it, because the wrong set is
+> internally consistent and the CPU never objects. This is the plausible wrong route, and it is the
+> reason the poison set is stated here from device measurements rather than from the format
+> definition.
+>
+> **The largest *finite* code on the HPU is `0x77` = 240** — and that is also what the platform's own
+> activation encoder (`cast_to_fp8_v2`) **saturates** to. So **240 is the right saturation target,
+> not the format's nominal 448.** A saturation bound taken from the CPU dtype's `max` would be 448,
+> i.e. ~1.9× too high, and would let the very bytes this section warns about into the operand.
+
 - **The condition is "HPU DECODES the byte", not "the byte is stored".** The upload is **bit-exact**,
   so the bytes are **inert until something decodes them**; the poison is created **at the decode**.
 - **The checkpoint legitimately contains those bytes** — anything quantised at `amax/448` fills the
@@ -580,6 +620,10 @@ the hazard (§3.4.1). **MEASURED / INFERRED**
   **corrupted** (byte 115 → 230).
 - **Fix: before the conversion, if `loaded_weight.dtype == torch.uint8`, decode `2 ** (byte - 127)`
   into a real scale.** Then the `× 2.0` applies correctly.
+- **⚠ The naive decode just given is itself wrong at one byte, and this is the site where it lives.**
+  `2 ** (byte − 127)` returns a finite value at `b = 255`, where the format says **NaN**. That is the
+  defect in §3.4.5 — and this load path is one of the **two live** sites it was fixed at. **A port
+  should route this decode through a helper that RAISES on 255** rather than paste the one-liner.
 - **Do NOT** re-add CPU dequant/requant hacks, and **do NOT** force the MoE onto a different
   execution path. The native path works once the expert scale bytes are decoded. **MEASURED**
 
@@ -600,10 +644,35 @@ For MXFP4 expert weights:
   **even** 64-byte chunks of the dequantized row and `o1` = the **odd** chunks; the `cat` places them
   at columns `[0, C)` and `[C, 2C)`. Equivalently, `cat([o0, o1], -1)` is a flat element interleave
   re-chunked by `[even, odd]`. **MEASURED** (derived from the device, verified at six shapes)
+- **And here is the INVERSE, because a port writing an oracle needs it and it is the part that is
+  easy to get wrong.** With `interleave` the flat element order:
+
+  ```
+  o0  == interleave.view(R, -1, 64)[:, 0::2, :]     # forward: o0 = the EVEN 64-byte chunks
+  perm = [0, 4, 1, 5, 2, 6, 3, 7]                   # inverse (nW = 8): interleave from cat([o0, o1])
+  #      [0, 2, 4, 6, 1, 3, 5, 7]  is WRONG
+  ```
+
+  **The kernel's own comment was right all along**; it was **our inverse permutation that was
+  mis-derived** — and the diagnosis built on top of it (*"the oracle's model of the TPC vector-load
+  layout over an `[R, C]` tensor is wrong"*) was itself the **mis-diagnosis**. With the correct
+  permutation a layout-aware oracle matches **exactly** (0 of 1,024 bytes differ). **MEASURED**
+  *(`analysis/perm_probe.py`; also `T7` of the replacement `test_fp4.py`.)*
+
+  **⇒ This is the manual's own reading lesson in miniature: a wrong inverse made a *correct*
+  implementation look wrong, and the wrong conclusion is the one that got written down. When a layout
+  disagrees with your oracle, check your inverse before you indict the kernel.**
 - **`fp4_dequant_fwd_gaudi2` is bit-exact** on the full domain (all 256 byte values × all 256 `k`
   values, 8 388 608 bytes) and at six production shapes, including the consumer operand. **MEASURED**
 
-#### The exponent fold is UNCLAMPED — a LATENT defect, not an active one
+#### The exponent fold was UNCLAMPED — **FIXED**, APPLIED to the tree, and reviewed
+
+> **Status: FIXED, APPLIED to the shipping tree, and independently REVIEWED.** The fix is
+> **a load-time assertion as the primary defence (zero runtime cost)** plus **a magnitude saturation
+> to `0x77` as belt-and-braces**, and both are now in the tracked kernel. The review found **three
+> real problems in the fix** — one of them a behaviour change the fix's own tests did not cover — and
+> **all three are addressed**. The findings are kept in the status block at the end of this
+> subsection, because they are the most transferable part of the story.
 
 The kernel folds the scale by **adding `k` to the exponent field** and does **not** clamp the upper
 end. Two ways that could bite: the folded exponent `t = exp + k` reaching **15** (the reserved bin,
@@ -629,8 +698,113 @@ sign bit. **We checked whether it can actually happen, and it cannot — on this
 > a chance to bite. **That is exactly the shape of defect that breaks on a different checkpoint** — one
 > with `amax ≥ ~768` in any block.
 >
-> **Recommendation: add the `t ≥ 15` upper clamp anyway.** It is cheap, and the failure mode is
-> **silent** (a poison byte in the operand, §3.4.1). Defensive work, not a bug fix.
+> **Recommendation (now adopted): add the `t ≥ 15` upper clamp anyway.** It is cheap, and the failure
+> mode is **silent** (a poison byte in the operand, §3.4.1). Defensive work, not a bug fix.
+
+**And the `t ≥ 16` failure mode is worse than "a poison byte": it is a silent WRONG NUMBER.**
+Measured on the consumer: `t = 16, mant = 0` emits `0x80`, which the HPU decodes as **`−0.0` — i.e.
+zero**; `t = 17` emits `0x84` → **`−0.0078`**, a small *negative* value where the true magnitude is
+≥ 256. That is a **silently sign-corrupted number**, not a NaN — and a silent zero is much harder to
+notice than an inf or a NaN, which is exactly why this needed a gate rather than an inspection.
+
+**The fix, and its measured cost.** Two variants were built and timed at the production tile
+(`[4096, 2048]`, 40 launches = 960 device events per arm), **three times each**:
+
+| arm | instr/iteration | `dur` median | per-event span (3 runs) | Δ span | ms/step @ 387 launches |
+|---|---|---:|---|---:|---:|
+| **unfixed** (the pre-fix kernel) | 68 | 61.281 µs | 62.186 / 62.173 / 62.173 µs | — | 24.06 |
+| exponent clamp (`t ≤ 14`) | 70 | 63.920 µs | 64.594 / 64.603 / 64.603 µs | **+2.41 / +2.43 / +2.43 µs (+3.9 %)** | 25.01 (+0.95) |
+| **magnitude saturation → `0x77`** (applied) | 72 | 67.760 µs | 68.636 / 68.543 / 68.543 µs | **+6.45 / +6.37 / +6.37 µs (+10.3 %)** | 26.53 (+2.47) |
+
+**The three runs agree to ±0.1 µs, and the delta is visible in `dur` AND in the launch span** — so it
+is not a one-run artefact. The same deltas hold at `8192×1024` and `12288×2048`: relative deltas
+3.93 / 4.03 / 4.51 % and 10.27 / 10.41 / 10.90 % — a spread of **~0.6 pp**, *not* the "0.1 %" an
+earlier draft claimed (only the absolute span between the two *small* shapes holds to 0.1 %).
+
+> **The cost is NOT predicted by the instruction-count slope, and that is the engineering lesson.**
+> The project's measured slope of ~0.81 µs per instruction/iteration predicts **+1.6 µs** for the
+> clamp and **+3.2 µs** for the saturation; the measurements are **+2.4** and **+6.4 µs**. The added
+> instructions sit on the decode's **dependency chain** (`t → over → mag → or → store`), not in
+> parallel issue slots, so each costs ~1.2–1.6 µs rather than 0.81. **A safety fix for a *latent*
+> defect that sums to 2.5 ms/step of device time deserves an explicit decision, not a reflex "add the
+> clamp".** **MEASURED**
+>
+> **Honest caveat on that explanation** (from the review): reproducibility *supports* the
+> dependency-chain story but does not test it — the marginal cost is superlinear (2 instructions →
+> +2.4 µs, 4 → +6.4 µs), which the chain story explains but which register pressure or a VLIW
+> bundling change would explain equally. **A fourth control arm with 2–4 *independent* dummy
+> instructions would separate "on the chain" from "any instruction".**
+
+**How much of that reaches the wall — and the honest bound on it.** An added `D ≈ 6.4 µs` per launch
+is only exposed if the device has a gap to absorb it. Measured from the existing decode trace
+(1,548 launches; `analysis/exposure.py`; **no engine run**): the fp4 launches are a **packed critical
+chain** — **union/sum = 0.965** (90.501 of 93.735 ms), the **median gap to the next launch is
+−2.14 µs**, and **1,376 of 1,547** gaps are **≤ 0**. So **88.9 %** of `D` is exposed on the *device*
+timeline: **2.20 ms/step** (against a summed-op bound of 2.47 ms/step).
+
+> **The WALL cost is an ESTIMATE, not a measurement** — pinning it down needs an engine run. If the
+> dequant's device busy is 22.6 ms/step and its contribution to `merged` is 12.086 ms/step, then ~53 %
+> of it is inside the critical region, giving **~1.2 ms/step ≈ 1.4 % of an 88 ms step.** Treat the
+> **2.20 ms/step device bound as measured** and the **~1.2 ms/step wall figure as an estimate**.
+> **The decision that follows is explicit, not a reflex:** the clamp costs ~2.2 ms/step of device
+> time to guard a condition that **cannot fire on this checkpoint** (256× margin), while the load-time
+> assertion alone costs **0 ms/step**. Both are in place; reverting the clamp is one patch reversal
+> plus a rebuild. **MEASURED / ESTIMATED**
+
+**Why the assertion is primary.** The overflow needs `k ≥ 6`, i.e. a scale byte ≥ 133. A **load-time
+assertion** makes the defect **unreachable at zero runtime cost** — so the saturation is a
+**deliberate correctness-over-speed choice**, not the thing that buys the safety. **The assertion is
+written on the scale VALUE, which is the form the loader actually has in hand:**
+`max(scale) ≤ 2⁵ = 32.0` ⟺ exponent byte `≤ 132` ⟺ `k ≤ 5` ⟺ `t ≤ 14`. On this checkpoint the global
+max is **0.125 = 2⁻³**, i.e. a **256× margin** — and the guard was verified to **fail** when it should
+(`2⁵` passes, `2⁶` raises). Keep both if you want safety by construction *and* safety in fact.
+
+> **Status block — what "FIXED" does and does not mean here.**
+> - **APPLIED to the shipping tree, deliberately.** Both protected artifacts are **superseded by
+>   design and recorded**: kernel source `9a16d2f7… → b60ff0b5…`, `.so` `0fffb589… → e8622c21…`. The
+>   pre-fix source is preserved **byte-identically** in the archive *and* as the `base` arm, so **RED
+>   stays reproducible after the apply**; the applied diff is `applied.patch`. **⇒ Do not check a
+>   future tree against the old md5s** — they describe a state that no longer exists, and an md5
+>   guard-rail that is not updated becomes a false negative.
+> - **The shipped binary is the verified binary.** A cross-library byte comparison of the **shipped
+>   `.so`** against the verified saturation arm is **IDENTICAL at all six shapes** (`2×256`,
+>   `12288×2048`, `24576×1024`, `4096×4096`, `4096×2048`, `8192×1024`; 0 differing bytes of
+>   25,165,824 per output at the large shapes). Post-apply: `shipped` **PASS**, saturation arm
+>   **PASS**, unfixed arm **FAIL** (544 failing `(byte, k)` pairs, first `(6, 6)`: expected `0x77`,
+>   got `0x78`).
+> - **The load-time assertion is `max(scale) <= 32.0`** (threshold derivation above), and its margin
+>   is measured: on the real checkpoint the global max is **0.125 = 2⁻³** ⇒ **256× margin**. It **can
+>   fail** (verified: `2⁵` passes, `2⁶` raises), costs **zero runtime**, and converts a silent
+>   corruption into a loud load-time failure. **Limitation, accepted:** it lives at **one caller**, so
+>   a future quantiser or a different checkpoint path bypasses it — which is exactly why the kernel
+>   clamp is there as belt-and-braces rather than instead of it.
+> - **Independently reviewed — the review found three real problems in the fix, all since addressed.**
+>   1. **A behaviour change the fix's own tests did not cover.** The saturation as first written
+>      (`mag = over ? 0x77 : mag`, applied *after* the magnitude is zeroed for `idx == 0`) turned an
+>      **exact zero into ±240** for a zero nibble at `k ≥ 15` — a value the *unfixed* kernel got
+>      right, and **no test covered it** (the identity test stops at `k = 5`; the zero-nibble tests
+>      use `k ≤ 8`). Fixed by gating the flag on the nonzero predicate
+>      (`over = sel_geq(t_raw, 15, nz, 0)`). **⇒ A fix that replaces a whole expression can change an
+>      input class nobody tested — and "it changes nothing that was already correct" is a claim that
+>      needs a test per input class, not one boundary probe.**
+>   2. **The guard is INERT at the top of the range.** `t_raw = exp + k` is an **8-bit** add, so for
+>      `k ≥ 119` (scale byte ≥ 246) it wraps negative, the flag never fires, and **all** arms emit the
+>      subnormal floor. Not a regression — but it **falsifies any absolute "`E=15` is now
+>      unreachable"**: that holds for `t_raw ∈ [15, 127]` only, and `k` legitimately reaches 127 for
+>      the largest e8m0 scale (byte 254). **The load-time assertion closes this hole; the kernel clamp
+>      alone does not.** *(This is why the two defences are not redundant.)*
+>   3. **The headline defect was not gated.** The test credited with catching the sign-clobber defect
+>      **passed on the unfixed kernel**, because its oracle is **arm-dependent** — `want` encodes the
+>      arm's own rule, so `got == want` is a self-consistency check, not a test. Only the reserved-bin
+>      defect was genuinely RED. Fixed by asserting the **contract** directly (`sign == 0 ⟹ bit 7
+>      clear`; `t ≥ 15 ⟹ byte ∈ {0x77, 0xF7}`).
+>   **Also found and fixed:** the replacement `test_fp4.py` had **not been installed** in the shipping
+>   directory — the old, broken test was still in place, so the shipped kernel was
+>   **fixed-but-unvalidated** until that was corrected.
+> - **The correctness check that matters:** on a 12,288 × 2,048 tensor with `k ∈ [−9, 0]` (the
+>   checkpoint's range) and with `k ∈ [−8, 5]` (the clamp's own boundary), **all three arms are
+>   byte-identical** — 0 differing bytes in 25,165,824 per output. **The clamp fires only at
+>   `t ≥ 15`; below that the emitted byte is bit-identical to the unfixed kernel.**
 
 **The lower bound: `k < −8` DOES occur — and it is benign, not a poison.** The kernel's own comment
 only reasons about the lower bound ("exact for `k ≥ −8`"). It is exceeded: **1,070 routed-expert
@@ -638,15 +812,70 @@ bytes**, and **365,620 shared-expert bytes** down to `k = −13`. What happens t
 corruption**: the subnormal branch's `sh2 = max(t + 2, 0)` makes the emitted code **saturate to the
 e4m3fn subnormal floor `2⁻⁹`** (byte `0x01`), the smallest value the format can represent — an
 **overestimate** of weights whose true scaled value is below the floor, not a poison code.
-Magnitude-tiny. Recorded so nobody re-derives it. **MEASURED**
+Magnitude-tiny. **Confirmed on device at `k = −9, −10, −13, −20`** — monotone, the emitted byte is
+`0x01`/`0x02`, **never `0` and never an `E=15` code**. **Deliberately NOT changed:** it is a
+**modelling choice, not a defect**, and changing it would alter currently-correct outputs, so the
+error is left in the safe direction and bounded. Recorded so nobody re-derives it. **MEASURED**
 
-> **⚠ And a test-staleness warning worth carrying.** A `test_fp4.py` in the source tree calls
-> `fp4_dequant(b)` with **one** argument against the shipping **two**-argument schema, and its
-> reference implementation **ignores `kexp`** entirely. **It therefore does not validate the shipping
-> kernel.** Do not treat a green `test_fp4.py` as evidence about the kernel you are shipping.
-> **MEASURED**
+> ### ⚠ The lesson worth keeping: **a green test is not evidence about the thing you think it tests**
+>
+> Both defects in this subsection — **the fold above and the e8m0 decode below** — were **live in
+> shipped code behind a passing test.** The story has **two halves**, and both belong in a manual,
+> because together they are the most concrete instance we have of the rule that **an instrument which
+> cannot fail is not evidence**.
+>
+> **First half — the old test could not validate anything.** The shipping `test_fp4.py`:
+> - called `fp4_dequant(b)` with **one** argument against the **two**-argument schema;
+> - its reference implementation **ignored the scale term (`kexp`) entirely** — so it never tested
+>   scale folding at all;
+> - used the **wrong exponent bias** (8 where the kernel encodes 7), i.e. off by one exponent field
+>   even at `k = 0`; and
+> - compared the outputs against the low/high nibbles **in input order**, when the kernel emits the
+>   `[o0 ‖ o1]` chunk interleave — so every byte would mismatch.
+>
+> **It passed while the kernel emitted poison.** "Stale" understates it: it could not have caught
+> anything.
+>
+> **Second half — the replacement gate was itself decoration on its first attempt.** Its byte-255
+> check used `torch.isfinite`, and **`inf` is not finite** — so it **passed on the defect it existed
+> to catch.** It was caught only by running the gate in **break mode** against the unfixed code, which
+> is the entire reason to build a break mode.
+>
+> **The replacement, measured — and this is the shape a real gate has:**
+>
+> | arm | result |
+> |---|---|
+> | **unfixed** kernel (the `base` arm — byte-identical to the pre-fix source) | **FAIL, exit 1** — 5 failing checks, incl. **1,396,623 poisoned bytes** on a tensor whose `k` drives `t` to 17 |
+> | fixed arm A (exponent clamp) | **PASS, exit 0** |
+> | fixed arm B (magnitude saturation) | **PASS, exit 0** |
+>
+> **All three arms share one library**, so **RED and GREEN come from the same binary** and the only
+> difference is which kernel the op resolves to. That is what makes the RED result evidence rather
+> than a claim.
+>
+> **⇒ What to carry into a port.** For any gate you write on a format, a layout or a decode:
+> **(a)** run it against the *unfixed* code and require it to fail — if it cannot fail, it is not a
+> gate; **(b)** compare against a reference that consumes **all** the inputs (the scale term here was
+> silently dropped for months); **(c)** check the *layout* assumption explicitly, because a wrong
+> layout assumption makes every byte mismatch and hides a real pass; and **(d)** prefer a
+> **structural** check (the pattern must not exist outside the helper) over a value check, because a
+> value check moves with the data. **MEASURED**
+>
+> **And a third instance, from the review of the fix itself.** The gate's *headline* check — the one
+> credited with catching the sign clobber — **passed on the unfixed kernel**, because its oracle was
+> **arm-dependent**: `want` was produced by the code under test, so `got == want` was a
+> self-consistency check. **A gate whose expected value is produced by the thing being tested is not a
+> gate** — the same failure as the two halves above, one level up, and it survived until the check was
+> made to assert the **contract** directly (`sign == 0 ⟹ bit 7 clear`).
 
-#### The e8m0 hand decode is WRONG at byte 255 — a real defect, LATENT on this checkpoint
+#### The e8m0 hand decode was WRONG at byte 255 — **FIXED** and reviewed
+
+> **Status: FIXED, and independently REVIEWED — and the review found the fix itself broken as first
+> written.** The fix routes the decode sites through **one helper**, uses `torch.float8_e8m0fnu` where
+> it can, and **raises** on byte 255 rather than substituting a value. The review then found **(a) a
+> regression that broke the decode path outright** and **(b) that the class was not deleted** — both
+> since fixed. See the status block below; the findings are kept because they are the transferable
+> part.
 
 **The same class as the unclamped fold above, found in the same corpus pass — and this one is a defect
 in our own loader.**
@@ -674,7 +903,61 @@ right and we are wrong.** **MEASURED**
     group by it. `inf * 0 == NaN`, so one byte-255 group **silently poisons that group's weights** —
     and nothing downstream flags an `inf` *scale* as a format error, because a scale is just a
     number. **The failure mode is silent in the scale's own path.**
-- **Fix is one condition**: treat `255` as NaN (or refuse it) in the decode. Cheap; do it.
+- **The fix, and the sweep that found its real size.** A sweep for the *pattern* (an unconditional
+  `2 ** (b − 127)`) found **four sites, not one**:
+
+  | site | path | live? |
+  |---|---|---|
+  | the block-fp8 scale load | called from three quantisation methods | **LIVE** — load-time |
+  | the routed-expert e8m0 load | `_register_v4_routed_packed > _scale_float` | **the `uint8` branch is DEAD for this checkpoint** — every scale tensor in it is stored as **`F8_E8M0`** (**33,792 expert + 375 non-expert**, read from the safetensors headers), so `_scale_float` takes its dtype branch and never reaches the hand decode. Reached only through the **upstream loader's uint8 view** — i.e. via the weight wrapper, which *is* the site that reads those 8.86 × 10⁹ bytes |
+  | the pure-Python dequant fallback | the non-custom-op control path | not production |
+  | the fp4→fp8 pre-dequant helper | not on the production path | not production |
+
+  **All four now route through one helper**, so the *class* is deleted rather than the instance
+  patched four times. **That is the argument for fixing a class rather than an instance: the sweep
+  found four where inspection had found one.** **MEASURED**
+- **And the sweep still undercounted — the review is what found out. A pattern sweep finds the
+  *spelling* you searched for, not the pattern.** The review found **at least six** hand-rolled e8m0
+  decodes, including one in a **different model** (`gptoss_mxfp4.py`: `scales − 127` then
+  `torch.ldexp`, so byte 255 → `inf` — **the same defect**, invisible to the gate's structural check
+  because it is not spelled `pow(2.0, …)`) and one in this file that **silently accepted** `0xFF`
+  instead of refusing it. **Widen the search to the arithmetic the pattern implies** (`exp2`,
+  `ldexp`, `2.0 **`, `<< 23`), not the call it happens to be written as. All now route through the
+  helpers. **MEASURED**
+- **The loader RAISES on byte 255** rather than propagating NaN or substituting a finite value.
+  Rationale, in order: a NaN scale is unambiguously a corrupt checkpoint (no MX quantiser emits one)
+  and the load path's job is to fail loudly; propagating defers the failure to inference, where NaN
+  logits are ~43 layers from one bad byte; and **never substitute a finite value** — that converts a
+  detectable data error into a wrong number.
+- **The dtype can be used after all — for the *conversion*.** `is_supported_type` rejects `e8m0`
+  *and* `e4m3fnuz` (§3.4.1), but that is a constraint on **allocating an HPU tensor**, not on
+  converting one: `bytes.view(torch.float8_e8m0fnu).float()` works and gives NaN for 255. So the fix
+  prefers the dtype (it cannot drift) with a guarded arithmetic fallback.
+- **Cost: one `max()` reduction (0.32 ms per 15.7 M bytes), on the `uint8` path only.**
+
+> **Status block — what "FIXED" does and does not mean here.**
+> - **The change is to tracked code** in the port's own source tree (**a 106-line diff**).
+> - **The fix as first written BROKE the decode path — and the review caught it by executing, not by
+>   reading.** The helper was imported **function-locally**, so the three call sites that use it had
+>   **no binding at all** and raised `NameError` for **every** uint8 input: strictly worse than the
+>   bug it fixed, on a path the port's own comments call live. Fixed by a **module-level import**.
+>   **⇒ Two lessons: import scope is not a style question when one helper is called from several
+>   functions; and a gate that imports the helper directly and never imports the *calling module*
+>   cannot see this class of break at all.**
+> - **The gate had a tautology on its PASS path.** Its "all finite bytes match the dtype" check
+>   compared the helper's own body against itself — it has content only in break mode. **Use an
+>   independent reference** (a literal 256-entry table, or `2.0 ** (b − 127)` in float64).
+> - **A structural AST check** accompanies the fix, so the pattern cannot silently reappear outside
+>   the helper — a gate on the *class*, matching the fix. **Its limits, stated:** it matches **one
+>   spelling** (`pow(2.0, x − 127)`), so `exp2`, `2.0 **`, `ldexp` and `<< 23` all evade it — and
+>   **two of those existed in the tree**. Widen it when you copy the idea.
+> - **The refusal's blast radius is the whole load, and that is a design choice worth making
+>   consciously.** The guard is on the **whole tensor**, so **one** `0xFF` byte anywhere in an 8.9
+>   G-byte scale population aborts the load of the entire model, with no way to skip or repair. If any
+>   checkpoint or vendor tool uses `0xFF` as "unset"/padding, that converts a working load into a hard
+>   failure. **Prefer a NAMED exception, report the offending indices (not just the count), and give
+>   the operator a switch.** *(The policy itself is now shared by both the value and the exponent
+>   representations, so at least it is applied uniformly.)*
 
 > **Why we are hand-rolling this at all — and why that makes it worth getting right.** The hand decode
 > is **forced, not a shortcut**: two fp8-family dtypes are unusable on this stack. `float8_e4m3fnuz`
@@ -752,7 +1035,7 @@ strategy and the coalescing trap: **Chapter 2 §2.4** and **Chapter 1 §1.4.3**.
   compiled programs is **not** "one per region kind" — it is **per layer**.
 - **Per-layer constants are computed *inside* the graph.** A layer index, a per-layer byte offset, a
   per-layer buffer slice: any of these is an integer in traced code, and therefore a specialization
-  key (Chapter 1).
+  key (Chapter 1 §1.4.2).
 - **⇒ The compiled-program count is `O(n_layers × region-kinds × buckets)`**, not
   `O(region-kinds × buckets)`. For a 43-layer model that is a factor of **43** on the layer axis alone,
   before any region-kind or bucket multiplier.
@@ -783,8 +1066,9 @@ rather than with the number of region kinds.
 > - **A later archived census** (`Archive/by-date/2026-10-11/node_law/out/*.json`) counts **83–130
 >   distinct recipes per 4-step trace** across that archive's runs — again well below 194.
 > - **The units are also not the same object.** "Recipe", "compile id" and "recipe handle" are three
->   different things and are counted on different clips (see Chapter 1's vocabulary section). A count
->   quoted without its unit and its clip is not a count.
+>   different things and are counted on different clips (see **Chapter 2 §2.1** for the four nouns,
+>   and **Chapter 2 §2.5.4** for how the three counts differ). A count quoted without its unit and
+>   its clip is not a count.
 
 **What survives, and what is the point of the example:** the *scaling* — the count is per-layer, and
 most instances serve exactly one layer. That is what a port of a deep model must budget for. **The
@@ -988,18 +1272,25 @@ as valuable as the wins.**
 
 ## 3.9 The UNKNOWN register
 
-Stated, not omitted. Each has a note on what would settle it. **Three entries have been closed since
-the first draft — items 2, 10 and 14 — and all are kept in place, marked CLOSED, so the resolutions are
-visible rather than silently deleted.** *(Items 10 and 14 state the fp8 format as `e4m3fn` codes,
+Stated, not omitted. Each has a note on what would settle it. **Four entries have been closed since
+the first draft — items 2, 4, 10 and 14 — and all are kept in place, marked CLOSED, so the resolutions
+are visible rather than silently deleted.** *(Items 10 and 14 state the fp8 format as `e4m3fn` codes,
 bias 7. That is the **configured default** — the bias is **selectable**; see the bias subsection in
 §3.4.1.)*
+
+> **The habit that keeps this honest, and it is cheap.** When a later section **corrects or supersedes**
+> a pattern, the **earlier** section that **prescribes** it must be re-checked **in the same pass**. A
+> chapter that says *"do X"* in §A and *"X is wrong"* in §B is **worse than one that says nothing**,
+> because the reader stops at §A. A mechanical check — *extract every `§X.Y` reference and assert the
+> target heading exists* — found four broken references in this chapter, one of them **§3.4.4
+> prescribing exactly the decode that §3.4.5 says is wrong**. Run that check after any edit.
 
 | # | UNKNOWN | what would settle it |
 |---|---|---|
 | 1 | **SRAM size.** The only figure anywhere ("48 MB") is marked **unverified by its own erratum**; do not import it. What *is* measured is that SRAM staging exists and is visible in the compiler's own output (`"allocation": "SRAM"`). | A vendor document that survives cross-checking, or a staging-size sweep. |
 | ~~2~~ | ~~**L1/L2 cache sizes and behaviour.**~~ **CLOSED — RESOLVED 2026-10-11. There is NO L1/L2 cache.** The corpus is consistent: the TPC's memory hierarchy is **HBM (96 GB) → 48 MB SRAM (on-die, shared, compiler-scheduled staging) → per-TPC local memory (1 KB scalar + 80 KB vector per core, private, kernel-programmer-managed)**, and **no cache level exists between them**. The TPC local memory is *not* the SRAM and is *not* a cache. *(tier **B**, `habana-docs`, `.../TPC/TPC_User_Guide/Processor_Architectural_Overview.html`, sha256 `0463528f9e4b5ec36bf7595933169066a76d2c375cca391d2e26afcfc21cc038`.)* **⇒ A bandwidth model must not assume reuse from a cache: reuse has to be engineered into the dataflow (tiling into local memory / SRAM) or it does not happen.** *Substantive material is routed to Chapter 1; this entry is closed here so the register is not stale.* | — **done** |
 | 3 | **Whether the TPC or DMA cost models consume the *general* HAL reader** (2000 MHz) rather than an engine-specific one (1650 MHz). If they do, they are **~21 % optimistic**. The MME has its **own** reader at 1650 MHz and is accurate to 0.5 %; the general reader's consumption by the other engines is **UNCHECKED**. | Disassemble the TPC/DMA cost models' clock path the way the MME's was done. |
-| 4 | **The 512 MiB C++ bench point (1,646 GB/s)** — an outlier below the measured 256 MB and 1 GB points. Two untested explanations (2-D vs flat 1-D memcpy; per-rep sync including launch latency). **OPEN** | A 1-D version of the same bench, and a version that syncs once outside the rep loop. |
+| ~~4~~ | ~~**The 512 MiB C++ bench point (1,646 GB/s)** — an outlier below the measured 256 MB and 1 GB points.~~ **CLOSED — RESOLVED 2026-10-11. The point is RETRACTED; both falsifiers ran.** **(a)** the bench **syncs per repetition**, so its wall time carries the launch+sync overhead (device union **530.5 µs** vs bench median **622.1 µs**, the ~90 µs gap being exactly that overhead); **(b)** the published number is an **arithmetic error** — the true quotient is **1,726 GB/s**, and 1,646 corresponds to **652.3 µs**, which is no bench statistic at all. The **corrected point is 2,023 GB/s** (flat 1-D 2,022.9 / shaped 2-D 2,023.5 — the **2-D hypothesis is DEAD**, 0.03 %) and **the curve is monotone**. *Artifact: `Archive/by-date/2026-10-11/dma_open_items/OPEN-ITEMS-c2-and-512MiB.md` §2; full treatment, including how the wrong point survived four passes, in **Chapter 1**.* | — **done** |
 | 5 | **Whether the engine's cross-engine intersections are real concurrency** (§3.6.3). | An arm that **varies** the deciding quantity — the one that ran held it fixed, making its own falsifier unevaluable. |
 | 6 | **The ~21 ms host constant's sync-wait vs host-compute split.** | A runtime change so `synchronizeEvent` carries the calling OS tid, or a `record_function` at the point the C++ runtime issues the sync. |
 | 7 | **The per-recipe / per-step / per-queue split of the DMA window's fixed component.** Every sweep arm held nodes, recipes and queues constant, so it is **confounded**. | A sweep that varies those independently. |
@@ -1055,6 +1346,10 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 19. Check the dead-end register (§3.8) before starting anything on the list.
 20. For a fused-expert idea, **first check whether the op reads the routed experts or all local
     experts** — 12.9× vs 1.21×.
+21. **When you fix a defect, sweep every place that *prescribes* the pattern you changed** — the
+    loader, the tests, your own notes, and the docs. In §3.4.5 each of the three defects was found by
+    reading **a different file from the one that was wrong**, and one of them was a document telling a
+    reader to paste the broken line.
 
 ---
 
@@ -1068,3 +1363,7 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 - **No claim that cross-engine overlap is absent *or* present.** The 12.531 ms figure is UNRESOLVED.
 - **No SRAM size, no L1/L2 behaviour** (UNKNOWN).
 - **No claim that removing the `cat` would help** — see §3.3.5; it is a recorded dead end.
+- **No claim that a fix in the tree is a *validated* fix.** The §3.4.5 review found the replacement
+  test uninstalled, the headline check arm-dependent, and the first version of the fix changing an
+  untested input class. **Re-run the contract on your own build; do not inherit a status block as
+  evidence.**

@@ -416,7 +416,8 @@ after warmup, at whatever count that implies"*; a rising count in the steady sta
 `[DSv4F]` — one workload, one box. Not a general law.
 
 The port's recorded scale was **~194 distinct recipes per decode step, of which 160 were used by
-exactly one layer** — i.e. almost all of the specialization was **per-layer**, so the count scaled with
+exactly one layer** — these are **recipes**, not the 160 *windows* of §2.9 rule 8; the digits coincide
+and the objects do not — i.e. almost all of the specialization was **per-layer**, so the count scaled with
 the number of layers rather than with the number of region kinds. That is [Chapter 0](00-tldr.md)'s
 fact 3 made concrete: an N-layer model pays roughly N per-layer graphs before anything is done wrong.
 
@@ -703,7 +704,7 @@ gate and a number that fails it must never appear in the same column.
 
 ---
 
-## 2.9 Measurement discipline — seven rules, each with the instance that produced it
+## 2.9 Measurement discipline — eight rules, each with the instance that produced it
 
 These are stated as rules because each one cost us a wrong number.
 
@@ -793,6 +794,65 @@ An arm that allocated ~2.3 GB/step of fresh output buffers was paced by the host
 — device busy **46 %**, queue drained at `H_end`. Fixed by reusing a preallocated output buffer. The
 enqueue cost measured on its own is only ~8.5 µs/op. **MEASURED.** Before concluding "the step is
 host-bound", check that your arm is not simply allocating.
+
+
+### Rule 8 — A factor that is exactly the step count is a **normalisation**, not a contradiction
+
+**Two counts of the same thing that agree on the moments but differ by exactly the number of steps are
+one measurement, not two.** Agreeing to four digits on the median *and* the total is the tell — a
+genuinely second mechanism would not reproduce both.
+
+**The instance, and it cost the project a whole session of carrying a false contradiction.** Two of its
+own notes reported the same window population:
+
+```
+note A:  total = 1.980 ms/step   n_windows/step = 40.0   median = 49.52 µs
+note B:  windows = 160           total = 1.980 ms/step   median = 49.52 µs
+```
+
+Same median, same mean, same max, same total — and a count differing by a factor of **4**, which is
+exactly the number of steps in the trace. **They are one object at two normalisations:** one source
+prints the **raw count over the whole 4-step trace** (160) while normalising the *total* by steps; the
+other prints the **per-step** figure (40). **160 = 4 × 40.** Both artifacts reproduce from the trace to
+four digits. **MEASURED.**
+
+**The object, named precisely, with its units:** the **`fp4_dequant` × `GEMM` intersection windows** —
+the intervals in which a TPC `fp4_dequant` execution and an MME `GEMM` execution are simultaneously in
+flight. There are **160 of them in the 4-step trace, i.e. 40 per step**, totalling **1.980 ms/step**,
+median **49.52 µs**.
+
+**The histogram, so you can see where both numbers come from:**
+
+| window duration | whole-trace n | per step |
+|---|---:|---:|
+| < 10 µs | **0** | 0 |
+| 20–50 µs | **124** | 31.0 |
+| 50–51.85 µs | **36** | 9.0 |
+| **total** | **160** | **40.0** |
+
+Every window is 20–51.85 µs and **none is below 10 µs**; median 49.52 µs, mean 49.50 µs, max 51.85 µs.
+The two buckets are the instrument's own split at 50 µs — the population is a **narrow spread straddling
+50 µs**, not two separated modes. **MEASURED.**
+
+**What the discrepancy was *not* — check all three before accepting "two mechanisms":**
+
+* **not a threshold** splitting or merging windows — no threshold appears in either instrument, and
+  there are **zero** sub-10 µs windows for a threshold to act on;
+* **not launches versus windows** — the number of launches carrying both families is **297**
+  (74.2/step), a different quantity entirely;
+* **not a different code state** — both instruments read the same trace.
+
+> **"One window per layer" — approximately, not exactly.** The model has **43 layers** and the
+> measurement gives **40 windows per step**, so the phrase is a **40/43 ≈ 93 % near-match, not a
+> derivation**. Write it as *"≈ one per layer (40/43)"*, and say that **what the missing 3 are is
+> unexplained**. An approximate match must never be written as an identity — that is the failure mode
+> rule 3 documents one level up: a number that *looks like* a mechanism is not one until the mechanism
+> itself is shown.
+
+**The general habit this gives you.** Before treating two counts of "the same thing" as a
+contradiction, divide them. If the ratio is the step count, the run count, the rank count or the layer
+count, you are almost certainly looking at a **normalisation** — and the moments (median, mean, total,
+max) agreeing is the evidence that it is one object. Compare the **moments**, not just the counts.
 
 ---
 
@@ -908,7 +968,10 @@ Working through this list on a region that "does not overlap" finds the cause in
 
 8. **Is anything you concluded resting on an identifier?** A name, a filename, a comment, a single
    record. If so, find a measurement or mark it **UNKNOWN**.
-9. **If you are adding a measurement to resolve a disagreement, stop and add a control instead.**
+9. **Are two counts you are treating as a contradiction actually the same object at two
+   normalisations?** Divide them. If the ratio is the step count, the rank count or the layer count,
+   it is a unit, not a mechanism (§2.9, rule 8).
+10. **If you are adding a measurement to resolve a disagreement, stop and add a control instead.**
 
 ---
 
@@ -928,7 +991,7 @@ Stated rather than omitted, per the README's convention.
 | 8 | **The one surviving piece of the closed item 9:** what fraction of the ~20 ms host tail is *sync waiting* vs *host computing*. The sync events carry a runtime stream id, not an OS thread id, so they cannot be intersected with the runner-thread frames. | sync events carrying the calling tid, or a `record_function` around each sync at the point the runtime issues it |
 | ~~9~~ | ~~**Whether a decode-shaped step is bound by launch/serialization or by device occupancy.**~~ **CLOSED 2026-10-11 — the occupancy model wins.** Both models fitted to the same 13 archived runs: `wall = k × node-executions` gives R² **0.346** / RMS **107.85 ms**, against `wall = a + b × merged` at R² **0.999950** / RMS **0.95 ms** — two orders of magnitude in residual, and the launch model's per-run coefficient varies by 171 % of its own mean. **The step is device-occupancy-bound and the lever is the union.** Source: `Archive/by-date/2026-10-11/node_law/`. See §2.5.5. | — **closed.** The surviving sub-question is item 8. |
 | 10 | The size of the gap between "recipes in a dump" and "recipes that executed" (cache-deserialised recipes may not be re-dumped). | a run with the recipe cache cold vs warm, comparing dump contents |
-| 11 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. | the engine-side dump paired with the trace |
+| 11 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. A *separate* engine-scale intersection — `fp4_dequant` (TPC) × `GEMM` (MME), **1.980 ms/step over 40 windows/step** (§2.9 rule 8) — is measured and reproduces exactly, but it is a **raw interval intersection**, not a validated concurrency claim: nothing here establishes that the two engines were doing useful work at the same time, only that their execution windows intersected. | the engine-side dump paired with the trace |
 
 ---
 
