@@ -347,6 +347,15 @@ either.
 first draft and is now **SETTLED** by measurement. Read it before anything else in this section: the
 wrong format *name* gives the wrong poison set, inverted.)*
 
+> **On sources.** A few claims in this section are cited from a **Gaudi evidence corpus** — an indexed
+> collection of vendor C++, vendor documentation, driver sources and datasheets, queried read-only
+> (the corpus lives at `~/Apps/gaudi-grimoire/` with a CLI; **349 active sources**). Each such claim
+> carries a **tier** (a rough provenance class) and a **sha256**, so a reader can verify it.
+> **This chapter does not depend on corpus access**: every claim is stated in full inline, and a
+> reader without the corpus still gets all of it. The citations exist so that the vendor-sourced
+> claims can be checked, and so that the distinction between *our measurements* and *vendor
+> statements* stays visible.
+
 ### 3.4.1 What the device's fp8 actually is — **SETTLED**
 
 > **HPU's fp8 is `e4m3fn` CODES (bias 7) truncated at 240. It is NOT `e4m3fnuz`.**
@@ -421,11 +430,62 @@ the old "`e4m3fnuz`: max 240, no NaN/inf" description was not even true of the d
 torch's `float8_e4m3fnuz` has **no inf** but **does** have a NaN code, `0x80` — only 255 of its 256
 codes are finite.)*
 
+#### The exponent bias is SELECTABLE — our bias-7 semantics describe the **configured default**
+
+**This is new content, not a correction: our measurement was right, and the *scope* of the claim was
+too wide.** It also dissolves an apparent conflict with Intel's `neural_compressor`, which describes
+Gaudi 2's fp8 as `float8_e4m3fnuz` (**bias 8**). **Both statements are true about different things.**
+
+**The vendor C++ says the bias is a runtime-selected parameter.** `gaudi-pytorch-bridge`,
+`backend/h2d_scales_cache.cpp:24-88` — tier **B**, sha256
+`5979f7896269741952c83c4c2de7aab86200e6f5b6a3a7021e9fd29202675ad6`:
+
+```cpp
+ * Default exp_bias is 7 (only torch.float8_e4m3fn is supported).
+ * Possible exp_bias for gaudi2 is [3, 7, 11, 15], so -1 is added as an inversion of 15.
+static constexpr int default_bias = 7;
+  if (is_gaudi2) { biases = {-1, 3, 7, 11, 15}; }
+```
+
+…and the comment says these are *"picked in runtime by fp8 ops supporting H2D scales"* — i.e. the bias
+is carried **in the scale tensor**, per op.
+
+**Corroborated three ways:**
+
+- **Vendor documentation** — tier **B**, `habana-docs`,
+  `.../PyTorch/Inference_on_PyTorch/Quantization/Inference_Using_FP8.html`: *"In Gaudi 2 there are
+  **4 possible exponent-bias values (3, 7, 11, 15), where 7 is the default exponent bias**"*, against
+  Gaudi 3's expanded range (0, 63).
+- **Intel `neural_compressor`** — tier **D**,
+  `neural_compressor/torch/algorithms/fp8_quant/_core/fp_utils.py:73-146`:
+  `EXP_BIAS_SETS[(GAUDI2, torch.float8_e4m3fn)] = [3, 7, 11, 15]`.
+- **The vendor docs describe our measured *default* byte-for-byte** — tier **B**, `habana-docs`,
+  `.../Debugging_Guide/Model_Troubleshooting.html:147-163`: *"S.1110.111 = 240.0"*,
+  *"Encoding for INF (S.1111.000)"*, *"more encoding for NaN (S.1111.{001..111})"*. That is exactly
+  the table in §3.4.1.
+
+**⇒ The statement to carry:**
+
+> **On Gaudi 2 the fp8 exponent bias is SELECTABLE — `{3, 7, 11, 15}`, default `7`, chosen at RUNTIME
+> per op via the H2D scale tensor.** Everything in this section describes the **configured default**.
+
+**The operative consequences:**
+
+- **Scope the ×0.5 mitigation to "bias-7 configurations."** The poison set published below is the
+  poison set **for the default bias**. A port that **selects a different bias has a different
+  reserved bin**, and the ×0.5 compensation is not automatically the right one for it.
+- **The exponent bias is part of the operand's contract, exactly like the dtype.** A model or kernel
+  that selects a different bias will not match a bias-7 reference.
+- **Nothing needs re-measuring.** The measurement was right; it was the *scope* of the claim that was
+  too wide. **Do not read this as casting doubt on the decode/encode tables above** — they are the
+  configured default, measured directly.
+
 #### The operational rule — the part a port needs
 
 - **Poison on any HPU decode: `0x78–0x7E` and `0xF8–0xFE` — 14 codes.** The whole `E=15` bin is
   reserved, with `M == 0` → ±inf and `M != 0` → NaN. Measured decode: `0x78` → `+inf`, `0x79–0x7E`
-  → NaN, `0xF8` → `−inf`, `0xF9–0xFE` → NaN. **MEASURED**
+  → NaN, `0xF8` → `−inf`, `0xF9–0xFE` → NaN. **MEASURED — and this set is for the DEFAULT bias (7);
+  a port that selects another bias has a different reserved bin (see the bias subsection above).**
 - **NOT poison:**
   - **`0x7F` / `0xFF`** — NaN in `e4m3fn` *and* NaN on the device. They **agree**; they are **not**
     mismatches.
@@ -463,9 +523,12 @@ codes are finite.)*
   process, no vLLM), with its own calibration gates and a post-graph dump of the same run.
 - The **e8m0 scale histogram** (§3.4.5) was **CPU-only** over the checkpoint — no device.
 
-The **three new measurements** are disclosed rather than presented as archive-sourced. Device hygiene
-for both device probes: one HPU, no vLLM, `GC_KERNEL_PATH` untouched, all four AIPs at the 768 MiB /
-0 % idle baseline before and after.
+The **three new measurements** are disclosed rather than presented as archive-sourced. The
+**vendor-sourced claims** (the selectable exponent bias and the e8m0 byte-255 definition) are cited
+inline with a tier and a sha256, and come from the read-only evidence corpus described in §3.4's
+opening note — **not** from our own measurements; the chapter says which is which at each claim.
+Device hygiene for both device probes: one HPU, no vLLM, `GC_KERNEL_PATH` untouched, all four AIPs at
+the 768 MiB / 0 % idle baseline before and after.
 
 ### 3.4.2 The conversion, and the wrapper that implements it
 
@@ -473,7 +536,9 @@ The standard conversion that makes checkpoint fp8 valid on Gaudi 2 multiplies **
 and **fp32 scales by 2.0**. The real (dequantized) value is preserved while the fp8 bit pattern is
 **range-fitted into the device's representable range** — i.e. the checkpoint's top bin (`0x78–0x7E` /
 `0xF8–0xFE`, §3.4.1) is moved out of the device's reserved `E=15` bin. **It is NOT an
-`e4m3fn → e4m3fnuz` format conversion** — see the warning in §3.4.1. **MEASURED**
+`e4m3fn → e4m3fnuz` format conversion** — see the warning in §3.4.1. **This is a compensation for the
+DEFAULT exponent bias (7); a port that selects another bias needs its own analysis (§3.4.1).**
+**MEASURED**
 
 See [`examples/03-porting/fp8_scale_adjustment.py`](examples/03-porting/fp8_scale_adjustment.py) for
 the annotated wrapper logic.
@@ -580,6 +645,49 @@ Magnitude-tiny. Recorded so nobody re-derives it. **MEASURED**
 > reference implementation **ignores `kexp`** entirely. **It therefore does not validate the shipping
 > kernel.** Do not treat a green `test_fp4.py` as evidence about the kernel you are shipping.
 > **MEASURED**
+
+#### The e8m0 hand decode is WRONG at byte 255 — a real defect, LATENT on this checkpoint
+
+**The same class as the unclamped fold above, found in the same corpus pass — and this one is a defect
+in our own loader.**
+
+The e8m0 format is defined by the **OCP Microscaling Formats (MX) specification §5.4.1**:
+
+> "E8M0 is an unsigned exponent-only scale format with bias 127. **A finite encoded byte `b` in
+> `[0, 254]` represents `2 ** (b - 127)`; `0xFF` is reserved for NaN.**"
+
+— tier **D** (docs crawl), `vllm-docs-content-crawl-20261004`, `.../deepseek_v4/amd/rocm/index.html`.
+
+**So our hand decode is wrong at exactly one byte.** The loader's decode is `2 ** (b − 127)`, which
+returns a finite value for `b = 255`; the format says **NaN**. **Torch's own `float8_e8m0fnu` is
+right and we are wrong.** **MEASURED**
+
+- **It is LATENT on this checkpoint**: the exhaustive histogram above found **0 occurrences of byte
+  255** in **8,858,370,048** routed-expert scale bytes (range `[118, 127]`), and **0** in the
+  non-expert scales either.
+- **But it is a wrong VALUE at a reachable input — not merely an unreachable branch, and that makes it
+  the more dangerous of the two defects in this section.** Compare:
+  - the **unclamped fold** is an **unreachable branch**: if it were reached it would emit a *poison
+    fp8 byte*, which the format itself marks as inf/NaN and which a reader of the operand could in
+    principle notice;
+  - the **e8m0 decode** would silently produce a huge/`inf` **scale** and multiply a whole 32-value
+    group by it. `inf * 0 == NaN`, so one byte-255 group **silently poisons that group's weights** —
+    and nothing downstream flags an `inf` *scale* as a format error, because a scale is just a
+    number. **The failure mode is silent in the scale's own path.**
+- **Fix is one condition**: treat `255` as NaN (or refuse it) in the decode. Cheap; do it.
+
+> **Why we are hand-rolling this at all — and why that makes it worth getting right.** The hand decode
+> is **forced, not a shortcut**: two fp8-family dtypes are unusable on this stack. `float8_e4m3fnuz`
+> is rejected outright by `is_supported_type` (§3.4.1), and the `e8m0` dtype is likewise not usable
+> through this path. When the platform gives you no supported dtype for a format you must read, **you
+> own the decode's correctness** — and this is the second defect found in a hand-rolled decode in this
+> section.
+
+*Corroboration, and how not to read it.* A vendor **test helper** clamps rather than special-cases —
+`return max(0, min(255, exp + 127))` — so it **allows** 255 (tier **B**, `gaudi-pytorch-bridge`,
+`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:83-88`). **Do not read the test
+helper as contradicting the spec**: it is a test helper, not a format definition. The OCP citation is
+the authority.
 
 **Don't pre-dequantize at load.** Converting fp4 → fp8 at load time **doubles the weight bytes**
 (0.5 → 1 B/value), taking the routed buffers from **36.8 → 71.4 GB/rank** (+34.6 GB), on a 96 GB card
@@ -877,14 +985,16 @@ as valuable as the wins.**
 
 ## 3.9 The UNKNOWN register
 
-Stated, not omitted. Each has a note on what would settle it. **Two entries have been closed since the
-first draft — items 10 and 14 — and both are kept in place, marked CLOSED, so the resolutions are
-visible rather than silently deleted.**
+Stated, not omitted. Each has a note on what would settle it. **Three entries have been closed since
+the first draft — items 2, 10 and 14 — and all are kept in place, marked CLOSED, so the resolutions are
+visible rather than silently deleted.** *(Items 10 and 14 state the fp8 format as `e4m3fn` codes,
+bias 7. That is the **configured default** — the bias is **selectable**; see the bias subsection in
+§3.4.1.)*
 
 | # | UNKNOWN | what would settle it |
 |---|---|---|
 | 1 | **SRAM size.** The only figure anywhere ("48 MB") is marked **unverified by its own erratum**; do not import it. What *is* measured is that SRAM staging exists and is visible in the compiler's own output (`"allocation": "SRAM"`). | A vendor document that survives cross-checking, or a staging-size sweep. |
-| 2 | **L1/L2 cache sizes and behaviour.** | Not attempted. |
+| ~~2~~ | ~~**L1/L2 cache sizes and behaviour.**~~ **CLOSED — RESOLVED 2026-10-11. There is NO L1/L2 cache.** The corpus is consistent: the TPC's memory hierarchy is **HBM (96 GB) → 48 MB SRAM (on-die, shared, compiler-scheduled staging) → per-TPC local memory (1 KB scalar + 80 KB vector per core, private, kernel-programmer-managed)**, and **no cache level exists between them**. The TPC local memory is *not* the SRAM and is *not* a cache. *(tier **B**, `habana-docs`, `.../TPC/TPC_User_Guide/Processor_Architectural_Overview.html`, sha256 `0463528f9e4b5ec36bf7595933169066a76d2c375cca391d2e26afcfc21cc038`.)* **⇒ A bandwidth model must not assume reuse from a cache: reuse has to be engineered into the dataflow (tiling into local memory / SRAM) or it does not happen.** *Substantive material is routed to Chapter 1; this entry is closed here so the register is not stale.* | — **done** |
 | 3 | **Whether the TPC or DMA cost models consume the *general* HAL reader** (2000 MHz) rather than an engine-specific one (1650 MHz). If they do, they are **~21 % optimistic**. The MME has its **own** reader at 1650 MHz and is accurate to 0.5 %; the general reader's consumption by the other engines is **UNCHECKED**. | Disassemble the TPC/DMA cost models' clock path the way the MME's was done. |
 | 4 | **The 512 MiB C++ bench point (1,646 GB/s)** — an outlier below the measured 256 MB and 1 GB points. Two untested explanations (2-D vs flat 1-D memcpy; per-rep sync including launch latency). **OPEN** | A 1-D version of the same bench, and a version that syncs once outside the rep loop. |
 | 5 | **Whether the engine's cross-engine intersections are real concurrency** (§3.6.3). | An arm that **varies** the deciding quantity — the one that ran held it fixed, making its own falsifier unevaluable. |
@@ -897,6 +1007,7 @@ visible rather than silently deleted.**
 | 12 | **Whether the `cat` is on the critical path.** The IR cannot decide it (no unique node ids), and the one synthetic arm was inconclusive and changed the engine mix. | A GC-side post-graph dump from the real model, or an arm that holds the engine mix fixed. |
 | 13 | **The exact tensor/line that introduces a data-dependent size into the graph** on our own port. Candidate identified, not pinned. | Per-region guard-key inspection. |
 | ~~14~~ | ~~**Whether the fp8 reserved-bin rule is ENGINE-DEPENDENT** — i.e. whether the MME could decode the reserved bin differently from the TPC.~~ **CLOSED — RESOLVED 2026-10-11. NO: the rule is a property of the device, not of an engine.** **`MME == TPC byte-for-byte over all 256 codes: True`**, same 14-code mismatch set, measured **within one process on one code set** (so a within-run two-engine comparison, not two measurements days apart). Calibration passed first — **242/242 exact through the MME** — so the readout is a pure decode. **`e4m3fnuz` is excluded twice over on the MME**: it reads `0x76` as **224** (fnuz would be 112) and `0x80` as **0** (fnuz would be NaN). **⇒ the format statement needs no engine qualifier, and the guard's byte set `0x78–0x7E` / `0xF8–0xFE` is confirmed for BOTH engines.** *Mechanism worth keeping: the fp8 decode happens **inside the GEMM node** — a post-graph dump shows `MME GEMM ['hfloat8','hfloat8'] → ['bf16']` consuming fp8 directly with **no intervening cast**, so **no engine-attribution pass can ever see it** and would have reported "MME, no fp8 cast" and been silently wrong.* **Full statement: §3.4.1** (see also the closed item 10 above for the format itself). *Provenance: a second disclosed ~11-second device probe, with its own post-graph dump.* | — **done** |
+| **15** | **What SELECTS the fp8 exponent bias in a given recipe, and whether it is readable back.** The bias is **selectable** (`{3, 7, 11, 15}`, default **7**) and is carried **per op in the H2D scale tensor** (§3.4.1), but *which* mechanism sets it for a given op, and whether a compiled recipe's chosen bias is **observable** from a trace or a dump, is **not established**. This matters because §3.4.1's poison set is stated **for the default bias** — a recipe that selects another bias has a **different reserved bin**. | A recipe/dump inspection for a bias field, or a decode readout on an arm known to select a non-default bias. *(**Opened** by the bias finding — recorded rather than left implicit, so the closures of items 10 and 14 are not read as "fp8 is fully understood".)* |
 
 ---
 

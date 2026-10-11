@@ -85,8 +85,61 @@ HCL-dedicated** (`4073, 4082, 4083`) — HCL being the inter-device communicatio
   DRAM/SRAM pool that your `DmaMemcpy`-shaped traffic actually uses.
 
 A separate count discrepancy is a **record-keeping artefact, not a mechanism**: the compiler
-library exposes `GAUDI_QMAN_ID_DMA0..7` (eight queue-manager ids), which matches the eight tids
-and not the five DRAM/SRAM lanes. **MEASURED**
+library exposes `GAUDI_QMAN_ID_DMA0..7` — **eight queue-manager ids**. **MEASURED**
+
+> **Caveat added after the vendor taxonomy below was checked.** Those eight QMAN ids **coincide
+> numerically** with the profiler's eight DMA tids, but the two are **different numberings**, and
+> the relationship between them is **not established**. The profiler tids are a **per-process**
+> thread numbering (see §1.1); the queue ids are the hardware's own enum, which as the next
+> subsection shows contains **32 EDMA queues**, not 8. So do not read "eight QMAN ids" as
+> confirming "eight DMA queues" — that agreement is a coincidence of small integers, and the
+> question of which physical queues the profiler's tids correspond to is open (§1.11, item 4).
+
+### The vendor's own queue taxonomy — three families, not two
+
+The hardware's queues are grouped into families **named by purpose**, and there are **three** of
+them — not the two ("host" vs "device") we had been using informally:
+
+| family | what it is | enum prefix |
+|---|---|---|
+| **PDMA** | **host PCIe** (H2D / D2H) | `GAUDI2_QUEUE_ID_PDMA_*` |
+| **EDMA** | the **device's internal DMA** — the DRAM/SRAM lanes that carry `DmaMemcpy`-shaped traffic | `GAUDI2_QUEUE_ID_DCORE{n}_EDMA_*` |
+| **NIC** | **RoCE v2 / HCL** — inter-device communication | `GAUDI2_QUEUE_ID_NIC_*` |
+
+- tier **B** · `drivers.accel.habanalabs.kernel` · `include/uapi/drm/habanalabs_accel.h:314-470`
+- **sha256 `457f5ae98c9c16c9533c496a232a94a170919551ec6defc9fe1eba183100cdf6`**
+
+The driver separates them with a **predicate**, not a convention:
+
+```c
+static bool gaudi2_is_edma_queue_id(u32 queue_id)
+{
+	switch (queue_id) {
+	case GAUDI2_QUEUE_ID_DCORE0_EDMA_0_0...GAUDI2_QUEUE_ID_DCORE0_EDMA_1_3:
+	case GAUDI2_QUEUE_ID_DCORE1_EDMA_0_0...GAUDI2_QUEUE_ID_DCORE1_EDMA_1_3:
+	case GAUDI2_QUEUE_ID_DCORE2_EDMA_0_0...GAUDI2_QUEUE_ID_DCORE2_EDMA_1_3:
+	case GAUDI2_QUEUE_ID_DCORE3_EDMA_0_0...GAUDI2_QUEUE_ID_DCORE3_EDMA_1_3:
+		return true;
+	default:
+		return false;
+	}
+}
+```
+
+- tier **B** · `drivers.accel.habanalabs.kernel` · `drivers/accel/habanalabs/gaudi2/gaudi2.c:2661-2673`
+- **sha256 `e92cdea11fb1dbf5442b6a32476e3c11538497a310613ba9f08d14c572b2147d`**
+
+**The EDMA geometry is `2 engines × 4 channels` per DCORE** (`EDMA_{0,1}_{0..3}`), across four
+DCOREs — **eight queues per DCORE**, of which the profiler shows us a subset. **This is a design
+parameter, and it is exactly what our "five DRAM/SRAM lanes" should be checked against**: five is
+a *measured subset* of a *documented* eight, not a contradiction of it.
+
+**What this does to our earlier reading — it SUPPORTS it, and sharpens it, but does not settle
+it.** The HCL-dedicated tids are neither host PCIe nor `compute_edma`, and the hardware genuinely
+has a **third** family (NIC) for that role — so the three-way split is not something we invented
+to explain an anomaly. But the corpus gives the family *taxonomy*, not the **tid→queue mapping**,
+so **which** family tids `4073/4082/4083` belong to remains open (§1.11). Read the claim as
+"supported", not "settled".
 
 > **Why this cost us time.** We had been treating "the DMA engine" as a single serial resource
 > with a single bandwidth number, and had been attributing the host-PDMA tids to "host PCIe"
@@ -204,26 +257,71 @@ graph. **MEASURED** (Chapter 2 develops what this does to concurrency.)
 
 ## 1.4 Memory
 
-| level | size | basis |
-|---|---|---|
-| **HBM** | **96 GiB per HPU** | **MEASURED** |
-| **SRAM** (on-die, MME/DMA staging) | **UNKNOWN** | see below |
-| L1 / L2 caches | **UNKNOWN** | see below |
+| level | size | scope | basis |
+|---|---|---|---|
+| **HBM2E** | **96 GiB per HPU** | per card | **MEASURED** |
+| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — MME/DMA staging | **ASSUMED** (vendor, tier B) |
+| **TPC local memory** | **1 KB scalar + 80 KB vector** | **per TPC core, private** | **ASSUMED** (vendor, tier B) |
+| **L1 / L2 data cache** | — | **there is none** | **ASSUMED** (vendor, tier B) |
+
+*(Corpus-sourced rows are tagged **ASSUMED** because that is this manual's tag for "taken from
+documentation, a vendor constant" — they are vendor sources, not measurements on our hardware.
+Each carries tier + source path + sha256 so you can check it. See §1.10.)*
 
 **HBM is 96 GiB per card**, with an idle baseline of ~768 MiB. **MEASURED**
 
-**SRAM size: UNKNOWN.** The only figure in circulation is *"48 MB on-die SRAM"*, and it is
-**explicitly marked unverified by the erratum that carries it** — do not import it. What *is*
-measured is that SRAM staging exists and is visible in the compiler's own output: recipe-dump
-tensors carry `"allocation": "SRAM"` with a distinct `sp_index` for MME operand slices, and the
-compiler has SRAM-sizing configuration flags. So the *mechanism* is confirmed; the *capacity* is
-not. **UNKNOWN.** *What would settle it:* a vendor datasheet, or a binary read of the GC's SRAM
-allocator constants — the same method that settled the MME clock (§1.6).
+**SRAM is 48 MiB on Gaudi 2.** `SRAM_SIZE = 0x3000000`. For scale across the family the same
+constant is **Gaudi 1 = `0x1400000` (20 MiB)** and **Gaudi 3 = `0x10000000` (256 MiB)**.
 
-**L1/L2 cache sizes and behaviour: UNKNOWN.** We never needed them and never measured them. Any
-cache figure you see in this manual's source material is imported, not measured. **UNKNOWN.**
-*What would settle it:* a vendor datasheet, or a bandwidth-vs-size sweep with a known footprint
-stepping across the candidate boundaries.
+- tier **B** · `drivers.accel.habanalabs.kernel` · `drivers/accel/habanalabs/include/gaudi2/gaudi2.h:41`
+- **sha256 `d5b436080df549fd64866bb8ecdacee3809b0b65f694fd14b3f5555b72e5f2ee`**
+- reachable as `lookup_constant SRAM_SIZE --asic gaudi2`
+
+The *mechanism* was already confirmed from the compiler's own output — recipe-dump tensors carry
+`"allocation": "SRAM"` with a distinct `sp_index` for MME operand slices — and now the *capacity*
+is sourced too.
+
+> **A number we carried unverified turned out to be right.** Our own notes had *"48 MB on-die
+> SRAM"* marked **"Unverified here; not load-bearing"** by its own erratum. It is correct. That is
+> worth one line because it is the *opposite* of the three errors the UNKNOWN note at the top of
+> this manual describes: an inherited number that **survived** checking. Two things follow.
+> **(a)** Marking it unverified was still right — the marking is what made it checkable.
+> **(b)** Building on an unverified number *before* checking it would still have been wrong, even
+> though it would have happened to work. The habit is what is being taught, not the outcome.
+
+**There is no L1/L2 cache.** This is a *positive* finding, not a gap. The documented memory
+hierarchy is **HBM2E → 48 MiB shared SRAM → per-TPC local memory**, with **no hardware-managed
+cache level between them**. The vendor architecture page names three subsystems (compute, memory,
+networking) and two compute engines (MME + TPC); searches of the documentation, the architecture
+overview and the whitepaper pages return the same three levels and never a cache.
+
+**What the TPC does have is *local memory*, and it is a scratchpad, not a cache:**
+
+> "Each TPC processor has its own instance of local memory. Each TPC can only access its own local
+> copy. That is, TPC A cannot access TPC B local memory. … **Scalar local memory: Size is 1 KB.**
+> … **Vector local memory: Size is 80 KB. If the program utilizes special functions such as tanh,
+> sin, or cos, only 16 KBs are available.**"
+
+- tier **B** · `habana-docs` · `docs.habana.ai/en/latest/TPC/TPC_User_Guide/Processor_Architectural_Overview.html`
+- **sha256 `0463528f9e4b5ec36bf7595933169066a76d2c375cca391d2e26afcfc21cc038`**
+
+> ### ⚠ Do not conflate the SRAM with the TPC local memory
+>
+> They are different levels, with different sizes, different owners and different lifetimes. A
+> bandwidth model that merges them will be wrong.
+>
+> | | **48 MiB SRAM** | **TPC local memory** |
+> |---|---|---|
+> | **scope** | one on-die pool, **shared** by every engine | **private to one TPC core** (24 cores ⇒ ~1.92 MB aggregate, but **not addressable across cores**) |
+> | **who schedules it** | the **compiler** — MME/DMA staging, SRAM slicing | the **kernel programmer**, explicitly |
+> | **size** | 48 MiB | 1 KB + 80 KB **per core** |
+> | **is it a cache?** | no | no |
+> | **visible how** | `"allocation": "SRAM"` in the recipe dump | only from inside a TPC kernel |
+>
+> **Neither is a cache, so there is no automatic reuse anywhere in this hierarchy.** Data reuse
+> must be **engineered** — tiled into local memory, or staged through SRAM — or it does not
+> happen. That is the single most important consequence of this section for a bandwidth model, and
+> it is why the figures in §1.5 are *stream* bandwidths rather than cache-resident ones.
 
 ---
 
@@ -293,6 +391,43 @@ carried by the **DMA engine in the 16–64 MB band** must be costed at **~1,776 
 slower**. If you build a roofline and then route the traffic differently from how you costed it,
 the roofline is wrong in the direction that flatters the change.
 
+### Why there is no vendor bandwidth table in this section — a deliberate choice
+
+**Every per-engine bandwidth figure above is ours, and there is no vendor table to import.** That
+is not an oversight; it is a fact about the field, and it was checked:
+
+> "**None of the cited evidence establishes measured per-engine bandwidth.**" … "The examined
+> sources did not establish how aggregate HBM bandwidth is allocated among engines. The recorded
+> search found **no share percentages, bytes/cycle per engine, or per-TPC table** in the examined
+> 19 `docs.habana.ai` trees, whitepapers, `HCL`, `tpc_llvm`, `hl-thunk-open`, `libscal`,
+> `libGraphCompilerPlugin`, `libSynapseMmeReference`, `armcpd`, or the habanalabs driver."
+
+- tier **D** (knowledge finding) · `knowledge/gaudi2-hbm-engine-bandwidth.md`
+- the finding's **stated purpose was exactly this question** — *"what are the HBM bandwidth limits
+  for the mme, each tpc core, and the dma engine?"* — and its headline is that the sources do not
+  answer it.
+
+So "we measured it ourselves" is not a limitation of this manual; **it is the only option.** If
+you see a per-engine Gaudi 2 bandwidth figure anywhere, ask where it came from — it did not come
+from a vendor document.
+
+### ⚠ Warning: a 1000× units typo you will probably find
+
+A vendor datasheet in circulation reads:
+
+> "Gaudi2 integrates 96GB of HBM2e memories on chip, at **2.45GB/sec** bandwidth"
+
+That is **GB**, where the unit should be **TB**. The figure is **wrong by 1000×**. The vendor's
+documentation, the whitepaper and the launch fact sheet all say **2.45 TB/sec**, and the corpus
+that carries the datasheet **flags the row as a typo so it is not propagated**.
+
+- tier **B** source (`datasheets/Gaudi2-Datasheet-2021.pdf.md:20-22`), flagged in a tier **D** finding
+
+**Why this deserves a warning box:** it is the single most likely number a reader will grep for
+when looking up Gaudi 2 bandwidth, it is wrong by three orders of magnitude, and it is *in a
+datasheet* — the genre a reader trusts most. **If a bandwidth figure looks 1000× off, check the
+unit before you check the physics.**
+
 ---
 
 ## 1.6 The cost models — and their error signs
@@ -360,7 +495,13 @@ outlier; it is **replaced** by the pair above. **MEASURED**
 The TPC side has a cost field (`tpc_tpc_cycles`) and a working-engine count
 (`tpc_working_engines`, e.g. `[24,24,24]`). **The clock it uses to convert cycles to time is
 UNKNOWN**, and the "general HAL reader is 21 % high" note above is the specific worry.
-**UNKNOWN.** *What would settle it:* the same disassembly method.
+
+**Be precise about which kind of unknown this is.** We tried to settle it against a vendor
+evidence corpus and **could not consult the tool that would answer it** — so this is
+*"not checked"*, **not** *"checked and absent"*. §1.11 records the distinction explicitly, and it
+matters: a tool outage must not be allowed to harden into a vendor statement. *What would settle
+it:* symbol access into the cost-model libraries, or the same disassembly method that settled the
+MME clock.
 
 ### The rule that follows
 
@@ -526,25 +667,45 @@ Two gotchas worth knowing before you try them:
   can silently see a small fraction of them (one recon saw **24 of 1,141** files). Use
   `os.walk`/`find`. **MEASURED**
 
+### A note on where the vendor claims in this chapter come from
+
+The vendor rows cited above — the SRAM size, the TPC local memory, the queue taxonomy, the fp8
+datatype description — were checked against a **searchable Gaudi evidence corpus** that mirrors
+the habanalabs kernel driver, the Habana documentation set, the TPC toolchain and vendor PDFs.
+Citations carry **tier, source path and sha256** so a reader who has the corpus can go straight to
+the bytes; the tier labels (A–D) are the corpus's own provenance ranking.
+
+**The manual does not depend on it.** Every claim is stated in full in the text — the citation is
+for *checkability*, not for access. A reader with no corpus gets the same chapter, minus the
+ability to re-verify the vendor rows, and those rows are the ones least likely to change.
+
 ---
 
 ## 1.11 What this chapter leaves UNKNOWN
 
 Stated here so the gaps are visible, and repeated inline above where they matter.
 
-| # | UNKNOWN | what would settle it |
-|---|---|---|
-| 1 | **SRAM size** | a vendor datasheet, or a binary read of the GC's SRAM allocator constants |
-| 2 | **L1/L2 cache sizes and behaviour** | a vendor datasheet, or a bandwidth-vs-size sweep with a stepped footprint |
-| 3 | **The TPC cost model's clock** | disassemble the TPC cost model and find which HAL reader supplies its clock |
-| 4 | **Whether the TPC/DMA cost models use the 21 %-high general HAL reader** | the same disassembly |
-| 5 | **The DMA driver's exact round-robin queue-selection rule** | reading the driver's queue-selection path |
-| 6 | **Whether the 3 HCL-dedicated tids are device lanes or host transfers** | the recipe dump: are they engine nodes in a compiled recipe? *(This one splits an earlier ruling — not settled.)* |
-| 7 | **The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations | a 2-D vs flat-1-D copy at 512 MiB, and a per-rep sync breakdown |
-| 8 | **The MME rate's absolute value — a 2× unit ambiguity** | the artifact's own label reads "215 TFLOPS" where the arithmetic gives 430; settling the unit convention settles the number |
-| 9 | **The MME rate at shapes other than the 4096³ family** | a rate sweep across shapes, each arm asserting `device_busy ≥ 80 %` |
-| 10 | **`per_op_cost`** — the per-op fixed cost term | a direct measurement; four candidate meanings exist, three orders of magnitude apart |
-| 11 | **Whether one process driving several devices keeps the tid windows** | one short run on a multi-device view, checking the three tid sets |
+| # | UNKNOWN | status | what would settle it |
+|---|---|---|---|---|
+| 1 | **The TPC cost model's clock** | ⚠ **corpus not successfully consulted** — the symbol-index tool failed on **every** attempt (`deadline exceeded`), and lexical search found nothing. **This is NOT "the corpus says no".** | retry `lookup_symbol` / `search_binary_strings` on `TPCCostModel` / `getClockFreqMHz` once the tool is healthy; or disassemble the TPC cost model |
+| 2 | **Whether the TPC/DMA cost models use the 21 %-high general HAL reader** | ⚠ **corpus not successfully consulted** (same cause) | the same retry, or the same disassembly |
+| 3 | **The DMA driver's exact round-robin queue-selection rule** | open — the queue *families* are now documented (§1.2); the *rule* is not. Note the raw thunk path takes a **caller-supplied queue index**, so the round-robin we measured must be chosen **above** the driver | symbol access into the runtime library that assigns the queue |
+| 4 | **Which queue family tids `4073/4082/4083` belong to** | **supported, not settled** — a third family (NIC) exists (§1.2), which is consistent with our split; the **tid→queue mapping was not given** | the profiler's `thread_name` for those tids, against the queue-name table |
+| 5 | **Are the per-TPC AXI rate limiters programmed?** — `mmDCORE0_TPC0_CFG_RD_RATE_LIMIT` `0x400BDA8` / `WR_RATE_LIMIT` `0x400BDAC` exist with `ENABLE` (bit 0) / `SATURATION` (bits 1–8) / `TIMEOUT` (bits 9–16); likewise QMAN `HBW_RD_RATE_LIM_CFG_0/1`, `LBW_WR_RATE_LIM_CFG_0/1` and the XBAR limiters. The corpus found **no programmed values**. | **NEW, open.** If they *are* programmed they would cap per-TPC bandwidth and could explain part of the **2,147 GB/s measured vs 2,450 GB/s nominal** gap | read the registers on a live device, or find the firmware init sequence that writes them |
+| 6 | **The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations | open; a **third** possibility (a rate limiter, item 5) is now visible | a 2-D vs flat-1-D copy at 512 MiB, and a per-rep sync breakdown |
+| 7 | **The MME rate's absolute value — a 2× unit ambiguity** | open | the artifact's own label reads "215 TFLOPS" where the arithmetic gives 430; settling the unit convention settles the number |
+| 8 | **The MME rate at shapes other than the 4096³ family** | open | a rate sweep across shapes, each arm asserting `device_busy ≥ 80 %` |
+| 9 | **`per_op_cost`** — the per-op fixed cost term | open; **the corpus does not define one** | a direct measurement; four candidate meanings exist, three orders of magnitude apart |
+| 10 | **Whether one process driving several devices keeps the tid windows** | open | one short run on a multi-device view, checking the three tid sets |
+
+**Two kinds of negative, and they are not the same.** Items **1** and **2** are *"we could not
+consult the corpus"* — the tool that would answer them was down, so they carry **no information
+either way** and must not be read as a vendor statement. The rest are *"we looked, and the answer
+is not in the sources we have"*.
+
+**Collapsing those two is how a tool outage becomes a false finding** — and it is the same class of
+error as the UNKNOWN note at the top of this manual: a claim that was never checked acquires the
+authority of one that was. When you record a negative, record **which kind** it is.
 
 ---
 
