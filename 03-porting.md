@@ -379,6 +379,38 @@ it is now closed with measurement.
 3. **The consumer agrees.** `cast_from_fp8` matches the CPU `e4m3fn` table **242/256** (the same 14
    codes) and the `e4m3fnuz` table **1/256**, byte-for-byte over all 256 codes. Nothing in the stack
    reads our stored bytes with bias-8 semantics.
+4. **The rule is ENGINE-INDEPENDENT — tested, not assumed.** See below.
+
+#### The rule is a property of the *device*, not of an engine
+
+**This was a legitimate worry and it needed measuring.** Facts 1–3 above came from **cast ops, which
+run on the TPC** — while the op that actually consumes every fp8 weight in a decode step is
+**`fp8_gemm_v2`, which runs on the MME**. A vendor is free to implement different decode behaviour per
+engine, so "TPC decodes it this way" does not by itself license a statement about the MME.
+
+It has now been tested in one process, on one code set, in one run:
+
+> **`MME == TPC byte-for-byte over all 256 codes: True.`** Same 14-code mismatch set
+> (`0x78–0x7E`, `0xF8–0xFE`). **MEASURED**
+
+- **Calibration passed first**, so the readout is a pure decode: the 242 non-disputed codes are exact
+  **through the MME** (242/242), the spot values check (`0x00`→0, `0x38`→1.0, `0x3C`→1.5, `0x40`→2.0,
+  `0x76`→224, `0x77`→240), and a B-doubling control holds.
+- **`e4m3fnuz` is excluded twice over, on the MME**: it reads `0x76` as **224** (fnuz would be 112) and
+  `0x80` as **0** (fnuz would be NaN). The only representation-level difference from the TPC is the
+  *sign of zero* at `0x00`/`0x80` (TPC `−0`, MME `0`) — numerically equal.
+- **⇒ The format statement needs no engine qualifier.** "`e4m3fn` codes (bias 7), 240 ceiling, `E=15`
+  reserved as an inf/NaN bin" holds for **TPC and MME alike**, and **the guard's byte set
+  `0x78–0x7E` / `0xF8–0xFE` is confirmed for both engines.** This is the sentence a port needs.
+
+> **Why this had to be measured rather than read off a dump — and the trap it hides.** The fp8 decode
+> happens **inside the GEMM node**: a post-graph dump of the same run shows the
+> `MME GEMM ['hfloat8','hfloat8'] → ['bf16']` node consuming fp8 operands **directly, with no
+> intervening cast node** — i.e. **not a TPC pre-pass**. So **no engine-attribution pass can ever see
+> this decode**; engine attribution would have reported *"MME, no fp8 cast"* and been **silently
+> wrong**. *(A microarchitectural pre-stage inside the MME node cannot be excluded from a numeric
+> readout — but the operational answer is the same either way: the rule seen through the GEMM is
+> identical to the TPC's.)* **MEASURED**
 
 **The structural relation — this is the useful part.** Over all 256 codes,
 **`e4m3fnuz(c) == e4m3fn(c) / 2` for all 253 codes finite in both.** `e4m3fnuz` is exactly
@@ -421,10 +453,19 @@ codes are finite.)*
 > what the measurements above describe. Worth a one-line check in the vendor docs before quoting a
 > format *name*.
 
-**Provenance.** The decode table for the `e4m3fn`-declared bytes is from the archive. The
-`e4m3fnuz`-specific facts (facts 1 and 2 above, and the encoder codes) come from **one new minimal
-device probe** — 3 casts, ~11 s, one process, no vLLM — run because the question was not answerable
-from the archive. It is disclosed here rather than presented as archive-sourced.
+**Provenance — which is which.**
+- The **`e4m3fn`-declared decode table** (§3.4.1's measured decode values, and the 14-code set) is
+  **archive-sourced** — it was measured earlier and archived.
+- The **`e4m3fnuz`-specific facts** (facts 1 and 2, and the encoder codes) came from **one new minimal
+  device probe** (~11 s, one process, no vLLM), run because the question was **not answerable from the
+  archive**.
+- The **engine-independence comparison** (fact 4) came from a **second new device probe** (~11 s, one
+  process, no vLLM), with its own calibration gates and a post-graph dump of the same run.
+- The **e8m0 scale histogram** (§3.4.5) was **CPU-only** over the checkpoint — no device.
+
+The **three new measurements** are disclosed rather than presented as archive-sourced. Device hygiene
+for both device probes: one HPU, no vLLM, `GC_KERNEL_PATH` untouched, all four AIPs at the 768 MiB /
+0 % idle baseline before and after.
 
 ### 3.4.2 The conversion, and the wrapper that implements it
 
@@ -496,6 +537,49 @@ For MXFP4 expert weights:
   re-chunked by `[even, odd]`. **MEASURED** (derived from the device, verified at six shapes)
 - **`fp4_dequant_fwd_gaudi2` is bit-exact** on the full domain (all 256 byte values × all 256 `k`
   values, 8 388 608 bytes) and at six production shapes, including the consumer operand. **MEASURED**
+
+#### The exponent fold is UNCLAMPED — a LATENT defect, not an active one
+
+The kernel folds the scale by **adding `k` to the exponent field** and does **not** clamp the upper
+end. Two ways that could bite: the folded exponent `t = exp + k` reaching **15** (the reserved bin,
+§3.4.1) would emit a **poison byte**, and `t ≥ 16` would overflow the 4-bit exponent field into the
+sign bit. **We checked whether it can actually happen, and it cannot — on this checkpoint.**
+
+**Exhaustive scan of every e8m0 scale byte in the checkpoint** (not a sample). **MEASURED, CPU-only**
+
+| group | tensors | bytes | byte range | implied `k` | bytes ≥ 133 (`k ≥ 6`) | byte 255 |
+|---|---:|---:|---|---|---:|---:|
+| **routed experts** | 33,792 | **8,858,370,048** | **[118, 127]** | **[−9, 0]** | **0** | **0** |
+| non-expert scales (shared experts etc.) | 375 | 367,616 | [114, 121] | [−13, −6] | **0** | **0** |
+
+- **`k ≥ 6` (needed for the folded exponent to reach the reserved bin): does not occur.** Not one byte
+  in 8.86 GB of routed-expert scales, nor in the other 375 scale tensors.
+- **`k ≥ 7` (exponent field overflows into the sign bit): does not occur.**
+- **byte 255** — where a hand decode `2 ** (b − 127)` disagrees with torch's `float8_e8m0fnu`
+  (inf vs NaN) — **does not occur**.
+
+> **⇒ State it as a LATENT DEFECT, not an active bug.** And record *why it survived*: the distribution
+> is extraordinarily tight — `k = −6` is 60.1 %, `k = −7` is 39.8 %, everything else 0.1 %; only **10
+> distinct byte values exist in the whole 8.86 GB**. `k > 0` never occurs. An unbounded fold never had
+> a chance to bite. **That is exactly the shape of defect that breaks on a different checkpoint** — one
+> with `amax ≥ ~768` in any block.
+>
+> **Recommendation: add the `t ≥ 15` upper clamp anyway.** It is cheap, and the failure mode is
+> **silent** (a poison byte in the operand, §3.4.1). Defensive work, not a bug fix.
+
+**The lower bound: `k < −8` DOES occur — and it is benign, not a poison.** The kernel's own comment
+only reasons about the lower bound ("exact for `k ≥ −8`"). It is exceeded: **1,070 routed-expert
+bytes**, and **365,620 shared-expert bytes** down to `k = −13`. What happens there is **not
+corruption**: the subnormal branch's `sh2 = max(t + 2, 0)` makes the emitted code **saturate to the
+e4m3fn subnormal floor `2⁻⁹`** (byte `0x01`), the smallest value the format can represent — an
+**overestimate** of weights whose true scaled value is below the floor, not a poison code.
+Magnitude-tiny. Recorded so nobody re-derives it. **MEASURED**
+
+> **⚠ And a test-staleness warning worth carrying.** A `test_fp4.py` in the source tree calls
+> `fp4_dequant(b)` with **one** argument against the shipping **two**-argument schema, and its
+> reference implementation **ignores `kexp`** entirely. **It therefore does not validate the shipping
+> kernel.** Do not treat a green `test_fp4.py` as evidence about the kernel you are shipping.
+> **MEASURED**
 
 **Don't pre-dequantize at load.** Converting fp4 → fp8 at load time **doubles the weight bytes**
 (0.5 → 1 B/value), taking the routed buffers from **36.8 → 71.4 GB/rank** (+34.6 GB), on a 96 GB card
@@ -793,9 +877,9 @@ as valuable as the wins.**
 
 ## 3.9 The UNKNOWN register
 
-Stated, not omitted. Each has a note on what would settle it. **One entry has been closed since the
-first draft — item 10 — and is kept in place, marked CLOSED, so the resolution is visible rather than
-silently deleted.**
+Stated, not omitted. Each has a note on what would settle it. **Two entries have been closed since the
+first draft — items 10 and 14 — and both are kept in place, marked CLOSED, so the resolutions are
+visible rather than silently deleted.**
 
 | # | UNKNOWN | what would settle it |
 |---|---|---|
@@ -812,6 +896,7 @@ silently deleted.**
 | 11 | **Whether the ~55 MB per compiled instance scales with the instance count.** If it does not, the memory is in transient activation workspace or per-launch state, and the specialization/memory tradeoff is void. | De-guard one region and re-measure the post-warmup footprint. |
 | 12 | **Whether the `cat` is on the critical path.** The IR cannot decide it (no unique node ids), and the one synthetic arm was inconclusive and changed the engine mix. | A GC-side post-graph dump from the real model, or an arm that holds the engine mix fixed. |
 | 13 | **The exact tensor/line that introduces a data-dependent size into the graph** on our own port. Candidate identified, not pinned. | Per-region guard-key inspection. |
+| ~~14~~ | ~~**Whether the fp8 reserved-bin rule is ENGINE-DEPENDENT** — i.e. whether the MME could decode the reserved bin differently from the TPC.~~ **CLOSED — RESOLVED 2026-10-11. NO: the rule is a property of the device, not of an engine.** **`MME == TPC byte-for-byte over all 256 codes: True`**, same 14-code mismatch set, measured **within one process on one code set** (so a within-run two-engine comparison, not two measurements days apart). Calibration passed first — **242/242 exact through the MME** — so the readout is a pure decode. **`e4m3fnuz` is excluded twice over on the MME**: it reads `0x76` as **224** (fnuz would be 112) and `0x80` as **0** (fnuz would be NaN). **⇒ the format statement needs no engine qualifier, and the guard's byte set `0x78–0x7E` / `0xF8–0xFE` is confirmed for BOTH engines.** *Mechanism worth keeping: the fp8 decode happens **inside the GEMM node** — a post-graph dump shows `MME GEMM ['hfloat8','hfloat8'] → ['bf16']` consuming fp8 directly with **no intervening cast**, so **no engine-attribution pass can ever see it** and would have reported "MME, no fp8 cast" and been silently wrong.* **Full statement: §3.4.1** (see also the closed item 10 above for the format itself). *Provenance: a second disclosed ~11-second device probe, with its own post-graph dump.* | — **done** |
 
 ---
 
