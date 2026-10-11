@@ -20,7 +20,7 @@ WHAT TO LOOK FOR (printed at the end)
 
 If `CROSS` comes back 0.0000, do NOT conclude "Gaudi 2 does not overlap".  Check the
 precondition line first.  An arm whose queue is empty at the moment the host stops
-issuing is INCONCLUSIVE, never a negative result (chapter 2, section 2.7).
+issuing is INCONCLUSIVE, never a negative result (chapter 2, section 2.8).
 
 WHY THE SIZES ARE WHAT THEY ARE  (chapter 2, section 2.2, condition 4)
 ---------------------------------------------------------------------
@@ -38,7 +38,7 @@ Environment notes that each cost a run:
   * do NOT set HABANA_VISIBLE_DEVICES in a container that already sets it;
   * GC_KERNEL_PATH must never be unset (an empty value fails every compile);
   * collect ONLY ProfilerActivity.HPU.  Adding CPU activity inflates the trace's
-    host span ~3x and manufactures a false empty-queue verdict (section 2.8, rule 6).
+    host span ~3x and manufactures a false empty-queue verdict (section 2.9, rule 6).
 """
 from __future__ import annotations
 
@@ -69,7 +69,7 @@ def body_tpc_mme(x, a, b):
 
 
 # ---------------------------------------------------------------------------
-# trace reduction -- section 2.8, rule 1: durations from UNIONS, never sums.
+# trace reduction -- section 2.9, rule 1: durations from UNIONS, never sums.
 # ---------------------------------------------------------------------------
 def merge(intervals):
     """|merge(intervals)| in us.  Intervals are (start, end) tuples."""
@@ -90,7 +90,7 @@ def merge(intervals):
 def family_of(name):
     """Bucket a device kernel name into an engine family.
 
-    NOTE (section 2.8, rule 3): this is op TAXONOMY, not engine identity.  It is
+    NOTE (section 2.9, rule 3): this is op TAXONOMY, not engine identity.  It is
     good enough to compute CROSS.  When you need to know which engine a node is
     on, read the compiler's own per-node `engine` field from the graph dump --
     see example 3.

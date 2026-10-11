@@ -11,11 +11,12 @@ points at chapter 1 for the full treatment. The overlap, composition and measure
 this chapter's own.
 
 This chapter is about **one `torch.compile` region on Gaudi 2** — a few to a few hundred ops that
-you want to run concurrently. It answers three questions in order:
+you want to run concurrently. It answers four questions in order:
 
 1. **When does cross-engine work actually overlap, and when is it exactly zero?** (§2.2–§2.4)
-2. **When overlap happens, how much time do you save, and what destroys the saving?** (§2.5–§2.6)
-3. **How do you measure any of this without fooling yourself?** (§2.7–§2.9)
+2. **How do you choose your regions, and what does a graph break cost?** (§2.5)
+3. **When overlap happens, how much time do you save, and what destroys the saving?** (§2.6–§2.7)
+4. **How do you measure any of this without fooling yourself?** (§2.8–§2.10)
 
 The short version, so you can hold it while reading: **overlap on Gaudi 2 is not a hardware
 property you get for free, and it is not a property of the *ops*. It is a property of the
@@ -31,13 +32,13 @@ You need four nouns. They are nested:
 | object | what it is | how you see it |
 |---|---|---|
 | **region** | one dynamo-traced FX graph from a `torch.compile` region | `Torch-Compiled Region: *` events; `TorchDynamo Cache Lookup` events (one per region execution) |
-| **node** | one op in that graph, carrying a **placement** | the graph dump (`DUMP_POST_GRAPHS`, §2.9) or a registered backend pass |
+| **node** | one op in that graph, carrying a **placement** | the graph dump (`DUMP_POST_GRAPHS`, §2.10) or a registered backend pass |
 | **recipe** | one compiled binary, produced from one **maximal contiguous run of `hpu_cluster`-placed nodes** | `LaunchRecipe` events; the recipe name in the dump |
 | **submission** | one Synapse `Launch` — the thing the device actually schedules | the `Launch`/`enqueueWithExternalEventsExt` record |
 
 **The word that matters is *submission*.** Not region. Not recipe. Not op. The Synapse scheduler
 co-schedules **independent nodes inside one submission**; it does nothing across submissions.
-Every rule in §2.2–§2.4 is a consequence of that sentence.
+Every rule in §2.2–§2.5 is a consequence of that sentence.
 
 > **Two counts that are easy to confuse, and only one of them is the submission count.**
 > `LaunchRecipe` counts **recipe launches**, not device submissions. An `eager`-placed node runs
@@ -58,7 +59,7 @@ CROSS = Σ(unions of each engine family) − union(all families)      [ms/step]
 
 `CROSS` is the literal time the engine families' execution windows intersect. `CROSS = 0` means
 disjoint; `CROSS > 0` is real concurrency. Build each `union` by **merging intervals**, never by
-summing durations (§2.8, rule 1). Family membership is by device kernel name: MME = `GEMM`/`gemm`,
+summing durations (§2.9, rule 1). Family membership is by device kernel name: MME = `GEMM`/`gemm`,
 DMA = `DmaTranspose`/`DmaMemcpy`/`transpose_dma`/…, TPC = everything else.
 
 > ### The law
@@ -93,7 +94,7 @@ single-shot and model-op arms add more entries to the numerator, never a counter
 pattern, not the count, is the result.)*
 
 The arms below are the ones that make the pattern legible. All are graph-compiled, all asserted
-their own precondition (§2.7), and all use **duration-matched** ops (§2.2 condition 4).
+their own precondition (§2.8), and all use **duration-matched** ops (§2.2 condition 4).
 
 | arm | structure | `CROSS` (ms/step) | `Launch`/step | one submission? | verdict |
 |---|---|---:|---:|:---:|---|
@@ -144,9 +145,9 @@ shapes, same submission count, one edge. **MEASURED.**
 | condition | check |
 |---|---|
 | 1. one submission | `Launch`/step == 1 **and** all your ops carry the **same** `recipeHandle`. `LaunchRecipe` alone is not enough (§2.1). |
-| 2. cross-engine | read the per-node `engine` field in the graph dump (§2.9). Do **not** infer the engine from an op name. |
+| 2. cross-engine | read the per-node `engine` field in the graph dump (§2.10). Do **not** infer the engine from an op name. |
 | 3. no dataflow edge | read the FX graph / JIT IR and confirm the nodes' operand sets are disjoint. Note that an edge can exist *only* through buffer reuse or aliasing — check for that too. |
-| 4. comparable durations | measure each group **solo** in the same context (§2.6) and confirm the ratio is within ~2×. |
+| 4. comparable durations | measure each group **solo** in the same context (§2.7) and confirm the ratio is within ~2×. |
 
 ### A caution about "`union(all) == union(TPC)`"
 
@@ -232,6 +233,14 @@ graph inspected independently.
 | `x * 3`, `x.clone()` (native) | `hpu_cluster` | **1** | a D2D copy **is** clusterable |
 | `torch.hpu.mark_step()` | — | **does not compile** | lazy-mode-only API; raises inside a traced region |
 
+> **One row in that table needs a warning, because it is easy to misread.** *"Python-int guard:
+> recipes/step 1, unchanged"* means an int guard does **not** split a single compilation into more
+> recipes — a guard is not a node, so the partitioner never sees it. It does **not** mean ints are
+> free: an int used in traced code becomes part of the guard set and produces a **separate compiled
+> graph per distinct value** ([Chapter 0](00-tldr.md), fact 2). Those are two different counts —
+> recipes *within* one compiled graph, versus compiled graphs *per* region — and §2.5 is about the
+> second one.
+
 ### The rule is "cannot be clustered", not "is custom"
 
 Read the last few rows carefully. **`x.cpu().to('hpu')` is a native PyTorch construct and it splits
@@ -283,7 +292,242 @@ project, `Archive/by-date/2026-10-11/recipe_boundary/`, is the harness that does
 
 ---
 
-## 2.5 The `MAX` rule, and the precondition that makes it true
+## 2.5 Region strategy: breaks, coalescing, and the specialization count
+
+**Where this comes from.** [Chapter 0](00-tldr.md) states two of its facts about *region strategy*: a
+graph break costs twice, and fewer/larger regions is the direction — but verify the specialization
+count actually fell. This section develops both, adds the metric you verify with, and says plainly
+where the evidence runs out.
+
+**Hold one thing from §2.2 before reading on.** The currency is the **submission**, not the region. A
+change that reduces the region count without reducing the submission count has bought host work and
+nothing else (§2.1).
+
+### 2.5.1 A graph break costs in two currencies — and only one of them is reliable
+
+A graph break — an explicit `torch._dynamo.graph_break()`, a host read of a device value, or anything
+else that forces one — splits the compiled program into **more regions**. Two consequences follow.
+
+**(a) It can destroy overlap you already had.** This is the large, reliable cost, and it follows
+directly from §2.2. Co-scheduling happens *inside one submission*. Ops that were independent and
+co-resident in one region are now in two regions, hence two submissions, and the scheduler does not
+co-schedule across submissions at all. The control arm in §2.2 is exactly this case: the same two ops,
+one region each instead of one region together, `Launch`/step **2.00**, **`CROSS = 0.0000`**.
+**MEASURED.**
+
+**(b) It adds host-side launch and synchronization traffic.** Each region is submitted separately, each
+submission is a blocking host-side handshake, and each region also brings its own guard evaluation.
+Structurally this is certain: a break takes a body from 1 region / 1 recipe / 1 launch to 2 regions /
+2 recipes / 2 launches (**MEASURED** — the break arm in §2.4's table).
+
+**How much that second charge is worth is a separate question, and the answer is "less than you would
+guess".** In one measurement the *entire* launch handshake was **~6 ms of a 46.6 ms host self-time
+budget**, and a cross-run fit put the marginal cost of one launch at **~13 µs** — a few ms for a few
+hundred launches, against a host tail of **~20 ms**. **MEASURED.** So a break's second charge is real
+and host-side, but it is a fraction of the host tail, not a multiple of it — and §2.5.5 shows it is
+**not the lever**.
+
+> **Read (a) first, (b) second.** When you are deciding about a break, the question that changes the
+> answer is *"what overlap does this cost me?"* — not *"how many launches does this add?"*. §2.5.5
+> settles the second question: the launch count is not what the wall tracks.
+
+### 2.5.2 Coalescing is the direction — and the trap that makes it silently fail
+
+The direction is **fewer, larger regions**. Two reasons, and they are worth keeping separate:
+
+* **Host-side:** one region means one guard evaluation and one launch/sync set instead of G of each
+  (§2.5.1b).
+* **Structural:** a region is the *unit inside which* one submission is possible. You cannot get
+  independent cross-engine ops into one submission if they are in different regions to begin with.
+
+**But "fewer regions" is necessary, not sufficient.** §2.4 showed that a single region can compile to
+several recipes — and therefore several submissions — whenever a node inside it is not clusterable. So
+coalescing regions removes the *region-level* overhead; it does not by itself produce the submission
+count that §2.2's law is about. **Do not report "we coalesced" as "we fixed the overlap".**
+
+> ### The trap
+> **Integers specialize exactly like shapes** ([Chapter 0](00-tldr.md), fact 2). A Python `int` used in
+> traced code becomes part of the guard set and produces **a separate compiled graph per distinct
+> value**. So a coalesced region that spans G layers **still compiles to G graphs** if it guards on
+> each layer's int constant — you have merged the regions, paid the compile, and kept every
+> specialization.
+
+**The verification step — stated as a step, not as a caveat:**
+
+> **After any coalescing change, measure the specialization count and confirm it actually fell.** If it
+> did not fall, the change bought host-side overhead only, and the int causing the per-layer split is
+> still in the graph. Fix the int, or revert.
+
+**The worked instance, and it is a negative result.** A layer-coalescing change took **43 per-layer
+modules down to 11 stacks** — a ~4× reduction in modules — and **every operational count was
+identical**: launches 401.0, syncs 649.8, distinct recipes 123, region labels 121, region executions
+306.8/step, and a wall of 92.6 ms against a 93.2 ms baseline. The prediction that a coalesced region
+spanning G layers still needs G graphs **was borne out**. **MEASURED** — `[DSv4F]`, one workload on one
+box.
+
+A second measurement makes the same point from the other side: **removing the graph break did not
+remove the specialization either.** After the break was gone, the single remaining decode region still
+needed **87 compile ids, 43 of them per-layer** — the specialization survives the break's removal.
+**MEASURED** — `[DSv4F]`.
+
+### 2.5.3 The specialization count is a first-class metric
+
+**Track it on every change to regions, kernels or graphs**, alongside launches, syncs and wall time.
+Three reasons it earns a column of its own:
+
+1. It is the quantity a coalescing change is *supposed* to move (§2.5.2) — without it you cannot tell
+   whether the change did anything.
+2. It is the quantity that costs compile time and device memory; each compiled graph holds its own
+   buffers.
+3. It is the cheapest early warning that something structural changed when you only meant to change a
+   kernel.
+
+**How to read it.** The count multiplying by **layer × constant × shape** is *expected*
+([Chapter 0](00-tldr.md), fact 3): an N-layer model is an O(N × buckets) specialization case by
+construction, not by bug. **So the metric's job is to catch the unexpected, not to be small.**
+
+| what you see | what it means |
+|---|---|
+| count ≈ (layers × per-layer constants) + a shared set | **expected.** Do not "fix" it. |
+| count **grows with steps** rather than with layers | a region is **recompiling per call** — a guard or a shape that changes every iteration |
+| count rises and keeps rising in the steady state | **cache-limit thrash** — the compiled set no longer fits, old entries are evicted and recompiled |
+| count **unchanged** after a change meant to reduce it | the change did not address the guard — see §2.5.2 |
+
+**How to tell "expected large" from "thrash": look at the steady-state recompile total, not the
+count.** In the healthy runs the post-warmup recompile total was **exactly zero** — the compiled set was
+reached during warmup and never churned afterwards — while the runs that deliberately forced a
+recompile had a non-empty compile list. **MEASURED.** So the baseline to hold is *"zero recompiles
+after warmup, at whatever count that implies"*; a rising count in the steady state is the signal.
+
+**Three counting traps, all measured:**
+
+1. **A `recipeHandle` count is not a recipe count.** Handles ranged **1 → 13 across runs at an
+   identical per-step recipe count**, because the recipe cache re-missed. The per-step recipe count was
+   stable 20/20. Count per-step **launches**; treat the handle count as diagnostic only (§2.4).
+2. **A per-region "variants" figure can be inflated by the rank count.** A recorded per-region figure
+   of **172** was **43 × 4 ranks** — the same specializations counted once per worker. **Never quote a
+   rank-multiplied number as a specialization count.** **MEASURED.**
+3. **Region executions per step is the cheap proxy.** It equals the per-step count of the dynamo
+   cache-lookup events **exactly**, in every run measured — so you can read "how many times did my
+   compiled regions execute this step" from a trace without a graph dump. **MEASURED.**
+
+### 2.5.4 One worked example, and the shape of the number
+
+`[DSv4F]` — one workload, one box. Not a general law.
+
+The port's recorded scale was **~194 distinct recipes per decode step, of which 160 were used by
+exactly one layer** — i.e. almost all of the specialization was **per-layer**, so the count scaled with
+the number of layers rather than with the number of region kinds. That is [Chapter 0](00-tldr.md)'s
+fact 3 made concrete: an N-layer model pays roughly N per-layer graphs before anything is done wrong.
+
+> **A flag on those figures, because it matters more than the figures.** The same archive records that
+> 194/160 comes from **one code state** and is **stale** for the later ones, where the measured
+> quantities are different again — **43** per-layer compile ids inside the single decode region, **117**
+> specialization keys per step, and **70–123** distinct recipe handles depending on the code family.
+> **Use the *shape* of the number — "almost all of it is per-layer, so it scales with the layer count"
+> — not the number itself.** **MEASURED for the shape; the absolute figures are code-state-specific and
+> one of them is explicitly flagged stale in the record.**
+
+The arithmetic, generically:
+
+```
+distinct graphs  ≈  (layers × per-layer constants)  +  (shared graphs)
+```
+
+The per-layer term dominates. That is why a change touching one shared region moves the count very
+little, and why removing a per-layer int can move it a lot.
+
+### 2.5.5 The launch-vs-occupancy question, resolved — and why the host charge is not the lever
+
+**This section once said the question was contested and that neither reading was promoted. That was the
+right thing to write at the time and it is the wrong thing to leave standing, because the question has
+since been settled.** The sequence is worth keeping visible, because it is this manual's own rule in
+action: an unresolved question gets **written down**, and then gets **settled** — it does not get
+smoothed over in either direction.
+
+Two competing models were fitted to the **same 13 archived runs** — every run in the corpus that has
+both a surviving trace and a measured wall (**MEASURED**):
+
+| model | R² | RMS residual |
+|---|---|---|
+| `wall = k × node-executions` (launch/node model) | **0.346** | **107.85 ms** |
+| `wall = a + b × merged` (occupancy model) | **0.999950** | **0.95 ms** |
+
+**The occupancy model wins by two orders of magnitude in residual** — 0.95 ms against 107.85 ms, on a
+run set whose walls span 73–403 ms. The fitted occupancy form is
+
+```
+wall  =  21.7  +  0.997 × merged          (merged = |union(device-busy intervals)|, ms/step)
+```
+
+i.e. slope ≈ 1 and a ~22 ms constant. That constant **is** the ~20 ms host tail of §2.5.1b — the
+intercept and the host-side charge are the same quantity, which is why the host charge can be real and
+still not be the lever. It is the same law §2.9 rule 1 states. **The step is
+device-occupancy-bound, and the lever is the union, not the launch count.** Source:
+`Archive/by-date/2026-10-11/node_law/`; the project's wall-bound analysis reaches the same conclusion
+independently, and [Chapter 0](00-tldr.md) carries the same result under *"The one stale claim to watch
+for"*.
+
+The launch model does not merely fit worse — it has **no usable coefficient.** Its per-run `k` varies
+by **171 % of its own mean** across the 13 runs, so there is no stable microseconds-per-node to
+design against. A quantity whose coefficient moves by more than a factor of 3 between runs at
+comparable node counts is not a law; it is a coincidence of the run set.
+
+**Robustness, because the obvious objection is the two outlier runs.** Excluding the two runs with the
+pathological write path (n = 8), the launch model improves to R² 0.536 / RMS 4.73 ms while the
+occupancy model gives R² 0.983 / RMS 0.90 ms — **the occupancy model still wins by ~5× in residual**,
+and the per-run `k` is *still* not constant (≈2.5–3.1 µs/node on the healthy runs against ≈9–10 on the
+pathology). The conclusion does not rest on the outliers. **MEASURED.**
+
+#### What this does to §2.5.1b
+
+> **The second charge is real, bounded, and NOT the lever.** The measured magnitude — ~6 ms of a
+> 46.6 ms host self-time budget, ~13 µs marginal per launch, against a ~20 ms host tail — is
+> *consistent* with this resolution rather than in tension with it. "A graph break costs twice" is
+> **true**: the second charge exists and it is host-side. But it is a **fraction of the host tail**,
+> and the host tail is a **fraction of the step**. The lever is the **union**.
+
+That is the correct reading, not a hedge. It is also why §2.5.1a — the overlap a break destroys — is
+the charge to weigh first: it is a `MAX`-to-`SUM` change in the quantity the wall actually tracks.
+
+#### The clinching intuition
+
+**The port once removed 34 % of a step's summed kernel time and the wall was flat.** Under the launch
+model that is a puzzle: less work should be faster. Under the occupancy model it is exactly what you
+would expect — **removing summed work does not reduce the union**, and the wall tracks the union.
+The removed kernels were overlapped, so the union barely moved. That is the same fact as §2.9 rule 1's
+**925 ms of summed device work inside a 70.5 ms wall**; the two observations are one observation.
+
+#### A prospective test, for a reader on a different code state
+
+The fit above is **cross-sectional** — it compares runs to each other. If you are on a different code
+state, or you simply do not trust a fit, the test below measures the same thing **within** one code
+state. It is now a **confirmation test rather than a tiebreaker**: the conclusion above says which way
+it will come out, and the experiment is how you check that on your own machine.
+
+Take one kernel family and remove its **device time only**: make the kernel return immediately, or run
+its loop twice. Keep its **launch, op count, region structure and recipe count byte-identical**, so the
+only thing that changes is how long the kernel occupies the device.
+
+| hypothesis | predicted effect on the wall |
+|---|---|
+| device-occupancy-bound (**the resolved answer**) | the wall moves by that family's **measured union contribution** |
+| launch/serialization-bound (**the stale framing**) | the wall is **flat** |
+
+The two predictions are **~20 ms apart on a ~90 ms step** — a 20 %+ effect, far above the run-to-run
+spread — so one run decides it. If you inherit a launch-bound claim, this is how you refute it on your
+own evidence.
+
+#### What is still not measured
+
+**How much of the ~20 ms host tail is sync *waiting* versus host *computing*.** That sub-question is
+still open (§2.12, item 8) — the sync events carry a runtime stream id rather than an OS thread id, so
+they cannot be intersected with the runner-thread frames. It is a **different question** from which
+side of the ledger the step's wall is on, and the answer above does not depend on it.
+
+---
+
+## 2.6 The `MAX` rule, and the precondition that makes it true
 
 The composition rule people want to write down is a `MAX`:
 
@@ -314,14 +558,14 @@ all) predicts 1.070 ms for `tpc+dma` against 1.082 observed — a **1.1 %** matc
 
 **Practical reading: MME × TPC overlaps beautifully; TPC × DMA barely at all.** And the two routes
 agree — the composition interaction measured independently (adding TPC at fixed DMA work inflates
-the DMA window 2.64×, §2.6) lands on the same conclusion as the table's own 21 % row.
+the DMA window 2.64×, §2.7) lands on the same conclusion as the table's own 21 % row.
 
 ### Scope qualifiers — all of them explicit
 
 * **The percentages do NOT transfer to your model.** They come from synthetic C-API recipes with
   identical dispatch structure. Use them as *ordering*, not as arithmetic.
 * **A pure bandwidth-sharing model does not hold across sizes.** That 1.1 % match was at **one**
-  size; the sweep gives a fixed component plus a per-byte component (§2.6). **MEASURED.**
+  size; the sweep gives a fixed component plus a per-byte component (§2.7). **MEASURED.**
 * **Not characterised:** how the scheduler shares time when the cross-engine groups are *unequal*;
   and **more than two engines in one recipe**. **UNKNOWN.**
 * **`MAX` is not bounded by anything other than the longer group** — the answer to "is it bounded by
@@ -329,7 +573,7 @@ the DMA window 2.64×, §2.6) lands on the same conclusion as the table's own 21
 
 ---
 
-## 2.6 The co-residency effect — the most useful worked example in this chapter
+## 2.7 The co-residency effect — the most useful worked example in this chapter
 
 This is the section to read if you read only one.
 
@@ -414,7 +658,7 @@ actually ship. The difference is the co-tenant cost, and on Gaudi 2 it is routin
 
 ---
 
-## 2.7 The validity gate: precondition, or `INCONCLUSIVE` — never "negative"
+## 2.8 The validity gate: precondition, or `INCONCLUSIVE` — never "negative"
 
 An arm whose device queue is **empty** at the moment the host stops issuing cannot test overlap. It
 is **INCONCLUSIVE**, never a negative result. This is not a stylistic preference; it is how the
@@ -450,7 +694,7 @@ property.** Two consequences:
   small shapes"*.
 * **A "no overlap" result with an empty queue is not evidence of no overlap.** Reproducing the
   project's own earlier arm gave exactly that: a 2-op compiled arm reported a false INCONCLUSIVE
-  until two measurement bugs were fixed (§2.8, rules 6–7).
+  until two measurement bugs were fixed (§2.9, rules 6–7).
 
 ### The gate is a claim about the *arm*, not about the code
 
@@ -459,7 +703,7 @@ gate and a number that fails it must never appear in the same column.
 
 ---
 
-## 2.8 Measurement discipline — seven rules, each with the instance that produced it
+## 2.9 Measurement discipline — seven rules, each with the instance that produced it
 
 These are stated as rules because each one cost us a wrong number.
 
@@ -521,9 +765,11 @@ Two corollaries:
 
 * **Check whether your corpus can separate the things you are comparing.** In one fit, launch count
   and sync count correlate at r ≈ 0.99 across the runs available — the data **cannot** separate them,
-  and any claim to have done so is an artefact of the fit. **MEASURED.**
+  and any claim to have done so is an artefact of the fit. **MEASURED.** (This is a *fit* statement —
+  it says the two counts are collinear, not that either predicts the wall. §2.5.5 answers the second
+  question, and the answer is that **neither** count is what the wall tracks.)
 * **Prefer a pair that differs in exactly one dimension.** The cleanest result in this chapter is a
-  2×2 whose four cells differ in exactly one thing (see §2.6's table A/B, and §2.2's size-matched
+  2×2 whose four cells differ in exactly one thing (see §2.7's table A/B, and §2.2's size-matched
   pair).
 
 ### Rule 5 — A pre-committed falsifier is only usable if the arm **varies** the quantity it is about
@@ -531,7 +777,7 @@ Two corollaries:
 An arm that holds the variable fixed renders its own falsifier **unevaluable by construction**. This
 is a **design flaw, not a null result** — and it must be reported as a design flaw. Our instance:
 an arm pre-committed to *"if the rate penalty scales with load, X"* held the load fixed at every point,
-so the question was never measured (§2.6). **Say so explicitly**; do not quietly report the arm as
+so the question was never measured (§2.7). **Say so explicitly**; do not quietly report the arm as
 having "passed".
 
 ### Rule 6 — Collect the profiler activity you need, and no more
@@ -550,12 +796,12 @@ host-bound", check that your arm is not simply allocating.
 
 ---
 
-## 2.9 The instrument: `DUMP_POST_GRAPHS`
+## 2.10 The instrument: `DUMP_POST_GRAPHS`
 
 For structural questions — *which engine is this node on, which recipe is it in, what is the modelled
 cost* — the right instrument is the compiler's own post-graph dump, not the profiler trace. A trace
 tells you what executed and when; the dump tells you **what the compiler built**, per node, before
-anything ran. The two answer different questions, and for the questions in §2.2–§2.4 the dump is the
+anything ran. The two answer different questions, and for the questions in §2.2–§2.5 the dump is the
 one that is definitive.
 
 ### What it gives
@@ -632,9 +878,11 @@ immediate in the disassembly; it is derived from geometry).
 
 ---
 
-## 2.10 A checklist you can apply
+## 2.11 A checklist you can apply
 
-Working through this list on a region that "does not overlap" finds the cause in most cases:
+Working through this list on a region that "does not overlap" finds the cause in most cases.
+
+**The four conditions of §2.2, in order:**
 
 1. **Is it one submission?** Count `Launch`/step. If > 1, stop — nothing else matters until it is 1.
    Then confirm structurally: do your ops share one recipe (graph dump) and one `recipeHandle`?
@@ -643,17 +891,28 @@ Working through this list on a region that "does not overlap" finds the cause in
    operand sharing.
 4. **Are the durations comparable?** Measure each group solo, in the same region context. If the
    ratio is worse than ~2:1, you cannot detect overlap — fix the experiment first.
-5. **Did the arm pass its precondition?** `ops@H_end >= 2` and `device_busy >= 80 %`. If not, report
+
+**Then, whatever you changed:**
+
+5. **Did the specialization count fall?** If you coalesced regions, kernels or graphs, measure it
+   (§2.5.2). A coalescing change that left the count unchanged bought host overhead only.
+
+**And the arm's own hygiene:**
+
+6. **Did the arm pass its precondition?** `ops@H_end >= 2` and `device_busy >= 80 %`. If not, report
    INCONCLUSIVE and change the arm.
-6. **Did you control the co-tenant?** Measure solo *and* in-context; the difference is the
+7. **Did you control the co-tenant?** Measure solo *and* in-context; the difference is the
    co-residency cost, and it is routinely 2–4×.
-7. **Is anything you concluded resting on an identifier?** A name, a filename, a comment, a single
+
+**And the two rules about how you are reasoning:**
+
+8. **Is anything you concluded resting on an identifier?** A name, a filename, a comment, a single
    record. If so, find a measurement or mark it **UNKNOWN**.
-8. **If you are adding a measurement to resolve a disagreement, stop and add a control instead.**
+9. **If you are adding a measurement to resolve a disagreement, stop and add a control instead.**
 
 ---
 
-## 2.11 What this chapter does **not** establish
+## 2.12 What this chapter does **not** establish
 
 Stated rather than omitted, per the README's convention.
 
@@ -666,13 +925,14 @@ Stated rather than omitted, per the README's convention.
 | 5 | Whether the co-residency rate penalty **scales with the co-tenant load**. The deciding arm (a 2-D sweep over TPC count × DMA size) was designed but never run; the 1-D version held the variable fixed, making its own falsifier unevaluable. | the 2-D sweep |
 | 6 | Whether two HPU streams can *ever* overlap. We measured one configuration (36 ops/step, 119.1 ops outstanding at `H_end`, both queues provably loaded) and got exactly `0.0000`. | a stream arm with a different submission structure |
 | 7 | Whether a `hpu_op` DMA interval is **execution** time or **submission** time. | a run with kernel-level (not `hpu_op`) DMA metrics |
-| 8 | What fraction of the host tail is *sync waiting* vs *host computing*. The sync events carry a runtime stream id, not an OS thread id, so they cannot be intersected with the runner-thread frames. | sync events carrying the calling tid, or a `record_function` around each sync at the point the runtime issues it |
-| 9 | The size of the gap between "recipes in a dump" and "recipes that executed" (cache-deserialised recipes may not be re-dumped). | a run with the recipe cache cold vs warm, comparing dump contents |
-| 10 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. | the engine-side dump paired with the trace |
+| 8 | **The one surviving piece of the closed item 9:** what fraction of the ~20 ms host tail is *sync waiting* vs *host computing*. The sync events carry a runtime stream id, not an OS thread id, so they cannot be intersected with the runner-thread frames. | sync events carrying the calling tid, or a `record_function` around each sync at the point the runtime issues it |
+| ~~9~~ | ~~**Whether a decode-shaped step is bound by launch/serialization or by device occupancy.**~~ **CLOSED 2026-10-11 — the occupancy model wins.** Both models fitted to the same 13 archived runs: `wall = k × node-executions` gives R² **0.346** / RMS **107.85 ms**, against `wall = a + b × merged` at R² **0.999950** / RMS **0.95 ms** — two orders of magnitude in residual, and the launch model's per-run coefficient varies by 171 % of its own mean. **The step is device-occupancy-bound and the lever is the union.** Source: `Archive/by-date/2026-10-11/node_law/`. See §2.5.5. | — **closed.** The surviving sub-question is item 8. |
+| 10 | The size of the gap between "recipes in a dump" and "recipes that executed" (cache-deserialised recipes may not be re-dumped). | a run with the recipe cache cold vs warm, comparing dump contents |
+| 11 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. | the engine-side dump paired with the trace |
 
 ---
 
-## 2.12 Examples
+## 2.13 Examples
 
 Runnable code for this chapter is in [`examples/02-regions/`](examples/02-regions/). Each file is
 self-contained and annotated with **what to look for**:

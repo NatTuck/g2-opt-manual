@@ -3,7 +3,7 @@
 
 WHAT THIS DEMONSTRATES
 ----------------------
-Chapter 2 section 2.9.  For structural questions -- which engine is this node on,
+Chapter 2 section 2.10.  For structural questions -- which engine is this node on,
 which recipe is it in, what did the compiler think it would cost -- the right
 instrument is the compiler's own post-graph dump, not a profiler trace.  A trace
 tells you what executed and when; the dump tells you what the compiler BUILT, per
@@ -19,12 +19,12 @@ an HPU.
 WHAT TO LOOK FOR
 ----------------
   * per-node `engine` -- the compiler's own literal field: TPC / MME / DMA / None.
-    This is engine identity, not an op-name heuristic (section 2.8, rule 3).
+    This is engine identity, not an op-name heuristic (section 2.9, rule 3).
   * per-graph ENGINE COMPOSITION -- the set of engines in one recipe.  Two engines
     in one recipe is the precondition for overlap (section 2.2, condition 2).
   * `dma_expected_duration` -- the DMA cost MODEL, in microseconds.  It is a
     LOWER BOUND (optimistic by ~16 % at 64 MB, ~3 % at >= 256 MB).  Never treat it
-    as a measured time (section 2.9, trap 3).
+    as a measured time (section 2.10, trap 3).
   * the filter cross-tab at the end -- the general habit that catches the bug where
     a filter does not test what it claims to.
 

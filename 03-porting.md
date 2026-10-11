@@ -729,85 +729,88 @@ Amplification **13.74×** against the 3.25 GB the path itself reads.
 
 ---
 
-## 3.5 Specialization and graph count
+## 3.5 Specialization and graph count — what it means for a deep model
 
-**This is where a port silently loses memory and gains compile churn.** Read it before you structure
-your model's forward.
+**This section is deliberately short, and it is not where the mechanism lives.**
 
-### 3.5.1 There are no dynamic shapes, and **ints are specialized too**
+- The **mechanism** — no dynamic shapes, integer specialization, and the graph-count arithmetic — is a
+  **basics** fact that bites someone optimising a 20-line region. It is in **Chapter 1 §1.4**
+  (§1.4.1–§1.4.2 for the two rules, §1.4.3 for the count, §1.4.4 for where it bites).
+- The **region strategy** — graph breaks cost twice, prefer fewer and larger regions, and the
+  coalescing trap (coalescing does *not* reduce the count if the region still guards on the same
+  parameters) — is in **Chapter 2 §2.4** and **Chapter 1 §1.4.3**.
 
-- **`dynamic=True` is turned into `{"options": {"force_static_compile": True}}`**, and
-  `dynamic_shapes_compilation` defaults True. So every tensor shape is **baked into the compiled
-  graph** — you cannot pass a dynamic slice bound or shape and have one graph serve several cases.
-  **MEASURED**
-- **A Python int used in the traced code becomes part of the guard set** and produces a **separate
-  compiled graph per distinct value**, exactly like a new shape does. A per-layer byte offset, a layer
-  index, a constant — all of them. **There is no "dynamic argument" escape hatch for ints.**
-  **MEASURED**
+Those two are cross-referenced here rather than restated. What is **porting-specific** is the
+*consequence of that arithmetic for a model with many layers*, and that is all this section covers.
 
-> **⇒ The graph count multiplies by layer × constant × shape.** This is the single most important
-> structural fact in this section, and it is the one a port is most likely to violate accidentally by
-> baking a per-layer index into the traced code.
+### 3.5.1 Why a deep model lands at O(n_layers) compiled programs
 
-### 3.5.2 Regional compilation, and the observed scale
+*(Mechanism: **Chapter 1 §1.4.1–§1.4.2**. The graph-count arithmetic: **Chapter 1 §1.4.3**. Region
+strategy and the coalescing trap: **Chapter 2 §2.4** and **Chapter 1 §1.4.3**.)*
 
-- **Regional compilation compiles each decoder layer as its own `torch.compile` function.** **MEASURED**
-- **Observed scale on the DSv4F port: ~194 distinct recipes per decode step, 160 of them used by
-  exactly one layer** — i.e. almost all specialization is **per-layer**, and the instance count scales
-  with `n_layers` (43), not with the number of region kinds. **MEASURED [DSv4F]**
-- **The recipe cache limit is inflated by `n_layers + 2`** to accommodate this. Watch for a single
-  region exceeding the cache size limit — that causes **recompile thrash**. **MEASURED**
-- **Two independent compile levels exist, each with its own cache and key**: the **recipe**
-  (`recipe_key` — the IR plus declared shape *ranges*) and the **Synapse graph** (`graph_key` —
-  recipe plus concrete shapes plus the bucket and dynamic-bucket info). **Both must be zero after
-  warmup**, or any timing measured over that window is invalid. **MEASURED**
-- **Naming trap: the profiler event called `compileGraph` is the *Synapse graph* compile, not a
-  dynamo compile.** A guard can be clean at level 1 while level 2 is wide open. **MEASURED**
-- **The shapes can be data-dependent without your noticing.** One port's decode window showed **93
-  `compileGraph` events per step** while level 1 was clean, because a live-entry count was reaching
-  the graph as a tensor size. **MEASURED [DSv4F]**. The fix is code: make those dims static
-  (fixed-size buffers + masks).
+- **Regional compilation compiles each decoder layer as its own compiled function.** So the number of
+  compiled programs is **not** "one per region kind" — it is **per layer**.
+- **Per-layer constants are computed *inside* the graph.** A layer index, a per-layer byte offset, a
+  per-layer buffer slice: any of these is an integer in traced code, and therefore a specialization
+  key (Chapter 1).
+- **⇒ The compiled-program count is `O(n_layers × region-kinds × buckets)`**, not
+  `O(region-kinds × buckets)`. For a 43-layer model that is a factor of **43** on the layer axis alone,
+  before any region-kind or bucket multiplier.
 
-### 3.5.3 Graph breaks cost twice
+**This is structural, not a bug.** It follows directly from the compiler's static-shape model applied
+to a model that genuinely has 43 *distinct* layers. **Do not treat a high count as a defect to
+chase** — treat it as the price of the design, and decide deliberately whether any part of it is worth
+removing (Chapter 2 carries the tradeoff, and it is not one-sided).
 
-**A graph break splits the compiled program into more regions, which means more graph launches — and
-each launch blocks the host in a `synchronizeEvent`.** So a break costs you on both sides. **MEASURED**
+### 3.5.2 The worked example — and a warning about its numbers [DSv4F]
 
-**⇒ Prefer fewer, larger compiled regions.** But:
+**An illustration of the arithmetic above, not a law.** A 43-layer model on our port has been reported
+at **~194 distinct compiled recipes per decode step, of which 160 were used by exactly one layer** —
+i.e. almost all of the specialization is per-layer, and the instance count scales with `n_layers`
+rather than with the number of region kinds.
 
-> **⚠ Coalescing regions does NOT reduce the specialization count if the coalesced region still guards
-> on each layer's ints.** The *parameter*, not the region boundary, is what sets the instance count.
-> Confirmed empirically: grouping 4 layers into one compiled unit **moved no operational count**.
-> **MEASURED**
+> **⚠ Those two numbers are NOT current, and a port should not quote them as a measurement.**
+>
+> - **Source (so you can check it):** the figure is recorded in the project's
+>   `notes/specialization-and-compile.md` §B1, and in its archived twin
+>   `Archive/by-date/2026-10-04/old-notes/intentional-specialization-params.md`. **It comes from a
+>   single `with_stack=True` trace taken 2026-09-20**, on a code state ~3× slower than the current one.
+> - **The project's own corrections note says so.** `notes/wall-bound.md` §9 lists it explicitly as a
+>   stale figure, and gives the current values: **123 distinct recipe handles per 4 steps** for one
+>   code family and **70–73** for another; and separately **246 compile ids over 25 regions, with a
+>   per-region maximum of 43** — that per-region 43 is the one number here that directly supports the
+>   per-layer claim, because 43 *is* `n_layers`.
+> - **A later archived census** (`Archive/by-date/2026-10-11/node_law/out/*.json`) counts **83–130
+>   distinct recipes per 4-step trace** across that archive's runs — again well below 194.
+> - **The units are also not the same object.** "Recipe", "compile id" and "recipe handle" are three
+>   different things and are counted on different clips (see Chapter 1's vocabulary section). A count
+>   quoted without its unit and its clip is not a count.
 
-**⇒ Always check the specialization count after a coalescing change; do not assume it helped.**
+**What survives, and what is the point of the example:** the *scaling* — the count is per-layer, and
+most instances serve exactly one layer. That is what a port of a deep model must budget for. **The
+exact number is code-state-, unit- and clip-dependent, so measure your own** rather than importing
+ours.
 
-### 3.5.4 The memory side
+### 3.5.3 The practical consequences for a port of a deep model
 
-- Retained graph/activation footprint after warmup was **~11 GiB** on one port; transient demand during
-  the first decode's compilation was **~30 GiB** above post-build. **MEASURED [DSv4F]**
-- **~55 MB per compiled instance** is the arithmetic (`11 GiB / ~194 instances`) — a **hypothesis, not
-  a measurement**. If the footprint does not fall when the instance count falls, the memory is
-  somewhere else and the hypothesis is void. **INFERRED**
-- **The tradeoff is device-side on both sides**: specializing buys device *runtime* (baked constants
-  fold into immediates; exact shapes give better fusion/tiling) and costs device *memory*; reducing
-  instances **saves** host work and memory and can only cost runtime. **INFERRED**
-
-**⇒ Keep an instance only where it measurably cuts device time.** Everything else should be collapsed.
-
-### 3.5.5 Standing metrics for a port
-
-Track these together, before and after every change. Any one alone has misled us:
-
-- **ops/step by family** — and note that a **device event is a replication count, not a launch**:
-  kernel events ÷ recipe launches was **544 / 569 / 971** across three traces of the same model —
-  *not even a fixed multiple*. **MEASURED**
-- **`merged`** = `|union(kernel ∪ hpu_op Dma*)|` — device occupancy (§3.6).
-- **graph launches/step** and **host syncs/step**.
-- **distinct recipes** (the specialization count) — and see the probe in
-  [`examples/03-porting/specialization_probe.py`](examples/03-porting/specialization_probe.py).
-- **the step wall**, unprofiled.
-- **`compileGraph` events** after warmup (should be zero).
+- **Budget device memory for the compiled programs, not only for weights and KV.** Each compiled
+  program holds its own graph buffers. On our port the retained post-warmup footprint was **~11 GiB**
+  above the post-build figure, with a transient of **~30 GiB** during the first decode's compilation
+  — both **[DSv4F]**. The derived **~55 MB per compiled program** is an **INFERRED hypothesis**, not a
+  measurement: if the footprint does *not* fall when the instance count falls, the memory is
+  somewhere else and the arithmetic is void.
+- **Budget warmup time and cache size.** The count is large enough to matter for both, and a cache
+  limit that is exceeded causes recompile thrash.
+- **Watch for compilation during steady state.** If the count grows while the workload runs, then some
+  shape or some integer is **not covered by warmup** — and **any timing measured over that window is
+  invalid.** This is a hard gate in the porting checklist (§3.10), and
+  [`examples/03-porting/specialization_probe.py`](examples/03-porting/specialization_probe.py)
+  measures it at both compile levels.
+- **The per-layer structure is where the count comes from, so that is where to look** if you want to
+  reduce it — and Chapter 2 explains why reducing it is not automatically a win.
+- **A deep model is not a special case of a shallow one.** A 2-layer test model will not show this
+  behaviour at all. If you prototype on a truncated model, you will not see the specialization
+  pressure your real port will have.
 
 ---
 
@@ -975,7 +978,7 @@ as valuable as the wins.**
 | 6 | **"Avoid custom ops" as a heuristic** | **Refuted by the model's own op.** Three arms held customness fixed and flipped the outcome purely on **submission count**: custom op → 0.2217 at 1 submission; custom op → 0.0000 at 2; native op → 0.4179 at 1. The discriminator is the submission count. | **MEASURED** |
 | 7 | **Region coalescing alone** | Grouping 4 layers into one compiled unit **moved no operational count** — the *parameter*, not the region boundary, sets the instance count. | **MEASURED** |
 | 8 | **Launch count / sync count / recipe count as the lever** | r² 0.15 / 0.195 / 0.066, **all with the wrong sign**. | **MEASURED** |
-| 9 | **The "device idle ~80 % / launch-bound" framing** | **Stale** for the current code state: the step is ~76 % device-occupancy. It described a code state 3× slower. | **MEASURED** |
+| 9 | **Optimising for "the step is launch/serialization-bound"** | **Two readings exist, and they point at opposite levers — so name both.** *(i) **launch/serialization-bound**: device idle ~80 %, host busy through most of it, ~573 graph launches and ~1048 host syncs per step.* *(ii) **device-occupancy-bound**: the step is ~76 % device-occupancy and the wall tracks device busy.* **These describe different CODE STATES, not two measurements of one** — the 573/1048 numbers are a 2026-09-19/20 `with_stack=True` state ~3× slower than the current one, and the launch/sync/recipe **counts** fail to predict the wall on the current corpus (wrong sign, r² ≤ 0.2) while `merged` fits at r² 0.9999. A later archived fit re-tests the launch-side model directly and **refutes it again** (`Archive/by-date/2026-10-11/node_law/`: wall = k × node-executions gives R² **0.346** through the origin with a per-run `k` spread of **171 %**, against wall = 21.703 + 0.99713 × `merged` at R² **0.99995**). **⇒ Do not optimise for launch count.** But if you are on a code state with the *other* symptom, the other reading is the right one — check which regime you are in before choosing a lever. | **MEASURED** |
 | 10 | **`torch.stack([a, a], dim=-1)` — the same tensor twice** | Costs **22,532 µs vs 301 µs** for two *distinct* tensors — **75×** — on a 50 MB output. It silently destroyed a component benchmark (read 22,500 µs inside a 4,300 µs whole-op measurement). | **MEASURED** |
 | 11 | **Profiling with CPU activity enabled** | Inflates the trace's host span **~3×** and collapsed a queue-depth metric from 23.3 to 1.67, manufacturing a false empty queue. **Use HPU-activity-only profiling.** | **MEASURED** |
 | 12 | **`**`-globbing a dump directory** | Silently **skips the hidden `.graph_dumps/`** directory — one recon saw **24 of 1,141** files on its first pass. Use `os.walk`/`find`. | **MEASURED** |

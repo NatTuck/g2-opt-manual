@@ -34,7 +34,7 @@ why the windows are reliable, and it is also why they are not a property of "dev
 **MEASURED** — every device event also carries Synapse's own engine label in
 `args["HW event name"]`. Coverage is **98.85 %**, and it agrees with the tid windows on **100 %**
 of device work across **21.9 M events**. The 1.15 % without a label are exactly the host spans,
-which correctly have no engine. **Use this field** — it is the runtime's own answer, and §1.7
+which correctly have no engine. **Use this field** — it is the runtime's own answer, and §1.8
 explains why a *name heuristic* is not a substitute.
 
 > **Reading trap.** A node's `guid` (the string you pass to `synNodeCreate`) selects an
@@ -93,7 +93,7 @@ library exposes `GAUDI_QMAN_ID_DMA0..7` — **eight queue-manager ids**. **MEASU
 > thread numbering (see §1.1); the queue ids are the hardware's own enum, which as the next
 > subsection shows contains **32 EDMA queues**, not 8. So do not read "eight QMAN ids" as
 > confirming "eight DMA queues" — that agreement is a coincidence of small integers, and the
-> question of which physical queues the profiler's tids correspond to is open (§1.11, item 4).
+> question of which physical queues the profiler's tids correspond to is open (§1.12, item 4).
 
 ### The vendor's own queue taxonomy — three families, not two
 
@@ -138,7 +138,7 @@ a *measured subset* of a *documented* eight, not a contradiction of it.
 it.** The HCL-dedicated tids are neither host PCIe nor `compute_edma`, and the hardware genuinely
 has a **third** family (NIC) for that role — so the three-way split is not something we invented
 to explain an anomaly. But the corpus gives the family *taxonomy*, not the **tid→queue mapping**,
-so **which** family tids `4073/4082/4083` belong to remains open (§1.11). Read the claim as
+so **which** family tids `4073/4082/4083` belong to remains open (§1.12). Read the claim as
 "supported", not "settled".
 
 > **Why this cost us time.** We had been treating "the DMA engine" as a single serial resource
@@ -146,7 +146,7 @@ so **which** family tids `4073/4082/4083` belong to remains open (§1.11). Read 
 > on a rule that did not survive contact with the lane layout. The lane split above **splits**
 > that earlier ruling: it covered tids `3090/3091/4082/4083` and called them all host; on the
 > lane layout **`3090/3091` remain host**, while **`4073/4082/4083` are device lanes** (the
-> HCL-dedicated ones). **Not fully settled** — see §1.11.
+> HCL-dedicated ones). **Not fully settled** — see §1.12.
 
 ### One transfer at a time per lane — but five lanes in parallel
 
@@ -255,7 +255,118 @@ graph. **MEASURED** (Chapter 2 develops what this does to concurrency.)
 
 ---
 
-## 1.4 Memory
+## 1.4 The compilation model — static shapes, specialized integers
+
+> **This section develops [Chapter 0, facts 1 and 2](00-tldr.md).** The TLDR states them in one
+> line each; here is the mechanism. Read it **before §1.6 (bandwidth)** and **§1.7 (cost models)**
+> — both assume a compiled graph, and both are easy to misread without this.
+
+Everything that runs on the device runs as a **compiled graph**, and **the graph is compiled for
+the exact values it saw**. There is no runtime interpretation step and no dynamic dispatch.
+
+### 1.4.1 There are no dynamic shapes
+
+Every tensor shape is **baked into the compiled graph**. Asking for dynamic shapes does **not**
+produce a shape-polymorphic graph — the request is **turned into static compilation**. So you
+cannot pass a dynamic slice bound or a dynamic shape and have one graph serve several cases.
+
+**ASSUMED (vendor).** Stated here as the toolchain's behaviour; it is consistent with everything in
+§1.6–§1.9, and it is the standard account of this class of accelerator.
+
+**Read it as a design constraint, not a limitation.** The consequence is that you work with a
+**shape set**: you decide which shapes the program must serve, and you accept that **each new shape
+is a new program**. That is a decision you make once, deliberately — and it is *why* padding and
+bucketing are normal engineering techniques here rather than hacks.
+
+### 1.4.2 Integers are specialized exactly like shapes
+
+**This is the fact that surprises people, and it is the most consequential one in this chapter.**
+
+A Python `int` used inside traced code — a **layer index**, a **per-layer byte offset**, any
+constant — becomes part of the compiled graph's **guard set**. Change the value, the guard fails,
+and **a new graph is compiled** — exactly as a new shape would.
+
+> **There is no dynamic-argument escape hatch for integers.** There is no "pass this int at
+> runtime" mode that keeps one graph. An `int` in traced code is a compile-time constant in the
+> same sense a shape is.
+
+**The consequence, stated as a rule:**
+
+> **Code that computes an offset from a loop index has written one program per iteration.**
+
+A loop that walks layers and computes `offset = layer * stride` *inside* the traced region does
+not produce one graph with a runtime offset. It produces **one graph per layer**, each with its own
+baked-in offset. The loop is unrolled **into the compilation**, whether or not it was unrolled in
+the Python.
+
+**INFERRED** — this follows directly from the guard-set mechanism above. *(We have not, in this
+chapter's sources, isolated a single integer and counted the graphs it produces; that is recorded
+in §1.12.)*
+
+### 1.4.3 The graph count multiplies: layer × constant × shape
+
+Put the two facts together and the arithmetic follows immediately:
+
+```
+graphs  ≈  (number of distinct shapes)  ×  (number of distinct int constants in guards)
+```
+
+and the int term is usually **the layer count**, because layer-indexed code is the normal shape of a
+transformer.
+
+> **An N-layer model is an O(N × buckets) specialization case BY CONSTRUCTION, not by bug.**
+> **A 43-layer model is an O(10²)-graph model before anything is done wrong.**
+
+**This is the practical value of the section.** A large graph count is **normal**, and it is **not
+evidence of a mistake** until it has been checked against this arithmetic. The two questions worth
+asking:
+
+- **Is the count near the prediction, or far above it?** Far above means something is specializing
+  on a value you did not intend — a data-dependent constant, or a shape that varies when you
+  believed it was fixed.
+- **Did a change meant to coalesce actually reduce the count?** Coalescing regions is a lever
+  (Chapter 2) — but a coalesced region spanning G layers **still needs G graphs** if it guards on
+  each layer's constants. **Check the count; do not assume it fell.**
+
+**INFERRED** from §1.4.1–§1.4.2. *(The 43-layer figure is this manual's reference workload, not a
+general law.)*
+
+> **Two different counts — do not conflate them.** §1.3's rule (*one recipe per maximal contiguous
+> run of clusterable nodes*) is about **placement**: how many recipes a region splits into. This
+> section is about **specialization**: how many compiled *variants* exist. They are independent
+> axes, and they multiply. A region that splits into 3 recipes and guards on 43 layer constants
+> does not have "3 graphs" — and a *recipe count* is not a *graph count*.
+
+### 1.4.4 Where this bites in practice
+
+Two mechanisms, and they compound:
+
+1. **Regional compilation.** A compiler may compile **each decoder layer as its own function**
+   rather than one function for the whole stack. That is a reasonable trade for compile time and
+   locality — but it makes the per-layer specialization **structural**: the layer boundary *is* the
+   graph boundary.
+2. **Per-layer constants computed in-graph.** When a layer computes something from **its own
+   index** inside the traced region — an address, a page offset, a rotation angle — that value
+   enters the guard set and **specializes that layer's graph to that layer**. Two layers running
+   *identical* code with different constants do **not** share a graph.
+
+**Together, these mean the O(N × buckets) count is not something you can compile away by writing
+the Python differently.** It is the natural consequence of per-layer constants in a
+statically-compiled system. The available levers are to **reduce the number of distinct constants**
+(make a value uniform across layers where you legitimately can) and to **reduce the number of
+distinct shapes** (bucket deliberately) — not to hope the compiler finds the sharing.
+
+**ASSUMED (vendor) / INFERRED.** Stated at the level of *what the compiler does*; deliberately not
+tied to any particular implementation.
+
+> **A caution about measuring it.** Count **distinct compiled graphs actually executed**, and do
+> not identify a graph by a **per-run handle**: handles are per-process and are not stable across
+> runs or ranks, so comparing two runs by handle identity shows you differences that are not
+> specialization. Compare **counts and stable graph identities** instead.
+
+---
+
+## 1.5 Memory
 
 | level | size | scope | basis |
 |---|---|---|---|
@@ -266,7 +377,7 @@ graph. **MEASURED** (Chapter 2 develops what this does to concurrency.)
 
 *(Corpus-sourced rows are tagged **ASSUMED** because that is this manual's tag for "taken from
 documentation, a vendor constant" — they are vendor sources, not measurements on our hardware.
-Each carries tier + source path + sha256 so you can check it. See §1.10.)*
+Each carries tier + source path + sha256 so you can check it. See §1.11.)*
 
 **HBM is 96 GiB per card**, with an idle baseline of ~768 MiB. **MEASURED**
 
@@ -321,11 +432,11 @@ overview and the whitepaper pages return the same three levels and never a cache
 > **Neither is a cache, so there is no automatic reuse anywhere in this hierarchy.** Data reuse
 > must be **engineered** — tiled into local memory, or staged through SRAM — or it does not
 > happen. That is the single most important consequence of this section for a bandwidth model, and
-> it is why the figures in §1.5 are *stream* bandwidths rather than cache-resident ones.
+> it is why the figures in §1.6 are *stream* bandwidths rather than cache-resident ones.
 
 ---
 
-## 1.5 Bandwidth — and the size each figure is valid at
+## 1.6 Bandwidth — and the size each figure is valid at
 
 **Bandwidth on this hardware is size-dependent. A bandwidth number without its size is not a
 number.** This section is therefore a table with a size column, and it is the section most likely
@@ -371,7 +482,7 @@ and is **withdrawn** — it was neither size-scoped nor direction-scoped. **MEAS
 A row reading *"D2D copy (DMA engine) | 1,014 / 1,704 / 1,888 GB/s"* was carried in two of our
 notes on the strength of its label. Those numbers are **TPC** numbers. Any "DMA engine" figure
 taken from `torch.copy_` in eager mode is TPC data, and the error is invisible from the label
-alone — which is exactly the failure mode §1.7's reading trap describes.
+alone — which is exactly the failure mode §1.8's reading trap describes.
 
 **How to tell them apart:** count events by `args["HW event name"]`, not by the op name you
 called. A TPC copy shows up on the TPC tids; a real DMA transfer shows up on the DMA tids. See
@@ -430,7 +541,7 @@ unit before you check the physics.**
 
 ---
 
-## 1.6 The cost models — and their error signs
+## 1.7 The cost models — and their error signs
 
 The compiler emits per-node *estimates*. They are useful, but **they are not neutral references**,
 and the two we have looked at fail in **opposite** directions.
@@ -484,7 +595,7 @@ That framing is the reusable part, and it explains a result that otherwise looks
 | 256 MB | 258.032 µs | 265.61 µs | **1.029×** |
 
 ⇒ **~16 % optimistic at 64 MB, ~3 % optimistic at ≥256 MB — a two-regime error, not a single
-factor.** The model's error and the engine's own two-regime behaviour (§1.5) **agree in shape**,
+factor.** The model's error and the engine's own two-regime behaviour (§1.6) **agree in shape**,
 which is a good sign for both. **MEASURED**
 
 An earlier single figure ("1.21× optimistic") rested on a mislabelled TPC row and on the 512 MiB
@@ -498,7 +609,7 @@ UNKNOWN**, and the "general HAL reader is 21 % high" note above is the specific 
 
 **Be precise about which kind of unknown this is.** We tried to settle it against a vendor
 evidence corpus and **could not consult the tool that would answer it** — so this is
-*"not checked"*, **not** *"checked and absent"*. §1.11 records the distinction explicitly, and it
+*"not checked"*, **not** *"checked and absent"*. §1.12 records the distinction explicitly, and it
 matters: a tool outage must not be allowed to harden into a vendor statement. *What would settle
 it:* symbol access into the cost-model libraries, or the same disassembly method that settled the
 MME clock.
@@ -512,7 +623,7 @@ MME clock.
 
 ---
 
-## 1.7 Markers, and what a duration actually means
+## 1.8 Markers, and what a duration actually means
 
 Every device event carries `args["HW event name"]` — Synapse's **own** per-event label. Coverage
 **98.85 %**; agreement with the tid windows **100 %** over 21.9 M events. **MEASURED.** Use it.
@@ -585,7 +696,7 @@ slow" conclusion.
 
 ---
 
-## 1.8 Profiling setup
+## 1.9 Profiling setup
 
 **Device events require a host-profiler shim.** Without it, `synProfilerStart` fails *silently*
 and your trace contains only `cpu_op` / `privateuse1_runtime` events — **no `kernel`, no
@@ -611,7 +722,7 @@ device. **MEASURED**
 
 ---
 
-## 1.9 Device identity and pinning
+## 1.10 Device identity and pinning
 
 There are **two distinct notions of device identity**, and conflating them produces a failure that
 looks like a hardware fault:
@@ -648,13 +759,13 @@ variables are named per-deployment. The manual does not assume any one container
 
 ---
 
-## 1.10 Where to look things up yourself
+## 1.11 Where to look things up yourself
 
 Three introspection routes, all of which we used to produce this chapter:
 
 | route | what it gives | example |
 |---|---|---|
-| **`DUMP_POST_GRAPHS=<dir>`** | one JSON per compiled graph with a **literal per-node `"engine"` field**, plus `guid`, `type`, `is_logical`, `origin_nodes`, `exec_order_idx`, `bundle_index`, and the cost fields (§1.6) | [`dump_post_graphs.py`](examples/01-basics/dump_post_graphs.py) |
+| **`DUMP_POST_GRAPHS=<dir>`** | one JSON per compiled graph with a **literal per-node `"engine"` field**, plus `guid`, `type`, `is_logical`, `origin_nodes`, `exec_order_idx`, `bundle_index`, and the cost fields (§1.7) | [`dump_post_graphs.py`](examples/01-basics/dump_post_graphs.py) |
 | **`LOG_LEVEL_ALL=2` alone** | per-recipe arc jobs naming the engines: `(for 0[TPC])`, `(for 1[MME])`, `(for 2[DMA])` — the cheapest independent confirmation | same example, second half |
 | **the SynapseAI C++ API** | build and launch a graph yourself; enumerate the recipe's launch tensors; read the GC's own node-type GUID table | [`synapse_cpp_minimal.cpp`](examples/01-basics/synapse_cpp_minimal.cpp) |
 
@@ -681,7 +792,7 @@ ability to re-verify the vendor rows, and those rows are the ones least likely t
 
 ---
 
-## 1.11 What this chapter leaves UNKNOWN
+## 1.12 What this chapter leaves UNKNOWN
 
 Stated here so the gaps are visible, and repeated inline above where they matter.
 
@@ -697,6 +808,7 @@ Stated here so the gaps are visible, and repeated inline above where they matter
 | 8 | **The MME rate at shapes other than the 4096³ family** | open | a rate sweep across shapes, each arm asserting `device_busy ≥ 80 %` |
 | 9 | **`per_op_cost`** — the per-op fixed cost term | open; **the corpus does not define one** | a direct measurement; four candidate meanings exist, three orders of magnitude apart |
 | 10 | **Whether one process driving several devices keeps the tid windows** | open | one short run on a multi-device view, checking the three tid sets |
+| 11 | **The measured graph count vs the O(N × buckets) prediction** — §1.4.3 states the arithmetic; we have not checked a real model's executed-graph count against it in this chapter's sources | open | count **distinct compiled graphs executed per step** on a real model and compare against `shapes × layer constants`. This is the check that turns §1.4.3 from an arithmetic into a diagnostic |
 
 **Two kinds of negative, and they are not the same.** Items **1** and **2** are *"we could not
 consult the corpus"* — the tool that would answer them was down, so they carry **no information
@@ -728,6 +840,9 @@ authority of one that was. When you record a negative, record **which kind** it 
 9. **Pre-flight every trace** — a stale profiler plugin path silently yields a trace with no
    device events at all.
 10. **Two notions of device identity** — conflating them causes silent mis-pinning.
+11. **Everything is compiled for the exact values it saw** — shapes *and* integers. An N-layer
+    model is an O(N × buckets) graph count **by construction**; check a count against that
+    arithmetic before treating it as a bug.
 
 **Next:** [Chapter 2 — Optimizing small programs and regions](02-regions.md) takes the engine model
 above and derives the rules for making independent work actually run at the same time.

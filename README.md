@@ -35,11 +35,12 @@ those in from general knowledge.**
 
 | # | chapter | lines | status |
 |---|---|---|---|
-| 1 | [Gaudi/HPU Basics](01-basics.md) | 572 | hardware model · engines · queues · memory · bandwidth · cost models · markers · profiling · pinning |
-| 2 | [Optimizing small programs and regions](02-regions.md) | 687 | overlap law · composition · recipe boundaries · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | 809 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends |
+| **0** | **[TL;DR](00-tldr.md)** | 86 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
+| 1 | [Gaudi/HPU Basics](01-basics.md) | 848 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
+| 2 | [Optimizing small programs and regions](02-regions.md) | 947 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
+| 3 | [Porting a large language model to HPU](03-porting.md) | 1070 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends |
 
-Example code lives in [`examples/`](examples/), organized by chapter — **14 files**, of which
+Example code lives in [`examples/`](examples/), organized by chapter — **13 files**, of which
 one (`examples/02-regions/03_inspect_graph_dumps.py --demo`) runs CPU-only and has been
 verified end to end, and one (`examples/03-porting/fp8_scale_adjustment.py`) is host-only and
 has been run. **The rest are annotated sketches** that need a device; each says so in its

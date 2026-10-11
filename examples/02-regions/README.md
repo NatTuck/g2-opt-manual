@@ -28,7 +28,7 @@ source activate.sh
 3. **`torch.hpu.set_device(i)` must be the first HPU call** if you pin. There is no working
    self-report API — read `os.environ["HLS_MODULE_ID"]`.
 4. **Collect `ProfilerActivity.HPU` only.** Adding CPU activity inflates the trace's host span ~3×
-   and manufactures a false empty-queue verdict (§2.8, rule 6).
+   and manufactures a false empty-queue verdict (§2.9, rule 6).
 5. **Stagger concurrent launches by ~2 s** if you run several arms at once; simultaneous starts lost
    processes to `synStatus=8` in 3 of 5 attempts.
 
@@ -43,8 +43,8 @@ that make the *reasoning* legible:
 * `03` is the instrument you need for the structural questions, and it is the one that runs without
   a device.
 
-The chapter's other evidence — the 24-arm placement table (§2.4), the absorption percentages (§2.5),
-the co-residency sweep and the TPC-count arm (§2.6) — comes from synthetic C-API and Python harness
+The chapter's other evidence — the 24-arm placement table (§2.4), the absorption percentages (§2.6),
+the co-residency sweep and the TPC-count arm (§2.7) — comes from synthetic C-API and Python harness
 runs in the source project (`Archive/by-date/2026-10-11/recipe_boundary/`,
 `Archive/by-date/2026-10-10/t2_graph_overlap/`, `Archive/by-date/2026-10-11/overlap_dma_probe/`).
 They are quoted with their conditions in the chapter rather than reproduced here, because their value

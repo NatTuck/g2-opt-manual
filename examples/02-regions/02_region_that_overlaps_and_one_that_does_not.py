@@ -64,7 +64,7 @@ def body_dep(x2d, b):
 
 
 # ---------------------------------------------------------------------------
-# reduction (section 2.8, rule 1: unions, never sums)
+# reduction (section 2.9, rule 1: unions, never sums)
 # ---------------------------------------------------------------------------
 def merge(intervals):
     if not intervals:
