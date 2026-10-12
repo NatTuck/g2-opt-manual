@@ -36,7 +36,120 @@ order is how you end up optimising a term that is not the largest one.
 | 4 | **Get the quantization formats right at load time.** | Format bugs are silent, and one class of them is unrecoverable. | §3.4 |
 | 5 | **Get the graph structure right: few regions, no dataflow-edge surprises, watch the specialization count.** | Graph breaks and specialization both cost, and they are hard to retrofit. | §3.5 |
 | 6 | **Only then price optimisations, in `merged` (device occupancy).** | Summed kernel time is not the quantity that moves the wall. | §3.6 |
-| 7 | **Keep a dead-end register** so nobody re-walks a closed path. | §3.8 — ours is 12 entries long. | §3.8 |
+| 7 | **Keep a dead-end register** so nobody re-walks a closed path. | §3.8 — ours is 13 entries long. | §3.8 |
+
+### 3.0.1 The method: replace SPANS, not kernels
+
+**This is the most reusable thing in this chapter, and it is the method the order above assumes at
+steps 5 and 6.** It is a *strategy for choosing what to rewrite* — stated separately from any fact
+about one model, because it is the part that transfers.
+
+> **Replace spans, not kernels.**
+
+1. **Decompose the task into a sequence of steps.** Number them. A step is a named stage with a
+   checkable output — the granularity our own gates already use (`src/gates/step*.py`), and that is
+   not a coincidence: **a step you can validate in isolation is a step you can replace in isolation.**
+2. **Rank sub-sequences by marginal.** Find the slow **contiguous span** — steps 3, 4, 5 of a 1..10
+   task — and rank candidate spans by what replacing each would buy. **Price the marginal the way §3.6
+   prices everything: in `merged` (device occupancy), not in summed step cost.** The premise of a span
+   is that its cost is not the sum of its parts, so a ranking built from per-step costs will mis-rank —
+   and a span's own marginal is **not** simply its summed time either, because removing a span changes
+   the union non-additively. **Measuring a span's marginal properly needs an arm, not arithmetic.**
+3. **Pull the span out and write entirely different code that computes the same result.** **Not a
+   kernel swap — a rewrite.** If the replacement is the same algorithm with a faster inner loop, this
+   method has not been applied.
+4. **Validate by ulp histogram over the span's output** (`src/gates/ulpval.py`). See the precision
+   rule and the span-combination rule below.
+5. **If the signature does not fit, WIDEN THE SPAN.** Replace steps 2, 3, 4 and 5 rather than 3, 4 and
+   5 — so that step 2 emits exactly what the new code wants to consume.
+
+#### Step 5 is the load-bearing one: a signature belongs to the *boundary*, and the boundary is a design variable
+
+**This is the part that took us longest to see, and the part most likely to cost you a candidate for
+the wrong reason.**
+
+**A signature — an op's input/output contract: arity, dtypes, shapes, layout (§3.3.4 is our worked
+instance of one) — is not a property of the kernel being replaced. It is a property of the boundary you
+chose to replace at** — and that boundary is *yours to move*. A hard-coded input count in a glue layer
+reads like a property of the hardware. It is not. **It is a property of replacing exactly one node**,
+which is a decision you made, not a constraint you were given.
+
+**The shape of it.** Suppose the code you want to write needs **three** inputs and the step you are
+replacing takes **two**. The naive reading is *"the op does not fit — drop it"*. The correct reading
+is: that third input is produced by an earlier step, so **absorb that step into the span**. Now the
+boundary takes two inputs and emits the new code's output, and the glue layer you were fighting is
+*inside* the span — where you are allowed to delete it.
+
+**Why we are writing this down.** We spent a long time treating a signature mismatch as a wall, and it
+**closed a candidate for the wrong reason**. The mismatch was evidence about **where we had drawn the
+line**; we read it as evidence about the hardware. **When a candidate dies of a signature mismatch,
+check whether the span is the reason before you write it off.**
+
+#### The precision rule: establish what the precision **was**
+
+**Find out what precision the span actually had — which is not necessarily what its dtype was — then
+either match it or justify a looser bound.**
+
+- **What dtype is the tensor *stored* as?** Readable off the checkpoint and the graph.
+- **What precision was it *computed* in?** A tensor stored bf16 but computed in fp32 has a different
+  effective precision from one computed in bf16. **The span's precision is the second thing, and it is
+  the one that decides whether a looser bound is available.**
+
+**For these DeepSeek models a great deal was presumptively designed for native NVIDIA fp4**, so an
+argument that *fp32 can drop to bf16*, or *bf16 to fp8*, is **usually available**. It still has to be
+**made**: the argument is that the reference's own effective precision is already at or below the
+format you propose to use, and that has to be shown for the span at hand. *(The design intent behind
+the checkpoint is our reading of it — **ASSUMED**, not measured. The effective precision is
+measurable, and that is what the argument must rest on.)*
+
+#### The span-combination rule — the subtle part, and the rejection is *measured*
+
+**The ulp histogram is admissible PER STEP. It cannot simply be expanded to a whole sequence**, and that
+is not a caution — it is a **decision we took and quantified**: `notes/numeric-acceptance.md`
+(2026-10-07) admits criterion N for a **single op**, and for an **op pair** *only where nothing
+accumulates between them* (the pair's budget then comes from **its own measured amplification**,
+declared before the run), and **explicitly rejects it for anything spanning a residual add or any
+accumulation** — whole layer, layer stack, whole process. **The rejection is measured, not argued.**
+**Do not re-derive it in the optimistic direction.**
+
+**The precisions do not compose by any fast rule.** There is **no `± 2 ulp` shortcut for a two-step
+span** — the pair's budget has to come from the pair's own amplification. And the reason a general rule
+fails is concrete rather than formal: **an fp4 ulp and a bf16 ulp are wildly different quantities.** Our
+own metric makes that structural — `src/gates/ulpval.py` carries a **separate ordered-int key per
+format** (`ulp_bf16`, `ulp_fp32`, `ulp_fp8`) precisely because a ulp count is only meaningful against
+the format it was measured in. Summing or bounding error bars **across a format change** is therefore
+not a conservative approximation; it is a **category error**. *(**source read** — `src/gates/ulpval.py`.)*
+
+**And the composition that does work is not a sum.** The path error is the per-step residuals
+**weighted by a product of downstream Jacobians** (`E ≈ Σ_i J_{i+1:n} · δ_i`), and that weighting is what
+makes a composed bound useless as an acceptance test: on our own stack the amplification is
+**~1.42× per layer and ~2500× by layer 22**, so a coherently propagated per-op bound lands at
+**≈ 0.15 relative — `2^-2.7`, about 2.7 bits of mantissa where bf16 offers 7**, i.e. a tolerance worth
+roughly a 4-bit float. That bound is *satisfiable*. It is rejected because it is **not falsifiable**:
+no width is simultaneously passable by a correct implementation **and** sensitive to a defect that
+matters. **A criterion a correct implementation cannot fail, and that a wrong one cannot fail either,
+is not a measurement.** *(**MEASURED**; `notes/numeric-acceptance.md` §2–§3.)*
+
+**So the method is: run the histogram, then reason about the result in light of how many steps are in
+the span.**
+
+1. **Run the histogram** over the span's output, in the format the span actually emits — and only where
+   the span is admissible at all (a single op, or an op pair with nothing accumulating between them).
+2. **Read the number against the span's step count.** The more steps you absorbed, the more room a
+   large number has to be legitimate — and the more you owe an account of **which step** the error came
+   from.
+3. **Do not accept a bound no tighter than the naive sum of the constituents' bars.** A span whose bound
+   is no better than the sum of its parts **has told you nothing**: that is the null result of a span
+   replacement, and it should be read as *"this span bought no precision back"*, not as *"this span is
+   correct"*.
+
+> ⚠ **What is missing here, stated rather than smoothed over: for a span that crosses an accumulation we
+> have no ulp-based acceptance criterion at all — by decision, not by omission.** The instrument adopted
+> for that case is a **paired-differential** fidelity measure plus a **decision-level** one, rather than a
+> tighter local histogram (`notes/numeric-acceptance.md` §3.1–§4). **For an admissible span the method is
+> the histogram plus the step count plus a per-step attribution; the acceptance bound is a judgement made
+> against those three, not a number that falls out of them.** Treat any span bound presented without that
+> reasoning as unverified.
 
 ---
 
@@ -225,7 +338,7 @@ are the ones that multiply the op count.
 
 ### 3.3.1 The chain
 
-Read from the source. **MEASURED** (the DSv4F implementation)
+Read from the source. **source read** (the DSv4F implementation)
 
 ```
 compute_routed(flat, topk_ids, topk_weights)
@@ -273,7 +386,7 @@ kernels you wrote by hand, you will undercount the path by that factor.
 
 `torch.ops.hpu.fp8_gemm_v2(A, trans_A, B, trans_B, D, out_dtype, A_scale_inv, B_scale_inv, bias,
 accumulate) -> Tensor` takes **2-D tensors**. It does **not** batch. So a batched expert GEMM becomes
-**G separate 2-D calls**. **MEASURED** (schema read from the installed library)
+**G separate 2-D calls**. **source read** (schema read from the installed library)
 
 **At K = 6 routed experts per token and 43 layers × 3 weights, that is 774 GEMM calls per decode
 step.** **MEASURED [DSv4F]**
@@ -351,6 +464,11 @@ This one is worth recording in full because it looks like an easy win and it is 
 are the **ALU** and the **materialised traffic**. Check your own port's structure before assuming
 either.
 
+**And before re-implementing any of this by hand, read §3.4.7:** the vendor ships a fused MXFP4 MoE op
+(`torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights`) that collapses the six stages above into one,
+with a measured conformance table for whether it is a drop-in for *your* model. (For DSv4F it is not —
+the activation is the wrong shape.)
+
 ---
 
 ## 3.4 Quantization formats and their hazards
@@ -360,14 +478,12 @@ either.
 first draft and is now **SETTLED** by measurement. Read it before anything else in this section: the
 wrong format *name* gives the wrong poison set, inverted.)*
 
-> **On sources.** A few claims in this section are cited from a **Gaudi evidence corpus** — an indexed
-> collection of vendor C++, vendor documentation, driver sources and datasheets, queried read-only
-> (the corpus lives at `~/Apps/gaudi-grimoire/` with a CLI; **349 active sources**). Each such claim
-> carries a **tier** (a rough provenance class) and a **sha256**, so a reader can verify it.
-> **This chapter does not depend on corpus access**: every claim is stated in full inline, and a
-> reader without the corpus still gets all of it. The citations exist so that the vendor-sourced
-> claims can be checked, and so that the distinction between *our measurements* and *vendor
-> statements* stays visible.
+> **On sources.** A few claims in this section are **vendor-sourced** — the vendor's C++, the
+> vendor's published documentation, and public format specifications. Those are cited inline to a
+> file path or a URL a reader can fetch, so the vendor-sourced claims can be checked. **Everything
+> else in this section is our own measurement**, and the text says which is which at each claim.
+> **Nothing here depends on a source a reader cannot reach**: every claim is also stated in full
+> inline.
 
 ### 3.4.1 What the device's fp8 actually is — **SETTLED**
 
@@ -449,9 +565,9 @@ codes are finite.)*
 too wide.** It also dissolves an apparent conflict with Intel's `neural_compressor`, which describes
 Gaudi 2's fp8 as `float8_e4m3fnuz` (**bias 8**). **Both statements are true about different things.**
 
-**The vendor C++ says the bias is a runtime-selected parameter.** `gaudi-pytorch-bridge`,
-`backend/h2d_scales_cache.cpp:24-88` — tier **B**, sha256
-`5979f7896269741952c83c4c2de7aab86200e6f5b6a3a7021e9fd29202675ad6`:
+**The vendor C++ says the bias is a runtime-selected parameter.** The vendor's PyTorch bridge,
+`backend/h2d_scales_cache.cpp:24-88` — public source, `HabanaAI/gaudi-pytorch-bridge` (our copy of
+the tree is archived at `data/Archive-2026-10-12/reference-diff/bridge/`):
 
 ```cpp
  * Default exp_bias is 7 (only torch.float8_e4m3fn is supported).
@@ -465,17 +581,18 @@ is carried **in the scale tensor**, per op.
 
 **Corroborated three ways:**
 
-- **Vendor documentation** — tier **B**, `habana-docs`,
-  `.../PyTorch/Inference_on_PyTorch/Quantization/Inference_Using_FP8.html`: *"In Gaudi 2 there are
-  **4 possible exponent-bias values (3, 7, 11, 15), where 7 is the default exponent bias**"*, against
-  Gaudi 3's expanded range (0, 63).
-- **Intel `neural_compressor`** — tier **D**,
+- **Vendor documentation** —
+  `https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Quantization/Inference_Using_FP8.html`
+  (verified present in the 1.24.2 docs set): *"In Gaudi 2 there are **4 possible exponent-bias values
+  (3, 7, 11, 15), where 7 is the default exponent bias**"*, against Gaudi 3's expanded range (0, 63).
+- **Intel's open-source `neural_compressor`** —
   `neural_compressor/torch/algorithms/fp8_quant/_core/fp_utils.py:73-146`:
   `EXP_BIAS_SETS[(GAUDI2, torch.float8_e4m3fn)] = [3, 7, 11, 15]`.
-- **The vendor docs describe our measured *default* byte-for-byte** — tier **B**, `habana-docs`,
-  `.../Debugging_Guide/Model_Troubleshooting.html:147-163`: *"S.1110.111 = 240.0"*,
-  *"Encoding for INF (S.1111.000)"*, *"more encoding for NaN (S.1111.{001..111})"*. That is exactly
-  the table in §3.4.1.
+- **The vendor docs describe our measured *default* byte-for-byte** — the vendor's
+  model-troubleshooting material: *"S.1110.111 = 240.0"*, *"Encoding for INF (S.1111.000)"*,
+  *"more encoding for NaN (S.1111.{001..111})"*. That is exactly the table in §3.4.1. *(⚠ We could
+  not resolve a fetchable URL for that page in the current public docs set — recorded rather than
+  papered over. The table it agrees with is measured on the device, so nothing here rests on it.)*
 
 **⇒ The statement to carry:**
 
@@ -565,8 +682,8 @@ is carried **in the scale tensor**, per op.
 
 The **three new measurements** are disclosed rather than presented as archive-sourced. The
 **vendor-sourced claims** (the selectable exponent bias and the e8m0 byte-255 definition) are cited
-inline with a tier and a sha256, and come from the read-only evidence corpus described in §3.4's
-opening note — **not** from our own measurements; the chapter says which is which at each claim.
+inline to the vendor's own source, the vendor's documentation, and a public format specification —
+**not** from our own measurements; the chapter says which is which at each claim.
 Device hygiene for both device probes: one HPU, no vLLM, `GC_KERNEL_PATH` untouched, all four AIPs at
 the 768 MiB / 0 % idle baseline before and after.
 
@@ -657,13 +774,23 @@ For MXFP4 expert weights:
   mis-derived** — and the diagnosis built on top of it (*"the oracle's model of the TPC vector-load
   layout over an `[R, C]` tensor is wrong"*) was itself the **mis-diagnosis**. With the correct
   permutation a layout-aware oracle matches **exactly** (0 of 1,024 bytes differ). **MEASURED**
-  *(`analysis/perm_probe.py`; also `T7` of the replacement `test_fp4.py`.)*
+  *(`Archive/by-date/2026-10-11/fp4_clamp/analysis/perm_probe.py`; also `T7` of the replacement
+  `Archive/by-date/2026-10-12/fp4-op-contract/test_fp4.py`.)*
 
   **⇒ This is the manual's own reading lesson in miniature: a wrong inverse made a *correct*
   implementation look wrong, and the wrong conclusion is the one that got written down. When a layout
   disagrees with your oracle, check your inverse before you indict the kernel.**
-- **`fp4_dequant_fwd_gaudi2` is bit-exact** on the full domain (all 256 byte values × all 256 `k`
-  values, 8 388 608 bytes) and at six production shapes, including the consumer operand. **MEASURED**
+- **`fp4_dequant_fwd_gaudi2` is bit-exact against its own contract oracle** on the full domain (all
+  256 byte values × all 256 `k` values, 8 388 608 bytes) and at six production shapes, including the
+  consumer operand. **MEASURED**
+  > **⚠ The oracle is a transcription of the kernel, so this says less than it looks.** `test_fp4.py`'s
+  > `fold()` contains the kernel's subnormal arithmetic **verbatim**
+  > (`((1 << max(t+2,0)) & m) + …`), so it cannot disagree with the kernel on any `t <= 0` cell —
+  > `T1` and `T5` therefore pass *by construction* on the whole lower end. Against the
+  > **correctly-rounded** `e4m3fn(fp4_value · 2^k)` the kernel differs in **1,764 of 4,096 cells**:
+  > the entire `t <= -3` subnormal **floor** and the `k >= 119` wrap. The kernel is bit-exact only for
+  > `k >= -8` — see the next subsection and
+  > `Archive/by-date/2026-10-12/fp4-op-contract/REPORT.md`.
 
 #### The exponent fold was UNCLAMPED — **FIXED**, APPLIED to the tree, and reviewed
 
@@ -737,7 +864,7 @@ earlier draft claimed (only the absolute span between the two *small* shapes hol
 
 **How much of that reaches the wall — and the honest bound on it.** An added `D ≈ 6.4 µs` per launch
 is only exposed if the device has a gap to absorb it. Measured from the existing decode trace
-(1,548 launches; `analysis/exposure.py`; **no engine run**): the fp4 launches are a **packed critical
+(1,548 launches; `Archive/by-date/2026-10-11/fp4_clamp/analysis/exposure.py`; **no engine run**): the fp4 launches are a **packed critical
 chain** — **union/sum = 0.965** (90.501 of 93.735 ms), the **median gap to the next launch is
 −2.14 µs**, and **1,376 of 1,547** gaps are **≤ 0**. So **88.9 %** of `D` is exposed on the *device*
 timeline: **2.20 ms/step** (against a summed-op bound of 2.47 ms/step).
@@ -747,7 +874,8 @@ timeline: **2.20 ms/step** (against a summed-op bound of 2.47 ms/step).
 > of it is inside the critical region, giving **~1.2 ms/step ≈ 1.4 % of an 88 ms step.** Treat the
 > **2.20 ms/step device bound as measured** and the **~1.2 ms/step wall figure as an estimate**.
 > **The decision that follows is explicit, not a reflex:** the clamp costs ~2.2 ms/step of device
-> time to guard a condition that **cannot fire on this checkpoint** (256× margin), while the load-time
+> time to guard a condition that **cannot fire on this checkpoint** (64× margin — see the correction
+> below), while the load-time
 > assertion alone costs **0 ms/step**. Both are in place; reverting the clamp is one patch reversal
 > plus a rebuild. **MEASURED / ESTIMATED**
 
@@ -756,8 +884,22 @@ assertion** makes the defect **unreachable at zero runtime cost** — so the sat
 **deliberate correctness-over-speed choice**, not the thing that buys the safety. **The assertion is
 written on the scale VALUE, which is the form the loader actually has in hand:**
 `max(scale) ≤ 2⁵ = 32.0` ⟺ exponent byte `≤ 132` ⟺ `k ≤ 5` ⟺ `t ≤ 14`. On this checkpoint the global
-max is **0.125 = 2⁻³**, i.e. a **256× margin** — and the guard was verified to **fail** when it should
-(`2⁵` passes, `2⁶` raises). Keep both if you want safety by construction *and* safety in fact.
+max over the scales the fp4 kernel is actually **fed** is **0.5 = 2⁻¹** (byte 126,
+`layers.35.ffn.experts.12.w2.scale`), i.e. a **64× margin** — and the guard was verified to **fail**
+when it should (`2⁵` passes, `2⁶` raises). Keep both if you want safety by construction *and* safety in
+fact.
+
+> **Correction (2026-10-12) — this margin was wrong by 4×, and it contradicted this section's own
+> table.** An earlier revision said *"max scale = 0.125 = 2⁻³ ⇒ 256× margin"*, measured over **3,840**
+> scale tensors — that is **5 of the 44 MoE layers** — and stated as a whole-checkpoint property. An
+> exhaustive scan of all **33,792** kernel-fed tensors (`layers.*.ffn.experts.*.w{1,2,3}.scale`,
+> 8,857,043,456 elements) gives **max byte 126 → 0.5 = 2⁻¹ ⇒ 64×**. The table two paragraphs above
+> already said the byte range is `[118, 127]`, i.e. it *contains* a byte whose scale is `2⁰ = 1.0`
+> (⇒ 32×) — that one lives under the **uninstantiated** `mtp.` head, which is why the two figures
+> differ. **The assertion itself is correct and passes; only the stated margin was wrong. MEASURED**
+> *(`Archive/by-date/2026-10-12/fp4-op-contract/` — `scale_hist.py`, `scale_extremes.py`, REPORT §5.1.)*
+> Note it is also a **per-layer** quantity at runtime (`_v4_load_routed_experts` runs once per MoE
+> layer), so a single checkpoint-wide number is the wrong *shape* for it as well.
 
 > **Status block — what "FIXED" does and does not mean here.**
 > - **APPLIED to the shipping tree, deliberately.** Both protected artifacts are **superseded by
@@ -773,7 +915,8 @@ max is **0.125 = 2⁻³**, i.e. a **256× margin** — and the guard was verifie
 >   **PASS**, unfixed arm **FAIL** (544 failing `(byte, k)` pairs, first `(6, 6)`: expected `0x77`,
 >   got `0x78`).
 > - **The load-time assertion is `max(scale) <= 32.0`** (threshold derivation above), and its margin
->   is measured: on the real checkpoint the global max is **0.125 = 2⁻³** ⇒ **256× margin**. It **can
+>   is measured: on the real checkpoint the global max is **0.5 = 2⁻¹** ⇒ **64× margin** (corrected
+>   2026-10-12; an earlier revision said 0.125 ⇒ 256×, from a 5-of-44-layer subset). It **can
 >   fail** (verified: `2⁵` passes, `2⁶` raises), costs **zero runtime**, and converts a silent
 >   corruption into a loud load-time failure. **Limitation, accepted:** it lives at **one caller**, so
 >   a future quantiser or a different checkpoint path bypasses it — which is exactly why the kernel
@@ -868,6 +1011,110 @@ error is left in the safe direction and bounded. Recorded so nobody re-derives i
 > gate** — the same failure as the two halves above, one level up, and it survived until the check was
 > made to assert the **contract** directly (`sign == 0 ⟹ bit 7 clear`).
 
+#### The OTHER end of the fold — the subnormal FLOOR, and it is not guarded
+
+> **Status: REAL GAP, NOT FIXED, and LIVE on this checkpoint.** Found 2026-10-12 while chasing a side
+> finding in the vendor-conformance probe. Instruments + report:
+> `Archive/by-date/2026-10-12/fp4-op-contract/`. **No code was changed** — this section is the
+> specification of the fix, not the fix.
+
+The upper clamp above guards `t = exp + k` **above**. The same expression is unguarded **below**, and
+the subnormal branch is where it shows:
+
+```c
+VECTOR sh2 = v_i8_max_b(v_i8_add_b(t, BCAST(2)), BCAST(0));      // clamp EACH term to >= 1
+VECTOR sh1 = v_i8_max_b(v_i8_add_b(t, BCAST(1)), BCAST(0));
+VECTOR sub = v_i8_add_b(v_i8_shl_b(BCAST(1), sh2),
+                        mant ? v_i8_shl_b(BCAST(1), sh1) : 0);
+```
+
+**The bug is that the two terms are clamped separately where their SUM should be rounded.** For
+`t <= -3` the true value is less than one unit of `2⁻⁹`, so the correctly-rounded answer is `0` — but
+`2^max(t+2,0)` cannot go below 1, and the `mant` term cannot either, so the sum floors at 1 (or 2).
+
+**What it is, and what it is not — measured on all 4,096 `(code, k)` cells, one op call.** The kernel's
+byte is compared against the correctly-rounded (RNE, 240-ceiling) `e4m3fn(fp4_value · 2^k)`:
+
+| region | condition | cells | differ | worst \|err\| |
+|---|---|---:|---:|---:|
+| `zero` / `normal` (`t∈[1,14]`) / `sub_ok` (`t∈[−2,0]`) / `sat` | — | 512 / 196 / 42 / 1582 | **0 / 0 / 0 / 0** | 0 |
+| **floor** | **`t <= -3`** | **1656** | **1656** | **`2⁻⁸` = 0.00390625** |
+| **wrap** | `t` unwrapped `> 127` | **108** | **108** | 1.02e39 |
+
+* The fold is **bit-exact everywhere except those two regions** — so the lower end has **no third
+  failure mode**: **0 poison bytes and 0 sign flips in all 4,096 cells** (the int8 add cannot wrap at
+  the bottom, `exp + k >= 6 - 128`). It is a **bounded magnitude overshoot**: magnitudes are only ever
+  `±2⁻⁹` (mantissa-0 codes 1,2,4,6,9,10,12,14) or `±2⁻⁸` (mantissa-1 codes 3,5,7,11,13,15).
+* **Absolute error bounded, relative error unbounded.** `|kernel - true| <= 2⁻⁸` always; the ratio
+  reaches 1.3e36 at `k = -128`. **8 of the 1656 cells are exact ties** (true value exactly `2⁻¹⁰`,
+  half a unit of `2⁻⁹`) and 1648 are unambiguous.
+* **Strictly per-cell.** One group at `k = -128` with 255 benign groups leaves **0 of 4080** benign
+  cells changed. Unlike the vendor MXFP4 fused op (§4.2 of the conformance probe), one bad scale
+  **cannot** poison a whole tensor here: `0 × inf` needs a non-finite operand and the floor emits a
+  finite byte. **Silent**, though — the output is a plausible number, and the shipped gate passes.
+* **The device disagrees with the kernel too.** `cast_to_fp8_v2` on the HPU maps `2⁻¹⁰ → 0x00`,
+  `1.5·2⁻¹⁰ → 0x02`, `3.5·2⁻⁹ → 0x04` (all RNE), `248`/`256` → `0x77` (the 240 ceiling) and
+  `−2⁻¹⁰ → 0x80`. So the kernel's tie-break is a deviation from the hardware's own cast, not just from
+  the spec's `T.Cast(FP8, .)`.
+
+**Exactness boundary: `k >= -8`** (exponent byte `>= 119`, scale `>= 2⁻⁸`) — the kernel header states
+this correctly, and it is confirmed by measurement (0 mismatches in every `t >= -2` cell). What the
+header gets wrong is the attribution: *"exact for the checkpoint's scale range"* — **this checkpoint
+reaches `k = -9`** (byte 118, 1,070 groups). Copied into four sibling kernels and
+`src/gates/step12_routed_spec_arm_gate.py:81`; all five need the same correction.
+
+**Reachability, measured.** The scales the fp4 kernel is actually fed are
+`layers.*.ffn.experts.*.w{1,2,3}.scale`: 33,792 tensors, **byte [118, 126] → k ∈ [−9, −1]** (the
+`mtp.` head reaches [119,127] but `DeepSeekV4MTP = None`; the non-expert set reaches [114,121] →
+`k ∈ [−13,−6]` but never enters this kernel). Byte 118 occurs in 51 tensors / 1,070 groups, and a
+byte-level scan of the packed weights finds **1,399 weights** carrying nibble code 1 or 9 — the only
+two codes that engage the floor at `k = -9`. Confirmed on the device on real weights (layer 35 `w1`:
+experts 101/104/200/231 → 9/0/41/211 = **261**, exactly the scan's layer-35 total). **The margin is
+ZERO**: the checkpoint's minimum byte is 118, which is precisely the byte at which the floor stops
+being a tie and becomes an unambiguous over-shoot one step deeper (`<= 117`).
+
+**The fix — and what it does NOT do.** A load-time **guard** (a `raise`, like the top one — *not* an
+assertion that silently passes) at **`min scale >= 2⁻⁹`**, i.e. exponent byte `>= 118`, `k >= -9`,
+costs **0 ms/step**. **It must NOT mirror the top-end assertion:** the *exactness* bound is `2⁻⁸`
+(byte `>= 119`) and **that threshold would refuse to load this checkpoint** (its minimum byte is
+exactly 118). The right threshold is the *tie* threshold, `2⁻⁹` — the line at which the kernel is
+"never worse than a tie". **It has ZERO margin on this checkpoint.**
+
+> **⚠ Correction (2026-10-12, same day, after review).** An earlier revision of this paragraph said
+> `2⁻¹⁰` / "byte `>= 118`" — those two are **not the same threshold** (`2⁻¹⁰` is byte **117**) — and
+> then claimed the guard makes the condition "unreachable at zero runtime cost". **Both were wrong.**
+> `2⁻¹⁰` permits byte 117, whose 6 engaged cells are *unambiguous* over-shoots (up to 3× relative),
+> not ties; and **no guard can fix the 1,399 live weights**, because a guard only *refuses* inputs —
+> it cannot change how a permitted input is computed. The live case **is** byte 118, which the guard
+> must permit to load this model at all. Measured per-`k` profile of the floor (device bytes, RNE
+> reference), which is what makes the threshold choice decidable:
+>
+> | `k` | byte | cells deviating | max \|error\| | max relative | class |
+> |---:|---:|---:|---:|---:|---|
+> | **−9** | **118** | **2** | **2⁻¹⁰** | **1 (i.e. 2×)** | **exact ties** |
+> | −10 | 117 | 6 | 2.4e−3 | 3 | unambiguous |
+> | −11 | 116 | 10 | 3.2e−3 | 7 | unambiguous |
+> | −12 | 115 | 14 | 3.5e−3 | 15 | unambiguous |
+> | −13 | 114 | 14 | 3.7e−3 | 31 | unambiguous |
+> | ≤ −20 | — | 14 | → 2⁻⁸ | → 4e3…1.3e36 | unambiguous |
+>
+> So deeper bytes are worse **in both senses** — more cells *and* a larger per-cell error (8× from the
+> boundary to the `2⁻⁸` asymptote) with an unbounded relative error. **The guard buys:** the deviation
+> set shrinks from 14 codes to 2, the per-cell bound from `2⁻⁸` to `2⁻¹⁰`, the relative error from
+> unbounded to 2×, and any deeper checkpoint becomes a loud load failure instead of a silent one.
+> **It does not buy correctness on this checkpoint** — the 1,399 tie weights need the kernel's
+> subnormal rounding changed (`(t >= -2) ? sub : ((t == -3) ? mterm : 0)`, ≈ +3–4 instructions, not
+> the +2 that only fixes `t <= -4`), and that must be coordinated with whoever holds the kernel. The
+> two are **not alternatives**.
+
+**⇒ The transferable lesson.** A **one-sided guard is a claim about the other side.** The top-end
+assertion was honest in its own title (*"upper-bound guard"*) and still misled, because every
+description around it — the kernel header, the test's contract scope, and this manual — spoke as if
+the range were bounded. And *"unreachable on this checkpoint"* needs the checkpoint's histogram **of
+the right population**: the old "256× margin" came from a 5-layer subset, and the reported "−13" came
+from a scale population that never reaches this kernel. Both numbers were real; only their
+populations were wrong.
+
 #### The e8m0 hand decode was WRONG at byte 255 — **FIXED** and reviewed
 
 > **Status: FIXED, and independently REVIEWED — and the review found the fix itself broken as first
@@ -877,15 +1124,18 @@ error is left in the safe direction and bounded. Recorded so nobody re-derives i
 > since fixed. See the status block below; the findings are kept because they are the transferable
 > part.
 
-**The same class as the unclamped fold above, found in the same corpus pass — and this one is a defect
-in our own loader.**
+**The same class as the unclamped fold above, found by the same sweep — and this one is a defect in
+our own loader.**
 
-The e8m0 format is defined by the **OCP Microscaling Formats (MX) specification §5.4.1**:
+The e8m0 format is defined by the **OCP Microscaling Formats (MX) specification §5.4.1** (public: the
+OCP MX v1.0 specification PDF, `opencompute.org`):
 
 > "E8M0 is an unsigned exponent-only scale format with bias 127. **A finite encoded byte `b` in
 > `[0, 254]` represents `2 ** (b - 127)`; `0xFF` is reserved for NaN.**"
 
-— tier **D** (docs crawl), `vllm-docs-content-crawl-20261004`, `.../deepseek_v4/amd/rocm/index.html`.
+**And we confirmed the definition ourselves, so the claim does not rest on the citation:**
+`torch.float8_e8m0fnu` reads bytes `0..254` as finite (`0x7F` → `1.0`, `0xFE` → `1.70e38`) and
+**byte `255` → `NaN`**. **MEASURED** (our check, torch 2.11).
 
 **So our hand decode is wrong at exactly one byte.** The loader's decode is `2 ** (b − 127)`, which
 returns a finite value for `b = 255`; the format says **NaN**. **Torch's own `float8_e8m0fnu` is
@@ -967,7 +1217,7 @@ right and we are wrong.** **MEASURED**
 > section.
 
 *Corroboration, and how not to read it.* A vendor **test helper** clamps rather than special-cases —
-`return max(0, min(255, exp + 127))` — so it **allows** 255 (tier **B**, `gaudi-pytorch-bridge`,
+`return max(0, min(255, exp + 127))` — so it **allows** 255 (the vendor's PyTorch bridge,
 `tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:83-88`). **Do not read the test
 helper as contradicting the spec**: it is a test helper, not a format definition. The OCP citation is
 the authority.
@@ -1009,6 +1259,239 @@ Amplification **13.74×** against the 3.25 GB the path itself reads.
 > not lowered to those events, or it is folded. **MEASURED**
 >
 > **⇒ Do not build a doctrine on the 12.99 GB.** Do not quote it as a measurement.
+
+---
+
+### 3.4.7 The vendor MXFP4 fused op — is it a drop-in for a new model?
+
+**The op.** `torch.ops.hpu.mixture_of_experts.mxfp4_fused_weights` is a vendor fused MoE for packed
+MXFP4 weights: it takes packed `uint8` weights plus `uint8` E8M0 scales and does the dequantisation,
+the two expert GEMMs, the activation and the routing **inside one op** — i.e. it is the fused
+alternative to the six materialising stages of §3.3. Our tree wraps it at
+`src/vllm-gaudi/vllm_gaudi/extension/ops.py:1841` (`VllmMixtureOfExpertsOpMXFP4`, which passes
+`permuted_weights=True` hardcoded at `:1951` and selects the `bias_*` variant purely on `has_bias`
+at `:1908`). **source read** — the artifact is named and quotable, but nothing was executed.
+
+**Why this subsection exists.** *"Can we adapt the stock fp4 builtin to our model?"* is a recurring
+question, and the answer is not yes-or-no — it is a **table of axes, each pass / fail / UNKNOWN**.
+What follows is that table, from an **op-level unit probe**: one HPU (module 3, pinned
+`HLS_MODULE_ID=3`), **no model, no vLLM, no server** — **under 30 s of device time for the
+conformance sweep, and ~6 s for the separate activation probe.** Where an axis was not tested it says
+**UNKNOWN**, never FAIL.
+
+*Artifacts. The conformance table and every number in it:
+`Archive/by-date/2026-10-12/fp4-builtin-conformance/` — `REPORT.md`, the decisive script `xprobe.py`
+(the dequant-as-readout table), `consprobe.py` (block size / dtype / shape constraints), `compare.py`
+(offline head-to-head against our op), `bench_ours.py`, and `out/*.json`. The activation and layout
+axes: `Archive/by-date/2026-10-12/a1-probe/` — `REPORT.md`, `mxfp4_act_probe.py`, `A1.json`. The
+clamp census behind the DSv4F line below:
+`data/Archive-2026-10-12/a0b-clamp-census/REPORT.md`.*
+
+**Bridge line numbers in this subsection are pinned to a revision.** Every
+`mixture_of_experts_gen.cpp:NNN` reference here is to **`gaudi-pytorch-bridge` v1.24.1** (commit
+`5176b1b2d6865608514e83a2b1fd66459920676e`, `github.com/HabanaAI/gaudi-pytorch-bridge`) — the
+revision our image ships. A newer upstream `master` carries the same code about 20 lines later
+(`:1441` → `:1461`, `:1553` → `:1574`, `:1448` → `:1468`), so a check against `master` lands in the
+wrong place. **The numbers are right for the revision we measured, not for `master`.**
+
+#### The readout — why the table is a measurement and not a fit
+
+The op's GEMMs are made **transparent**. With `H = F`, `x = ones(T, H)`, exactly one non-zero per row
+of `w12` at column `k` (`1.0` in the gate half, the test value in the up half) and `w3 = I_F`, the
+device output **is** `relu(gate) · up` at inputs we chose — i.e. the **vendor decode of
+`(nibble_k, e8m0_byte_k)`, in bf16, with no weight-quantisation error and no activation error**. One
+call reads `F = 128` independent `(nibble, scale-byte)` pairs; the full 16 × 256 isolated table is
+4096 cells and takes **2.42 s**. **MEASURED**
+
+> ⚠ **A harness bug that produced a *plausible wrong answer* — kept because it is an instance of the
+> op's most important property.** The first table put all 128 channels of a call in one byte group
+> (bytes 248..255 together) and reported *"bytes 248–255 decode to NaN for every nibble"*. That is
+> **false**: byte 248 decodes correctly to `6 × 2^121 = 1.59507e+37`. It was wrong because of trap 1
+> below — the byte-255 channel's weight overflows bf16 to `inf`, and the down-projection GEMM then
+> computes `0 × inf = NaN` for **every other channel**. **A dequantisation probe must isolate each
+> cell.** The superseded table is kept as evidence (`out/decode_table_device_SUPERSEDED.pt`).
+> **MEASURED**
+
+#### The conformance table
+
+| # | axis | result |
+|---|---|---|
+| 1 | **activation** | **plain SILU, NO clamp** — `h = silu(gate) · up`. `gate = 40, up = 40` → the device returns **1600.0** (a clamp at 10 would give 99.9955; at 7.0, 48.9554). Fitted over 8192 cells: no-clamp `rel = 6.30e-04` (96.24 % within 1 bf16 ulp), against **15.0** for clamp-±10 and **31.7** for clamp-±7.0; on the **1505** cells where the hypotheses differ by more than 2 ulp the device is no-clamp on **100.00 %** and clamp-±10 on **0.00 %**. ⇒ **not a drop-in for a model that clamps.** **The kernel's SILU is not bit-identical to a torch `silu`** — 96.24 % of cells within 1 bf16 ulp, 99.93 % within 2, max **2.13 ulp** — which is why the fit above has a residual at all rather than being exact. **MEASURED** |
+| 2 | **`limit` parameter** | **INERT on all three activation modes.** All three activation strings are honoured and none clamps — `relu(40) = 40` on the device, not 7. The clamped path is not merely unselected, it is **unreachable through this op**: `gpt_swiglu` is hardcoded `false` (`hpu_ops/backend/mixture_of_experts_gen.cpp:1441`), so the `1.702 / 7.0` pair that the same file writes into the params is never consumed. **MEASURED** (the inertness); **source read** (the unreachability) |
+| 3 | **gate/up layout, non-bias path** | **HALVES, not interleaved** — `w12 = cat(w1, w2, dim=0)`. `halves` fits at `rel = 6.3e-04`; `interleaved` at **`rel = 1.0000`**, i.e. *completely* wrong, so the two are not confusable. ⇒ **a silent gate/up-swap trap.** **Scope: this is the NON-BIAS op only.** The bridge's *bias* / GPT-SwiGLU path is a **different op and a different code path** (`gpt_swiglu = true`, `mixture_of_experts_gen.cpp:1553`, against `false` at `:1441`), and its layout is **UNKNOWN** (§3.9 item 17). Do not read the two as a disagreement — see the note under this table. **MEASURED** |
+| 4 | **e8m0 decode, bytes 0..254** | **PASS** — **4052 / 4068** finite cells are bit-identical to the correctly-rounded IEEE bf16 of the exact OCP MX value `fp4 × 2^(b−127)`. The 16 that differ are all **flush-to-zero** (see below), and the 28 non-finite cells are *exactly* `{true product exceeds bf16 max} ∪ {byte 255}` — verified by **set equality**. **MEASURED** |
+| 5 | **fp4 exponent fold at the top of the range** | **PASS — the op does NOT have our defect.** There is no reserved bin and **no sign clobber**: the overflow is IEEE-correct with the **sign preserved** (code 7, byte 253 → `+inf`; code 15, byte 253 → `−inf`). This is the axis the port actually cared about, and it is the one place the vendor op is **better** than ours. ⇒ **a port does not inherit the `t = exp + k` bug class from this op** — but it must not *assume* our saturating semantics either. **MEASURED** |
+| 6 | **block / group size** | **`block_size` is INERT — every value behaves as 32.** `8 / 16 / 64 / 128 / 0` all produce the `block_size = 32` answer, and a scale tensor shaped for anything other than `ceil(cols/32)` columns is a hard **graph-compile failure** (`synStatus 26`). **MEASURED** — and it **contradicts the kernel source's own comment** (trap 2). |
+| 7 | **input dtype** | **bf16 only.** fp16 and fp32 are **rejected at graph compile** (`synStatus 26`) — the cguid has no moe kernel for those precisions. **MEASURED** |
+| 8 | **shapes** | **PASS — no alignment requirement.** `T ∈ {1,2,3,5,8,16,17,32,33,64,65,128,129,256,512,1024}` all correct; `H × F` including the non-multiples **31, 33, 65** all correct, with the tail beyond `F` exactly `0`. Output bf16, shape == `hidden_states`; padding is internal. **MEASURED** |
+| 9 | **bit-exactness vs a guarded custom dequant** | **NOT bit-exact — 742 / 748 cells identical** over the region both output formats can represent; the 6 differences are all a **subnormal-floor** effect. See below. **MEASURED** |
+
+**A non-conflict worth stating, because the naive reading of row 3 is a false alarm.** The
+"interleaved gate/up split" the bridge *documents* belongs to the **`bias_mxfp4_fused_weights` /
+GPT-SwiGLU path** (`gpt_swiglu = true`, `hpu_ops/backend/mixture_of_experts_gen.cpp:1553`), which is a
+**different op and a different code path** from the one measured here (`mxfp4_fused_weights`,
+`gpt_swiglu = false`, `:1441`). So the `halves` result above is **not contradicted** by it, and the two
+must not be presented as a disagreement. What the *bias* path's split actually is remains **UNKNOWN**
+(§3.9 item 17) — it is the arm that wedges the card. *(The one genuine disagreement in the vendor
+artifacts is doc-against-doc and about that path: a bridge test docstring
+(`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:741`, in the same archived bridge
+tree as the `gen.cpp` comment above) says "interleaved", while **vllm-gaudi**'s own `swiglu_oai`
+reference (`vllm_gaudi/models/minimax_m3_sparse.py`) says split/first-half. Neither is a device
+measurement, we have not resolved it, and we do not claim to.)*
+
+> **A harness trap inside axis 8, recorded because it faked a result.** The first shape sweep
+> reported `FailOnRecompileLimitHit` for 30 of 40 configurations — it measured the *harness*, not the
+> op, because dynamo's recompile limit is **per code object** and a fresh `@torch.compile` closure
+> does **not** reset it. `torch._dynamo.config.recompile_limit = 512` fixed it. **MEASURED**
+
+#### ⚠ TRAP 1 — one out-of-range scale NaNs the ENTIRE layer, not one channel
+
+**This is the single most important porting fact in this subsection.**
+
+With exactly **one** channel carrying an overflowing weight — `(code 7, byte 254)` — and the other
+127 channels exactly `0.0`, the probe channel returns `+inf` and **all 1016 benign outputs (127
+channels × 8 tokens) return NaN**. The down-projection GEMM computes `0 × inf = NaN`, so there is
+**no per-channel containment**. **MEASURED**
+
+**The op has no guard on the scale.** Contrast our own path, where the analogous failure is
+*bounded*: the stack refuses `0xFF` at load and asserts a bound on the max scale (§3.4.5), and the
+kernel saturates to the fp8 ceiling. On the vendor op a bad checkpoint scale is **global** — the
+whole layer output becomes NaN, not one weight. **MEASURED** (the whole-layer NaN) / **INFERRED**
+(the absence of a guard — an absence claim, supported by the byte-255 row below)
+
+**And byte 255 is not refused either.** Even `(code 0, byte 255)` — a weight of exactly `0.0` —
+returns NaN, which requires the *scale* to be non-finite. **UNKNOWN whether that scale is `inf` or
+`NaN`**: the op cannot distinguish them (`0 × either = NaN`). Either reading means the op lets a
+non-finite scale into the tensor rather than rejecting it. **MEASURED** (the NaN); **UNKNOWN** (which
+non-finite).
+
+⇒ **Before choosing this op, histogram the real scale tensors.** On our own checkpoint the
+routed-expert scales live at bytes `[118, 127]` and the non-expert scales at `[114, 121]`, so byte
+255 is unreachable *here* — which is exactly why the guard is cheap to keep and easy to lose.
+**MEASURED** — the histogram and the byte ranges come from our e8m0 byte-255 gate,
+`src/gates/step_e8m0_byte255_gate.py:19-20`.
+
+#### ⚠ TRAP 2 — `block_size` is a decoy
+
+The op *takes* `block_size`, and the bridge's own source comment says why, verbatim
+(`hpu_ops/backend/mixture_of_experts_gen.cpp:1448-1450` in **bridge v1.24.1** — upstream `master`
+has this at `:1468`; see the revision note above. Our copy of that tree is archived at
+`data/Archive-2026-10-12/reference-diff/bridge/`):
+
+```
+// block_size must always be set for MXFP4: the cguid-inserted
+// cast_packed_mxfp4_to_bf16 kernel uses it to index E8M0 scales
+// regardless of whether expert-parallelism chunking is active.
+```
+
+**It does not.** Measured with a discriminating design — scale column 0 = byte 127 (scale `1.0`),
+every other column = byte 0, so a *honoured* `block_size` would give `6.0` for channels `k < bs` and
+`~0` for `k ≥ bs`: **MEASURED**
+
+| declared `block_size` | scale columns | `k = 0..24` | `k = 32` | verdict |
+|---:|---:|---:|---:|---|
+| 32 | 4 | 6.0 | 0.0 | baseline, correct |
+| 64 | 2 | — | — | **compile FAIL `synStatus 26`** |
+| 64 | 4 | 6.0 | **0.0** | honoured would give `6.0` at `k = 32` ⇒ **inert** |
+| 128 | 1 | — | — | **compile FAIL** |
+| 128 | 4 | 6.0 | 0.0 | **inert** |
+| 16 | 8 | — | — | **compile FAIL** |
+| 16 | 4 | 6.0 | 0.0 | honoured would give `0.0` at `k = 16`; it gives `6.0` ⇒ **inert** |
+| 8 | 4 | 6.0 | 0.0 | **inert** |
+| 0 | 4 | 6.0 | 0.0 | **inert** |
+
+⇒ **Fixed at 32.** The declared value is a no-op for E8M0 indexing, and the scale *shape* is what is
+enforced — by a compile-time failure, not by a runtime check. The vendor's own test asserts the same
+(`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:103`:
+`assert block_size == MXFP4_GROUP_SIZE, "TPC kernel requires group_size=32"`), and our own
+`fp4_dequant` uses the same 32-wide group. **A port that "sets `block_size` to match the checkpoint"
+silently gets group-32 semantics.**
+
+**This is the §3.4.5 lesson in the vendor's tree rather than ours: a source comment is a claim, not a
+measurement.** It is stated plainly here because a porter will find the comment and not the
+measurement.
+
+#### Not bit-exact — even where the two formats agree
+
+Over the region **both output formats can represent**, **742 / 748 cells are bit-identical and 6
+differ, by 64 bf16 ulp**: **MEASURED**
+
+| cell | exact | vendor | ours |
+|---|---:|---:|---:|
+| code 3, byte 118 (`k = −9`) | 0.0029296875 | 0.0029296875 | 0.00390625 |
+| code 5, byte 117 (`k = −10`) | 0.0029296875 | 0.0029296875 | 0.00390625 |
+| code 7, byte 116 (`k = −11`) | 0.0029296875 | 0.0029296875 | 0.00390625 |
+| *(plus the three negative mirrors, codes 11 / 13 / 15)* | | | |
+
+Our op's e4m3 output grid **floors** magnitudes below `2^-9` to `2^-9` and **rounds within the
+binade**, so `1.5 × 2^-9` lands on `2^-8` — a factor of **4/3**, which is the 64 bf16 ulp quoted
+above (measured against the exact value's binade).
+**These cells are inside the checkpoint's own scale range**: 52 of 128 cells differ over bytes
+`[114, 121]`, and 4 of 160 over the routed-expert range `[118, 127]`. There are **zero** arithmetic
+disagreements outside our fp8 representability, so this is a **format limit, not an arithmetic
+error** — but it is real, it is quantified, and it means the two ops are **not interchangeable at
+small magnitudes**. **⇒ "Adapt the builtin" is not a drop-in even where the formats agree.**
+**MEASURED**
+
+**The vendor decode also flushes subnormals to zero, and our kernel does not.** Byte 0 → scale
+`2^-127` is an **fp32 subnormal**, flushed to `0.0` for every nibble — including code 7, whose true
+product `3.53e-38` is a perfectly *normal* bf16. A **bf16-subnormal product** flushes too (code 1,
+byte 1 → `2^-127` → `0.0`; code 1, byte 2 → `1.18e-38` → kept). Our kernel instead floors to its own
+fp8 subnormal minimum. **Both are wrong; they are wrong differently.** **MEASURED**
+
+#### What to check before adopting
+
+Adopt the vendor op **iff all six hold.** Anything else is a rewrite or a rejection, not a config
+change.
+
+1. **Its activation matches the model's.** This op is plain SILU with no clamp, and the clamped path
+   is **unreachable through it**. A model that clamps the gate/up is **not** a candidate — and this
+   check alone rejects **DSv4F**, whose spec is `silu(clamp(gate, max=10)) · clamp(up, ±10)`: the
+   census prices dropping that clamp at worst-frame `rel = 1.184`, with 7 of 96 decode frames above
+   `8.524e-2`. **MEASURED [DSv4F]** (CPU census over captured decode frames)
+2. **Its gate/up layout matches the checkpoint's.** The non-bias path is **halves**; the checkpoint
+   must be `cat(w1, w2, dim=0)`. An interleaved checkpoint does not fit — and the mismatch is
+   *silent* in the sense that the op still returns a plausible number, wrong by `rel = 1.0`. Verify
+   it; do not assume it.
+3. **Every scale in the checkpoint is provably in range.** There is **no runtime guard** — an
+   **INFERRED** absence claim, whose measurement is the whole-layer NaN below. The first byte that
+   can overflow is **253**, not 248: byte 248 decodes to `6 × 2^121 = 1.59507e+37` and byte 252 to
+   `6 × 2^125 = 2.552e38`, both below bf16 max `3.3895e38`; the derivation is
+   `6 × 2^(b−127) > bf16 max ⟺ b ≥ 253`, which first bites at nibbles 6/7/14/15. One such byte turns
+   the **entire layer output** into NaN (trap 1). Histogram the real scale tensors first, and check
+   byte 0 for the FTZ.
+4. **The input is bf16.** fp16 / fp32 do not compile.
+5. **A 32-wide block matches the checkpoint's quantisation.** `block_size` is inert; the *shape* of
+   the scale tensor is not, and any column count other than `ceil(cols/32)` fails to compile.
+6. **The tolerance budget accepts an IEEE-±inf-vs-saturation difference at the top of the range.**
+   Ours saturates at the 240 ceiling inside its contract; the vendor overflows to `±inf`. Both
+   preserve the sign — that is the only thing they agree on up there.
+
+**The one-line version:** *the vendor op is a drop-in only for a bf16-input, SILU, no-clamp, block-32
+MXFP4 model whose scales keep every `|weight| ≤ bf16 max`.*
+
+#### Performance: measured, but NOT like-for-like — do not quote a ratio
+
+A microbenchmark exists and is deliberately **withheld as a ratio**. Vendor **whole fused op** at
+`T = 512, H = 4096, F = 2048`: **0.591 ms** median (min 0.519). Our `fp4_dequant` **alone** at the
+same packed size (16.8 M fp4 values): **0.409 ms** median (min 0.361). **The vendor number buys
+routing + two GEMMs + the activation; ours buys a dequant only** — so a naive ratio of the two
+numbers would be misleading in the vendor's favour by an unknown factor. The honest statement is: the
+fused op is cheap (**0.6 ms** at a production-ish decode shape); our dequant alone is the same order
+**as the vendor number, which buys more work**; and **the GEMM term is not measured here**. **A
+like-for-like chain benchmark is not yet built.**
+**MEASURED / NOT COMPARABLE**
+
+#### What this subsection does not establish
+
+| # | UNKNOWN | why it is open |
+|---|---|---|
+| 1 | the on-device semantics of the **GPT-SwiGLU clamped path** (`limit`, `alpha`, the gate/up split) — **a different op** (`bias_mxfp4_fused_weights`, `gpt_swiglu = true`) from the one measured above | the op that reaches it **wedged the compute queue** with a 30 s timeout on its first execution and was not retried. Its split is **UNKNOWN**: a bridge test docstring (`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:741`) says *interleaved*, while vllm-gaudi's own `swiglu_oai` reference (`vllm_gaudi/models/minimax_m3_sparse.py`) says split/first-half — a doc-against-doc disagreement we have not resolved, and **not** evidence about the non-bias path's measured `halves`. The clamped formula we have is framework source, **not** a device measurement. (§3.9 item 17.) |
+| 2 | whether the byte-255 scale is `inf` or `NaN` | the op cannot distinguish them (`0 × either = NaN`). (§3.9 item 18a.) |
+| 3 | the mechanism of the flush-to-zero | measured behaviour, unmeasured cause. (§3.9 item 18b.) |
+| 4 | **multi-expert correctness** | the probe used one expert; a `topk` routing table is a different contract, and a naive all-zeros table gave garbage. (§3.9 item 19.) |
+| 5 | like-for-like cost of the vendor op vs a dequant + fp8-GEMM chain | not built (above). (§3.9 item 20.) |
+| 6 | cost at the real production shape and real expert count | the microbenchmark shape is synthetic. (§3.9 item 20.) |
 
 ---
 
@@ -1398,24 +1881,32 @@ as valuable as the wins.**
 
 ## 3.9 The UNKNOWN register
 
-Stated, not omitted. Each has a note on what would settle it. **Four entries have been closed since
-the first draft — items 2, 4, 10 and 14 — and all are kept in place, marked CLOSED, so the resolutions
+Stated, not omitted. Each has a note on what would settle it. **Five entries have been closed since
+the first draft — items 1, 2, 4, 10 and 14 — and all are kept in place, marked CLOSED, so the resolutions
 are visible rather than silently deleted.** *(Items 10 and 14 state the fp8 format as `e4m3fn` codes,
 bias 7. That is the **configured default** — the bias is **selectable**; see the bias subsection in
 §3.4.1.)*
+
+**Items 17–20 are new, opened 2026-10-12 by the vendor-MXFP4-op conformance probe (§3.4.7) — they are
+additions, not closures.** They are registered here rather than left inside §3.4.7 so that a reader who
+consults this register to find out what we do *not* know gets a complete answer.
 
 > **The habit that keeps this honest, and it is cheap.** When a later section **corrects or supersedes**
 > a pattern, the **earlier** section that **prescribes** it must be re-checked **in the same pass**. A
 > chapter that says *"do X"* in §A and *"X is wrong"* in §B is **worse than one that says nothing**,
 > because the reader stops at §A. A mechanical check — *extract every `§X.Y` reference and assert the
 > target heading exists* — found four broken references in this chapter, one of them **§3.4.4
-> prescribing exactly the decode that §3.4.5 says is wrong**. Run that check after any edit.
+> prescribing exactly the decode that §3.4.5 says is wrong**. Run that check after any edit — and
+> **scope it to refs whose preceding token is not a path**: a document-qualified ref written bare
+> (`` `REPORT.md` §2.1 ``) resolves against *this* chapter's §2.1 and **passes silently against the
+> wrong target**, while a bare `§7` or `§4.4` in the same style **false-fails**. Both are the check
+> lying about what it checked, in opposite directions.
 
 | # | UNKNOWN | what would settle it |
 |---|---|---|
-| 1 | **SRAM size.** The only figure anywhere ("48 MB") is marked **unverified by its own erratum**; do not import it. What *is* measured is that SRAM staging exists and is visible in the compiler's own output (`"allocation": "SRAM"`). | A vendor document that survives cross-checking, or a staging-size sweep. |
-| ~~2~~ | ~~**L1/L2 cache sizes and behaviour.**~~ **CLOSED — RESOLVED 2026-10-11. There is NO L1/L2 cache.** The corpus is consistent: the TPC's memory hierarchy is **HBM (96 GB) → 48 MB SRAM (on-die, shared, compiler-scheduled staging) → per-TPC local memory (1 KB scalar + 80 KB vector per core, private, kernel-programmer-managed)**, and **no cache level exists between them**. The TPC local memory is *not* the SRAM and is *not* a cache. *(tier **B**, `habana-docs`, `.../TPC/TPC_User_Guide/Processor_Architectural_Overview.html`, sha256 `0463528f9e4b5ec36bf7595933169066a76d2c375cca391d2e26afcfc21cc038`.)* **⇒ A bandwidth model must not assume reuse from a cache: reuse has to be engineered into the dataflow (tiling into local memory / SRAM) or it does not happen.** *Substantive material is routed to Chapter 1; this entry is closed here so the register is not stale.* | — **done** |
-| 3 | **Whether the TPC or DMA cost models consume the *general* HAL reader** (2000 MHz) rather than an engine-specific one (1650 MHz). If they do, they are **~21 % optimistic**. The MME has its **own** reader at 1650 MHz and is accurate to 0.5 %; the general reader's consumption by the other engines is **UNCHECKED**. | Disassemble the TPC/DMA cost models' clock path the way the MME's was done. |
+| ~~1~~ | ~~**SRAM size.** The only figure anywhere ("48 MB") is marked **unverified by its own erratum**; do not import it.~~ **CLOSED — RESOLVED 2026-10-11. The SRAM is 48 MiB on Gaudi 2** (`SRAM_SIZE = 0x3000000`); the "unverified" marking was right, and the figure survived checking. What *is* measured is unchanged — SRAM staging exists and is visible in the compiler's own output (`"allocation": "SRAM"`). *(Source, public and checkable: the upstream Linux kernel's habanalabs driver — `drivers/accel/habanalabs/include/gaudi2/gaudi2.h:41` (`SRAM_SIZE`); line numbers move between kernel releases, so check the symbol, not the line.)* **Full statement: Chapter 1 §1.5.** | — **done** |
+| ~~2~~ | ~~**L1/L2 cache sizes and behaviour.**~~ **CLOSED — RESOLVED 2026-10-11. There is NO L1/L2 cache.** The public vendor documentation is consistent: the TPC's memory hierarchy is **HBM (96 GB) → 48 MB SRAM (on-die, shared, compiler-scheduled staging) → per-TPC local memory (1 KB scalar + 80 KB vector per core, private, kernel-programmer-managed)**, and **no cache level exists between them**. The TPC local memory is *not* the SRAM and is *not* a cache. *(the vendor's TPC user guide: `docs.habana.ai/en/latest/TPC/TPC_User_Guide/Processor_Architectural_Overview.html`.)* **⇒ A bandwidth model must not assume reuse from a cache: reuse has to be engineered into the dataflow (tiling into local memory / SRAM) or it does not happen.** *Substantive material is routed to Chapter 1; this entry is closed here so the register is not stale.* | — **done** |
+| 3 | **Whether the TPC cost model consumes the *general* HAL reader** (2000 MHz) rather than an engine-specific one (1650 MHz). If it does, it is **~21 % optimistic**. The MME has its **own** reader at 1650 MHz and is accurate to 0.5 %. **The DMA cost model is EXCLUDED — it makes no clock call at all** (no vtable slot-7 call in its constructor or in its duration/cost functions), so the clock question does not apply to it; the **TPC** cost model's clock remains **UNCHECKED** because its constructor is not exported. | Disassemble the TPC cost model's clock path the way the MME's was done. *(MME clock and family table: `Archive/by-date/2026-10-11/synapse_cpp/GC_COST_MODEL_CLOCK.md` §8; the DMA exclusion and the TPC absence: same file, §10.)* |
 | ~~4~~ | ~~**The 512 MiB C++ bench point (1,646 GB/s)** — an outlier below the measured 256 MB and 1 GB points.~~ **CLOSED — RESOLVED 2026-10-11. The point is RETRACTED; both falsifiers ran.** **(a)** the bench **syncs per repetition**, so its wall time carries the launch+sync overhead (device union **530.5 µs** vs bench median **622.1 µs**, the ~90 µs gap being exactly that overhead); **(b)** the published number is an **arithmetic error** — the true quotient is **1,726 GB/s**, and 1,646 corresponds to **652.3 µs**, which is no bench statistic at all. The **corrected point is 2,023 GB/s** (flat 1-D 2,022.9 / shaped 2-D 2,023.5 — the **2-D hypothesis is DEAD**, 0.03 %) and **the curve is monotone**. *Artifact: `Archive/by-date/2026-10-11/dma_open_items/OPEN-ITEMS-c2-and-512MiB.md` §2; full treatment, including how the wrong point survived four passes, in **Chapter 1**.* | — **done** |
 | 5 | **Whether the engine's cross-engine intersections are real concurrency** (§3.6.3). | An arm that **varies** the deciding quantity — the one that ran held it fixed, making its own falsifier unevaluable. |
 | 6 | **The ~21 ms host constant's sync-wait vs host-compute split.** | A runtime change so `synchronizeEvent` carries the calling OS tid, or a `record_function` at the point the C++ runtime issues the sync. |
@@ -1429,6 +1920,10 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 | ~~14~~ | ~~**Whether the fp8 reserved-bin rule is ENGINE-DEPENDENT** — i.e. whether the MME could decode the reserved bin differently from the TPC.~~ **CLOSED — RESOLVED 2026-10-11. NO: the rule is a property of the device, not of an engine.** **`MME == TPC byte-for-byte over all 256 codes: True`**, same 14-code mismatch set, measured **within one process on one code set** (so a within-run two-engine comparison, not two measurements days apart). Calibration passed first — **242/242 exact through the MME** — so the readout is a pure decode. **`e4m3fnuz` is excluded twice over on the MME**: it reads `0x76` as **224** (fnuz would be 112) and `0x80` as **0** (fnuz would be NaN). **⇒ the format statement needs no engine qualifier, and the guard's byte set `0x78–0x7E` / `0xF8–0xFE` is confirmed for BOTH engines.** *Mechanism worth keeping: the fp8 decode happens **inside the GEMM node** — a post-graph dump shows `MME GEMM ['hfloat8','hfloat8'] → ['bf16']` consuming fp8 directly with **no intervening cast**, so **no engine-attribution pass can ever see it** and would have reported "MME, no fp8 cast" and been silently wrong.* **Full statement: §3.4.1** (see also the closed item 10 above for the format itself). *Provenance: a second disclosed ~11-second device probe, with its own post-graph dump.* | — **done** |
 | **15** | **What SELECTS the fp8 exponent bias in a given recipe, and whether it is readable back.** The bias is **selectable** (`{3, 7, 11, 15}`, default **7**) and is carried **per op in the H2D scale tensor** (§3.4.1), but *which* mechanism sets it for a given op, and whether a compiled recipe's chosen bias is **observable** from a trace or a dump, is **not established**. This matters because §3.4.1's poison set is stated **for the default bias** — a recipe that selects another bias has a **different reserved bin**. | A recipe/dump inspection for a bias field, or a decode readout on an arm known to select a non-default bias. *(**Opened** by the bias finding — recorded rather than left implicit, so the closures of items 10 and 14 are not read as "fp8 is fully understood".)* |
 | **16** | **How a real `vllm serve` pins its workers end-to-end — and therefore whether a TP=N launch is deterministic or a race.** vllm-gaudi **never references `HLS_MODULE_ID`** (grep, whole tree) and calls `torch.accelerator.set_device_index(local_rank)`, which **does not route** to the device-acquire path (`HPUHooks` does not override `setCurrentDevice`). The measured per-rank mechanism (`HLS_MODULE_ID` distinct per rank) was proven on bare `torch_hpu` processes only; the vLLM integration was deliberately not run. Two further device-pinning questions sit in the same place: **(a)** whether the module-id table also restricts the driver's unpinned by-type choice (**UNKNOWN** — the PT-bridge does not consult it (**INFERRED**), but the driver/thunk level is not settled; `hpu_isolation` §10.2), and **(b)** what `torch.device("hpu", N)` does when N ≠ the pinned module's index (**MEASURED** for an unpinned process — the index is ignored and the bridge warns; only the *pinned* variant is untested). | Launch the **real TP=4 server** with and without `HLS_MODULE_ID` exported per rank, and read each worker's device off `hl-smi`'s process table / `hl-smi -Q index,module_id,memory.used -f csv,nounits`. For (a): a **discriminating** two-process arm — a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the processes take (the two-process arm we already have used the container's *full* table, so it cannot separate the table from the cgroup). For (b): one probe that pins module 6 and then allocates on `hpu:1` / `hpu:2`. *(Opened 2026-10-12; sources: `Archive/by-date/2026-10-11/hls_module_id/REPORT.md` §8, `hpu_isolation/REPORT.md` §10.1–§10.2.)* |
+| **17** | **The on-device semantics of the vendor MXFP4 op's GPT-SwiGLU / clamped path** — `bias_mxfp4_fused_weights` (`gpt_swiglu = true`, `mixture_of_experts_gen.cpp:1553`): the `limit`, the `alpha`, the `beta` / `(up+1)` term, and **the gate/up split layout**. **This is a different op and a different code path from the one we measured** — the non-bias `mxfp4_fused_weights` is `gpt_swiglu = false` (`:1441`) and its split is **measured as `halves`** (§3.4.7, row 3). The bias path's own split is **not** measured: a bridge test docstring (`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:741`) says *interleaved*, while **vllm-gaudi**'s `swiglu_oai` reference (`vllm_gaudi/models/minimax_m3_sparse.py`) says split/first-half — a **doc-against-doc** disagreement we have not resolved. Do not read either document as evidence about the non-bias path. | A `bias_*` arm on a **non-degenerate** configuration (≥ 2 experts, random weights and biases — the vendor's own test shape). The probe's corner configuration (1 expert, `experts_min == experts_max`, identity `w12`, zero biases) **wedged the compute queue** with a 30 s timeout and was deliberately not retried. The cheapest first step is the **bf16** `bias_fused_weights` op, which traverses the same cguid GPT-SwiGLU lowering **without** the fp4 cast nodes, so it isolates whether the hang is fp4-specific. *(Opened 2026-10-12 by the vendor-op probe; §3.4.7; `Archive/by-date/2026-10-12/a1-probe/REPORT.md` §6 and `STATE_AFTER_HANG.md`.)* |
+| **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
+| **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
+| **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
 
 ---
 
@@ -1485,6 +1980,25 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
     loader, the tests, your own notes, and the docs. In §3.4.5 each of the three defects was found by
     reading **a different file from the one that was wrong**, and one of them was a document telling a
     reader to paste the broken line.
+22. **When you substitute a vendor-built artifact for a reference one, assert its symbols in *both*
+    directions.** A shared library's *undefined* set is what it deliberately leaves for runtime
+    resolution; its *export* set is what the rest of the process will look for **in it**. Comparing
+    only the undefined set can pass a library that cannot load. **MEASURED:** the patched
+    Bridge passed a clean 2,410-vs-2,414 undefined comparison while exporting **0** `HlMlMemory*`
+    symbols against the shipped **34**, and `import torch` then died on
+    `_hpu_C.so: undefined symbol: HlMlMemoryReporter::GetPath` — a symbol the *installed wheel's own*
+    pybind extension needs from that library. The cause was one **optional** CMake variable
+    (`SPECS_EMBEDDED_ROOT`, absent from the project's own required-env list), so CMake logged a single
+    `STATUS` line and built on. **An optional build variable is a silent failure mode: assert the
+    feature's symbols, not the absence of a log line.** Working example: `1cat/build.sh`, whose
+    self-check prints exports, `MISSING` against the reference library, and the feature's symbol count.
+    *(The measurement, with the counts in both directions: `1cat/REPORT.md` §5.1 and §5.3, and
+    `1cat/evidence/COUNTS.txt`.)*
+    **`ldd -r` is the mirror of the same trap:** on a plugin library it reports every symbol that the
+    *other* libraries in the process will supply as `undefined` (75 lines on our backend), so it reads
+    as authoritative while proving nothing about loadability — and it says nothing at all about what
+    the library fails to *export*. Neither tool is a substitute for comparing both symbol sets against
+    the reference.
 
 ---
 
@@ -1496,7 +2010,7 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 - **No claim that the 44.64 GB materialised traffic is measured** — it is a model, and its largest
   component is uncorroborated.
 - **No claim that cross-engine overlap is absent *or* present.** The 12.531 ms figure is UNRESOLVED.
-- **No SRAM size, no L1/L2 behaviour** (UNKNOWN).
+- ~~**No SRAM size, no L1/L2 behaviour** (UNKNOWN).~~ **RESOLVED — both are settled: the SRAM is 48 MiB on Gaudi 2** (`drivers/accel/habanalabs/include/gaudi2/gaudi2.h:41`), **and there is no L1/L2 cache.** *Stated in §3.9 (items 1–2) and Chapter 1 §1.5.*
 - **No claim that removing the `cat` would help** — see §3.3.5; it is a recorded dead end.
 - **No claim that a fix in the tree is a *validated* fix.** The §3.4.5 review found the replacement
   test uninstalled, the headline check arm-dependent, and the first version of the fix changing an

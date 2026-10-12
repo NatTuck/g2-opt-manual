@@ -17,6 +17,7 @@ built on.
 | tag | meaning |
 |---|---|
 | **MEASURED** | observed on real Gaudi 2 hardware by an instrument we can point at |
+| **source read** | read directly out of a named source file or binary — vendor or our own — with the path and line given. **Not executed, so not a measurement** — and not an assumption either: the artifact is quotable |
 | **ASSUMED** | taken from documentation, a vendor constant, or a model's own assumption — **not** independently verified |
 | **INFERRED** | derived by reasoning from measurements; the derivation is stated |
 | **UNKNOWN** | we looked and did not find out. **Stated, not omitted** — see the note below |
@@ -24,6 +25,10 @@ built on.
 **Numbers are quoted with the conditions they are valid under.** Bandwidth in particular is
 size-dependent on this hardware; a figure without its size is not a figure. Where a number
 has a known regime boundary, the boundary is given.
+
+**Every citation is to a source a reader can reach** — a URL, an upstream file path, or our own
+archived measurement. A claim whose only support is a collection you cannot open is an assertion,
+not a citation: mark it as such, or drop it.
 
 **A note on UNKNOWN.** Three separate errors during the work behind this manual came from
 claims inherited from a summary and never checked — a clock, an engine label, and a
@@ -33,12 +38,18 @@ those in from general knowledge.**
 
 ## Chapters
 
-| # | chapter | lines | status |
+| # | chapter | ~lines | status |
 |---|---|---|---|
-| **0** | **[TL;DR](00-tldr.md)** | 93 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
-| 1 | [Gaudi/HPU Basics](01-basics.md) | 944 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
-| 2 | [Optimizing small programs and regions](02-regions.md) | 1010 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | 1504 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
+| 1 | [Gaudi/HPU Basics](01-basics.md) | ~900 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
+| 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
+| 3 | [Porting a large language model to HPU](03-porting.md) | ~1,800 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+
+**`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
+figures maintained by hand, and **two of the four had gone stale** — chapter 1 read 944 against an
+actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked. An exact number here
+is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
+not cite it.**
 
 Example code lives in [`examples/`](examples/), organized by chapter — **13 files**, of which
 one (`examples/02-regions/03_inspect_graph_dumps.py --demo`) runs CPU-only and has been

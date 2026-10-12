@@ -917,10 +917,12 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
 chapter is only the error signs.)*
 
 The MME cost model is **accurate to 0.5 %**: the engine library carries its own clock constant
-(**1650 MHz**, hardcoded, matching the SoC clock an independent tool reports) and
+(**1650 MHz**, hardcoded, matching the SoC clock `hl-smi` reports) and
 `262144 FLOP/cycle × 1.65 GHz = 432.5 TFLOP/s` against a measured **430.0–432.7**. **MEASURED** for
 the clock and the agreement; the `262144` constant itself is **INFERRED** (it is not present as an
-immediate in the disassembly; it is derived from geometry).
+immediate in the disassembly; it is derived from geometry). *(Artifact for both:
+`Archive/by-date/2026-10-11/synapse_cpp/GC_COST_MODEL_CLOCK.md` — §8 for the clock and its
+`hl-smi` agreement, §9 for the absent `262144`/`131072` immediates.)*
 
 **The two models have different error signs.** The MME model is accurate; the DMA model is optimistic.
 **Neither may be used as a neutral reference without saying which one you are quoting.**
