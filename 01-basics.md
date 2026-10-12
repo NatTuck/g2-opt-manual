@@ -372,13 +372,14 @@ tied to any particular implementation.
 | level | size | scope | basis |
 |---|---|---|---|
 | **HBM2E** | **96 GiB per HPU** | per card | **MEASURED** |
-| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — MME/DMA staging | **ASSUMED** (vendor documentation) |
+| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — MME/DMA staging | **source read** |
 | **TPC local memory** | **1 KB scalar + 80 KB vector** | **per TPC core, private** | **ASSUMED** (vendor documentation) |
 | **L1 / L2 data cache** | — | **there is none** | **ASSUMED** (vendor documentation) |
 
-*(Vendor-sourced rows are tagged **ASSUMED** because that is this manual's tag for "taken from
-documentation, a vendor constant" — they are vendor sources, not measurements on our hardware.
-Each is cited to a public source — a URL or an upstream file path — so you can check it. See §1.11.)*
+*(Rows tagged **ASSUMED** are taken from documentation or a vendor constant; where the number comes
+from a **named source file with a path and line** it is tagged **source read** instead, as the SRAM
+row is. Neither is a measurement on our hardware. Each is cited to a public source — a URL or an
+upstream file path — so you can check it. See §1.11.)*
 
 **HBM is 96 GiB per card**, with an idle baseline of ~768 MiB. **MEASURED**
 

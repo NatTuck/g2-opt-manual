@@ -26,9 +26,9 @@ built on.
 size-dependent on this hardware; a figure without its size is not a figure. Where a number
 has a known regime boundary, the boundary is given.
 
-**Every citation is to a source a reader can reach** — a URL, an upstream file path, or our own
-archived measurement. A claim whose only support is a collection you cannot open is an assertion,
-not a citation: mark it as such, or drop it.
+**Every citation is to a source a reader can reach** — a URL, an upstream file path, or a named
+artifact from our measurement campaign, archived in the source project. A claim whose only support
+is a collection you cannot open is an assertion, not a citation: mark it as such, or drop it.
 
 **A note on UNKNOWN.** Three separate errors during the work behind this manual came from
 claims inherited from a summary and never checked — a clock, an engine label, and a
@@ -43,7 +43,7 @@ those in from general knowledge.**
 | **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
 | 1 | [Gaudi/HPU Basics](01-basics.md) | ~900 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | ~1,800 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| 3 | [Porting a large language model to HPU](03-porting.md) | ~2,000 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the four had gone stale** — chapter 1 read 944 against an

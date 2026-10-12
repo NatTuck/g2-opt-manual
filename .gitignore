@@ -1,0 +1,7 @@
+# Scratch, generated and large artifacts — never part of the manual.
+out/
+data/
+scratch/
+*.pt
+*.log
+__pycache__/
