@@ -26,9 +26,11 @@ built on.
 size-dependent on this hardware; a figure without its size is not a figure. Where a number
 has a known regime boundary, the boundary is given.
 
-**Every citation is to a source a reader can reach** — a URL, an upstream file path, or a named
-artifact from our measurement campaign, archived in the source project. A claim whose only support
-is a collection you cannot open is an assertion, not a citation: mark it as such, or drop it.
+**Every citation names its source** — a URL, an upstream file path, or a named artifact from our
+measurement campaign, archived in the source project. **It is not a promise that every source is one
+you can open:** the archived artifacts live in a project that is not published, so they are
+provenance pointers rather than checkable citations. A claim whose *only* support is a collection you
+cannot open is an assertion, not a citation: mark it as such, or drop it.
 
 **A note on UNKNOWN.** Three separate errors during the work behind this manual came from
 claims inherited from a summary and never checked — a clock, an engine label, and a

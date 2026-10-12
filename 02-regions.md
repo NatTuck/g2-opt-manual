@@ -116,6 +116,55 @@ Read the TPC×MME rows across: in every overlapping arm `union(all) == union(TPC
 depth** (0.2019 → 0.4021 → 0.8080) instead of saturating at one op's worth, which is what you would
 see if the scheduler were only hiding a fixed slice.
 
+> ### UPDATE 2026-10-12 — the headline, re-measured on an independent harness, together with its negatives
+>
+> **The primary result, and the strongest statement in this chapter. MEASURED.**
+>
+> **In a single submission with independent branches, `union(all) == union(TPC)` EXACTLY — the entire
+> MME family hides behind TPC, with `ov = 1.000` across 13 arms.** Every size, every TPC load, every
+> orchestration that keeps one submission. **This is not partial overlap: the MME contributes
+> *nothing* to the union.** (`ov = (t_a + t_b − t_ab) / min(t_a, t_b)`, on **device unions**; the
+> harness that produced it is 33 arm-runs, each a single `torch.compile(fullgraph=True,
+> dynamic=False)` region — or a deliberately uncompiled control — replayed 20 steps after a 6-step
+> warm-up at the correct shapes.)
+>
+> **The instrument was validated before the result was believed.** The reduction reproduces the
+> archived `t2_graph_overlap` numbers **exactly** on the archived traces — `t2_02_tpc_mme_indep`
+> 0.2659 / 0.2019 / CROSS 0.2019, `t2_08_tpc_mme_indep` 1.0387 / 0.8080 / 0.8080,
+> `t2_02_tpc_dma_indep` 0.2496 / DMA 0.6730 / 0.2496, `t2_02_mme_mme_indep` 0.2697 / 0.0000 — and it
+> does so with a *different* TPC op form from the archived harness (`torch.mul(x, s, out=o)` with a
+> 0-dim tensor multiplier, instead of `torch.mul(x, 2.0)`). **And the headline reproduced within
+> 1.1 % on a second independent run** — a separate process ~40 minutes later on the same module:
+> `tri_tpc_mme_tx` CROSS 0.3831 → 0.3824.
+>
+> **The negatives — and each is now a *tested null*, not an assumed one.** Every arm below asserted
+> and **passed** its own precondition (§2.8); none of them is an empty-queue arm.
+>
+> * **Two HPU streams, device-bound: `ov = 0.0000` exactly, both runs.** The precondition is asserted,
+>   not assumed — **18.5 ops outstanding at `H_end`, 83.5 % device busy** (run 1) and **55.9 / 97.0 %**
+>   (run 2) — and `union(all) = TPC + MME` to four decimals in both. **A sentence of history, because
+>   it is the reason this arm had to be re-run:** the *older* two-stream null recorded in §2.12 had
+>   **0/40 ops in flight** — it was not device-bound, so it tested nothing. **This one is a real
+>   negative.**
+> * **Single vs double buffering: no effect on the overlap fraction.** In-place (`torch.mul(x, s,
+>   out=x)`, so step *k+1* reads what step *k* wrote) against two independent `(in, out)` pairs:
+>   `ov`(TPC,MME) = **1.000 both ways**, `ov`(TPC,DMAh) = **0.978 both**. The extra TPC op in the
+>   double-buffered arm adds its full 0.185 ms to the union — same engine, so additive, exactly as
+>   §2.6's rule predicts — and changes nothing else. **This is the first artifact anyone has produced
+>   on this question**; §2.12 previously had none.
+> * **Emission order: no effect.** Transpose emitted first vs TPC-first: CROSS **0.3831 vs 0.3826**.
+>   The scheduler is not order-sensitive here, consistent with the archived finding that the scheduler
+>   knobs are inert.
+> * **A dataflow edge: every pairwise intersection collapses to `0.000`.** CROSS falls 0.3831 → 0.0939,
+>   and the residual 0.0939 is MME∥DMAh, which stays independent in that body. §2.2 condition 3,
+>   reproduced with three engines instead of two.
+>
+> *(Source: `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §2, §3 and §6.
+> Of the 33 arm-runs, 30 passed the precondition and
+> **3 are recorded INCONCLUSIVE** — `solo_mme2048` and `sw_t0_m2048` (queue too shallow at the
+> smallest matmul) and `ctl_sync_mid` (50.7 % busy, 0.7 ops outstanding; the sync drains the queue, so
+> that arm cannot test anything, which is a design flaw and not a negative). Physical module 3.)*
+
 ### Condition 4 is not decoration — it is what makes the experiment a test
 
 An overlap experiment in which one group is 5 % of the other's duration cannot detect anything:
@@ -221,7 +270,7 @@ graph inspected independently.
 | construct | placement of the inserted node | recipes/step | why |
 |---|---|---:|---|
 | 2 / 4 / 8 / 16 / 32 **native** adds in one body | `hpu_cluster` | **1** every time | growing a body with clusterable ops does not split |
-| custom `kchain::alu` mid-body | **eager** | 1 → **2** | fails `shared_layer_validation` |
+| custom `kchain::alu` mid-body | **eager** | 1 → **2** | fails `shared_layer_validation` — *but read the correction below: that validator is only **reached** at all because the op is not in the `custom_op` namespace* |
 | two custom ops, separated | eager ×2 | 1 → **3** | two splits |
 | two custom ops, **adjacent** | eager ×2 | 1 → **2** | one eager *run* adds one split |
 | custom op at the very **start or end** | eager | **1** (unchanged) | the eager node lies outside every clusterable run |
@@ -260,6 +309,79 @@ Both ops have `default_fallback=False` and both are absent from the hpu fallback
 discriminator is the **shared-layer op-support table** — not the fallback list, and not the custom
 namespace. **MEASURED** (read out of the backend, then reproduced from a registered optimization
 pass that prints the placement and the reason per node).
+
+> ### ⚠ CORRECTION 2026-10-12 — that discriminator is true for `aten` ops and **FALSE** for `custom_op`-namespace custom ops
+>
+> **The claim as it was made (kept above, not deleted):** *"the discriminator is the **shared-layer
+> op-support table** — not the fallback list, and not the custom namespace."*
+>
+> **As stated it is wrong, and wrong in the direction that matters: it does not decide placement at
+> all for a custom op.** **MEASURED**, in **one process holding both custom extensions**, by a
+> registered `PRE_PARTITIONER` pass reading `node.meta["placement"]` per node:
+>
+> | node | namespace | `check_for_default_op_support` | `shared_layer_validation` | **placement** |
+> |---|---|---:|---:|---|
+> | `custom_op.fp4_dequant.default` | **`custom_op`** | **True** ("Graph support for user's CustomOp") | **False** | **`hpu_cluster`** |
+> | `kchain.alu.default` | `kchain` | False | False | **`eager`** |
+> | `aten.add.Tensor` | `aten` | False | **True** | `hpu_cluster` |
+>
+> **`custom_op::fp4_dequant` is clustered *despite* `shared_layer_validation = False`.** The
+> validator is never consulted for it, because the backend **short-circuits on the namespace first**
+> (`shared_layer.py:273`):
+>
+> ```python
+> # Enable torch.compile for user's CustomOp API
+> if hasattr(node.target, "namespace") and node.target.namespace == "custom_op":
+>     return True, "Graph support for user's CustomOp"
+> ```
+>
+> `check_for_default_op_support` returning `True` makes `is_eager_fallback_required` exit `False`
+> **before** the `shared_layer_validation` call is reached — so the node is placed `hpu_cluster`,
+> joins the clusterable run, and lands in the same Synapse submission as the GEMM.
+>
+> **So read the split precisely:**
+>
+> * **for an `aten` op** the original claim holds — `shared_layer_validation` decides
+>   (`aten.add` → True → clustered);
+> * **for an op in the `custom_op` namespace** it is false — placement is `hpu_cluster`
+>   **regardless of what the validator would say**.
+>
+> The two nodes above with `shared_layer_validation = False` therefore land in **different** places,
+> and the stated discriminator cannot separate them. **The real rule is the namespace
+> short-circuit.** `kchain::alu` is `eager` because its namespace is not `custom_op` — nothing about
+> its kernel makes it eager. *(Source: `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §5.1. Run on
+> physical module 3.)*
+
+> ### THE ENGINEERING RECIPE — how to get a hand-written `tpc-clang` kernel co-scheduled
+>
+> This is actionable and it is not obvious, so it is written as a procedure. To make a new
+> `tpc-clang` kernel **co-schedule with MME/DMA in ONE submission**:
+>
+> 1. **Register it in the EXISTING `custom_op` library — do not create a new namespace.** Add its
+>    `m.def` / `m.impl` lines to the existing `TORCH_LIBRARY(custom_op, …)` block and to the
+>    `TORCH_LIBRARY_IMPL(custom_op, HPU/Meta, …)` blocks (in this project,
+>    `src/custom_ops/fp4_dequant/hpu_custom_fp4_dequant.cpp:42/45/48`), rather than shipping a new
+>    extension under a new namespace.
+>    * **A defensive new namespace is exactly what costs you the overlap.** It is the natural thing
+>      to do — it is what `kchain` did, and the reason recorded in its own header is mechanical:
+>      `TORCH_LIBRARY` may be called only once per process per namespace, so a second extension
+>      cannot re-declare `custom_op`, and loading two would be a hard `c10::Error`. **The namespace
+>      short-circuit above is a better justification for the one-library design than that reason
+>      was:** one extension, one `custom_op` namespace, **all** of its ops clusterable — whereas a
+>      separate namespace buys isolation and **pays for it with the overlap**. *(That the `kchain`
+>      namespace costs `kchain::alu` the overlap is **MEASURED**; that it does the same for the
+>      other four `kchain` ops — `fp4_base`, `fp4_arith2`, `fp4_lutptr`, `ident` — follows from the
+>      same measured namespace rule and is **INFERRED**, not separately measured.)*
+> 2. **Keep the body a DAG with no dataflow edge to the MME/DMA branch.** One edge drops every
+>    pairwise intersection to exactly `0.000` (measured above with three engines).
+> 3. **Duration-match** the branches to within ~2× (condition 4).
+> 4. **Verify; do not assume.** Register a `PRE_PARTITIONER` pass and print
+>    `node.meta["placement"]` — `hpu_cluster` means it is in the recipe. The whole check is ~100
+>    lines (`Archive/by-date/2026-10-12/engine-overlap/eo_placement.py`). **Do not infer from the op's
+>    name or its namespace** (§2.9 rule 3): read the placement. This is the check that produced the table
+>    above; without it, the superseded claim in this section would still be standing.
+> 5. **Confirm at the trace level** that `Launch`/step == 1 and the ops share one `recipeHandle` —
+>    and read the `Launch` count, not the handle count (§2.1).
 
 ### The trap: `LaunchRecipe` is not a submission count
 
@@ -469,6 +591,17 @@ device-occupancy-bound, and the lever is the union, not the launch count.** Sour
 independently, and [Chapter 0](00-tldr.md) carries the same result under *"The one stale claim to watch
 for"*.
 
+> **⚠ CAVEAT added 2026-10-12 — a fitted `a + b·X` form is only as identifiable as the corpus it was
+> fitted on.** This law is **MEASURED on the trace it was fitted to**, and it stays. But the project's
+> own 2-D sweep shows the limit of the *form*: fitting `W = a + b·M` to a **1-D** sweep gives slope
+> **3.22** when the swept knob is matmul *size* and **1.54** when it is matmul *count* — the same
+> physical quantity, a **2× discrepancy** — and the resulting 2-point fit misses an intermediate size
+> by **15 %** (§2.7). **Read a fitted `a + b·X` as a description of its run set, not as a law.** Before
+> you extrapolate one, check that the corpus **varied more than one dimension**, or that the dimension
+> you are extrapolating along is the one that was swept. This is §2.9 rule 4 — a collinear corpus
+> cannot be separated by more fits — applied to the *form* of the fit rather than to the choice
+> between two of them.
+
 The launch model does not merely fit worse — it has **no usable coefficient.** Its per-run `k` varies
 by **171 % of its own mean** across the 13 runs, so there is no stable microseconds-per-node to
 design against. A quantity whose coefficient moves by more than a factor of 3 between runs at
@@ -568,7 +701,9 @@ the DMA window 2.64×, §2.7) lands on the same conclusion as the table's own 21
 * **A pure bandwidth-sharing model does not hold across sizes.** That 1.1 % match was at **one**
   size; the sweep gives a fixed component plus a per-byte component (§2.7). **MEASURED.**
 * **Not characterised:** how the scheduler shares time when the cross-engine groups are *unequal*;
-  and **more than two engines in one recipe**. **UNKNOWN.**
+  and **more than two engines in one recipe**. **UNKNOWN.** *(The second clause is **SUPERSEDED
+  2026-10-12**: three engines in one recipe **are** now measured — see the closure of §2.12 item 4.
+  The *unequal-groups* clause stands.)*
 * **`MAX` is not bounded by anything other than the longer group** — the answer to "is it bounded by
   something else" is **no**, in general. **MEASURED** (for the pairs tested).
 
@@ -632,6 +767,49 @@ no TPC :   W ≈ 20.5 + 0.947·M        (slope ≈ 1 — the model's own rate; a
 with TPC:  W ≈ 96.0 + 2.164·M        (~96 µs fixed offset; a 2.16× per-byte penalty)
 ```
 
+> ### ⚠ CORRECTION 2026-10-12 — the `W = a + b·M` form above is **not identifiable from a 1-D sweep**
+>
+> **Keep the fits above — they are what this sweep measured, on the arms it measured. But do not
+> read them as a law.** **MEASURED**, on a 2-D sweep (`t` independent TPC muls × **one** matmul of
+> size `m`, one region, 12 arms): the **same physical quantity gets two different slopes depending on
+> which knob you turn**.
+>
+> ```
+> sw grid, one matmul, size varies:
+>   TPC=0 mul :  W =  4.13 us + 1.023 * M      <- no co-tenant: the model's own rate
+>   TPC=1 mul :  W =  8.07 us + 3.219 * M
+>   TPC=2 mul :  W =  0.44 us + 3.958 * M
+>   TPC=4 mul :  W =  0.25 us + 3.932 * M
+>
+> ratio grid, TPC=1 mul, BOTH count and size vary (8 arms, M 10.3..156.2 us):
+>   TPC=1 mul :  W = 25.32 us + 1.537 * M
+> ```
+>
+> **At TPC = 1 mul the slope is 3.22 if you vary matmul *size* and 1.54 if you vary matmul *count* —
+> a 2× discrepancy.** So `W` is **not a function of `M` alone**, and a two-parameter linear form is
+> **not identifiable** from a 1-D sweep. Concretely: the archived 2-point fit `96.0 + 2.164·M`
+> predicts **265.0 µs** at a point the 2-D sweep measures at **305.0 µs — 15 % off**, at a size the
+> fit never saw. **The harness reproduces the archived *endpoints* to 0.4 %** (`t2_08_tpc_mme_indep`
+> p = 3.892 archived vs 3.91 here; `x_dma4096_tpc` p = 2.877 archived), so **this is the fit
+> failing, not the harness.**
+>
+> **Two structural facts about the window itself** (also MEASURED, from per-node grouping) — they are
+> part of why the "fixed component + per-byte term" reading is suspect:
+>
+> * **runs/step = 1.00** for essentially every node group: one node execution is **one contiguous
+>   window**, not a scatter. Marker fan-out is 25×–130× (many beats inside one window), consistent
+>   with §2.9 rule 2.
+> * **The window is invariant to DMA queue load but sensitive to a TPC co-tenant.** The same node
+>   (`…/memcpy/0`, 3072² shape) measures **8.89 µs** with no co-tenant and **22.4 µs** with one TPC
+>   mul — 2.5×. Yet at fixed DMA it is **flat** across TPC load: W = 77.2 / 76.3 / 75.4 µs for 1 / 2 /
+>   4 TPC muls. So the inflation is a **step change when the first co-tenant appears, plus a weaker
+>   per-byte term** — a threshold, not a proportion. **Why** it is a threshold rather than
+>   proportional was not isolated (HBM contention vs residency vs queue interaction): **UNKNOWN.**
+>
+> *(Source: `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §4.2.
+> The ratio curve that replaces the linear law as the usable form is in the
+> closure of §2.12 item 5.)*
+
 > **The pre-committed falsifier fired.** The author had committed in advance to *"if the no-TPC arms
 > give `W/M` in [1.05, 1.25], then my 'union exceeds the modelled work' finding is specific to
 > TPC-bearing recipes."* At 2048² the no-TPC arm gives **1.446** — outside the band. So the claim
@@ -647,6 +825,22 @@ is a single `M` and the total effect **cannot be split into intercept and slope*
 identifiable only at 0 and 4 TPC ops. The question *"does the rate penalty scale with the load?"*
 **was never measured**. **UNKNOWN**, and the arm that would settle it is a 2-D sweep (vary TPC count
 **and** DMA size), not a 1-D one.
+
+> **SUPERSEDED 2026-10-12 — the 2-D sweep was run.** **MEASURED**: the co-residency inflation
+> `p = W/M` as a function of the TPC:DMA ratio (17 arms, `t` independent TPC muls × matmuls):
+>
+> | regime | TPC/W ratio | `p = W/M` |
+> |---|---|---|
+> | **no co-tenant** | 0.00 | **1.15 – 1.42** |
+> | co-tenant, ratio **1.0–1.8** | 1.01 – 1.77 | **1.67 – 2.28** |
+> | saturating | ≥ 1.96 | **3.86 – 4.01** |
+>
+> So the penalty is **not** a fixed overhead and **not** linear in the load: it is a **step at the
+> first co-tenant**, then a rise to a **plateau at ~3.9–4.0**. The two arms that bracket the model's
+> own operating ratio are `rat_t1_n4_m3072` (r 1.51, p 2.28) and `rat_t1_n2_m4096` (r 1.77, p 2.23).
+> **The full curve, and what it is for — the ceiling on `p` for the engine's disputed intersection —
+> are in §2.12 item 5 and in chapter 3 §3.6.3.** *(Source:
+> `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §4.3.)*
 
 ### The rule
 
@@ -779,7 +973,9 @@ An arm that holds the variable fixed renders its own falsifier **unevaluable by 
 is a **design flaw, not a null result** — and it must be reported as a design flaw. Our instance:
 an arm pre-committed to *"if the rate penalty scales with load, X"* held the load fixed at every point,
 so the question was never measured (§2.7). **Say so explicitly**; do not quietly report the arm as
-having "passed".
+having "passed". *(The question itself was subsequently measured, by the 2-D sweep this rule implies —
+see §2.7's 2026-10-12 update and §2.12 item 5. The rule stands: it is about the **arm**, not about
+the answer.)*
 
 ### Rule 6 — Collect the profiler activity you need, and no more
 
@@ -983,17 +1179,17 @@ Stated rather than omitted, per the README's convention.
 
 | # | unknown | what would settle it |
 |---|---|---|
-| 1 | The exact shared-layer op-support table that decides `hpu_cluster` vs `eager`. We measured the decision *mechanism* and the outcome per construct, not the table. | read the table from the backend, or run the placement pass over a candidate op set |
+| 1 | The exact shared-layer op-support table that decides `hpu_cluster` vs `eager`. We measured the decision *mechanism* and the outcome per construct, not the table. *(**Refined 2026-10-12:** the table only decides for a node **outside** the `custom_op` namespace, which short-circuits ahead of it — see the correction in §2.4. The table's **contents** remain unenumerated, which is what this item is about.)* | read the table from the backend, or run the placement pass over a candidate op set |
 | 2 | Whether the engine's per-region recipe multiplicity follows this chapter's rule. **INFERRED**, not verified. | one engine run with the placement pass registered |
 | 3 | How the scheduler shares time between **unequal** cross-engine groups. | an arm with a deliberately unequal pair (e.g. 4:1 durations) |
-| 4 | Behaviour with **more than two engines in one recipe**. | a 3-engine synthetic recipe with the bottleneck varied |
-| 5 | Whether the co-residency rate penalty **scales with the co-tenant load**. The deciding arm (a 2-D sweep over TPC count × DMA size) was designed but never run; the 1-D version held the variable fixed, making its own falsifier unevaluable. | the 2-D sweep |
-| 6 | Whether two HPU streams can *ever* overlap. We measured one configuration (36 ops/step, 119.1 ops outstanding at `H_end`, both queues provably loaded) and got exactly `0.0000`. | a stream arm with a different submission structure |
+| ~~4~~ | ~~Behaviour with **more than two engines in one recipe**.~~ **CLOSED — RESOLVED 2026-10-12 (the independent case).** **MEASURED, three engines in one recipe, independent:** `union(all) = 0.7400` against `Σ[kernel] = 1.1232` and `max(single) = 0.6380` — the third engine costs only **+0.102 ms** of union, so **all three co-schedule** and the two added engines are almost entirely hidden. Pairwise fractions from the same arm family: **TPC∥DMA `0.63–0.99`**, **MME∥DMA `0.79–0.89`**. *(Controls in the same wave: one dataflow edge collapses every pairwise intersection to `0.000` and drops CROSS from 0.3831 to 0.0939; emission order changes nothing, 0.3831 vs 0.3826.)* **Still not run: the *bottleneck-varied* 3-engine recipe this row asked for** — every arm above is an *independent* body, so "how the scheduler shares time when three engines contend for one resource" folds into item 3 and stays open. Source: `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §2–§3. | — **done** for the independent case; the bottleneck-varied case is item 3, generalised. |
+| ~~5~~ | ~~Whether the co-residency rate penalty **scales with the co-tenant load**. The deciding arm (a 2-D sweep over TPC count × DMA size) was designed but never run; the 1-D version held the variable fixed, making its own falsifier unevaluable.~~ **CLOSED — RESOLVED 2026-10-12. The 2-D sweep was run.** **MEASURED**: the window inflation `p = W/M` is **1.15–1.42 with no co-tenant**, **1.67–2.28 at TPC:DMA ratio 1.0–1.8**, and **saturating at ~3.9–4.0** (ratio ≥ 1.96). So the answer to this row's question is **yes, it scales — with the TPC:DMA ratio — and it saturates**; it is *not* a fixed overhead. Note the second, equally measured fact that constrains the reading: **at *fixed* DMA the window is flat across TPC load** (W = 77.2 / 76.3 / 75.4 µs for 1 / 2 / 4 TPC muls), so the inflation is a **step at the first co-tenant plus a weaker per-byte term**, not a proportion. Curve and fits: §2.7's 2026-10-12 update. What the curve is *for* — the ceiling on `p` for the engine's disputed intersection — is item 11 and chapter 3 §3.6.3. Source: `Archive/by-date/2026-10-12/engine-overlap/REPORT.md` §4.2–§4.3. | — **done.** |
+| 6 | Whether two HPU streams can *ever* overlap. We measured one configuration (36 ops/step, 119.1 ops outstanding at `H_end`, both queues provably loaded) and got exactly `0.0000`. **MEASURED 2026-10-12 — re-run with a *device-bound* arm; the earlier arm's precondition is CORRECTED.** The new arm is two HPU streams with deep queues: `ov = 0.0000` **exactly, both runs**, with **18.5 ops outstanding at `H_end` / 83.5 % device busy** (run 1) and **55.9 / 97.0 %** (run 2), and `union(all) = TPC + MME` to four decimals. **Two loaded queues still buy exactly zero overlap.** **The correction:** the arm this row originally quoted is recorded in the new work as having had **0/40 ops in flight** — i.e. it was **not** device-bound, so it was a **null test** and could not have shown anything either way. The "119.1 ops outstanding / both queues provably loaded" precondition above is therefore **superseded** by the re-measurement; the *conclusion* is unchanged and is now carried by an arm whose precondition is asserted and **passes**. | — **closed for the tested structure.** A stream arm with a *different* submission structure is still open. |
 | 7 | Whether a `hpu_op` DMA interval is **execution** time or **submission** time. | a run with kernel-level (not `hpu_op`) DMA metrics |
 | 8 | **The one surviving piece of the closed item 9:** what fraction of the ~20 ms host tail is *sync waiting* vs *host computing*. The sync events carry a runtime stream id, not an OS thread id, so they cannot be intersected with the runner-thread frames. | sync events carrying the calling tid, or a `record_function` around each sync at the point the runtime issues it |
 | ~~9~~ | ~~**Whether a decode-shaped step is bound by launch/serialization or by device occupancy.**~~ **CLOSED 2026-10-11 — the occupancy model wins.** Both models fitted to the same 13 archived runs: `wall = k × node-executions` gives R² **0.346** / RMS **107.85 ms**, against `wall = a + b × merged` at R² **0.999950** / RMS **0.95 ms** — two orders of magnitude in residual, and the launch model's per-run coefficient varies by 171 % of its own mean. **The step is device-occupancy-bound and the lever is the union.** Source: `Archive/by-date/2026-10-11/node_law/`. See §2.5.5. | — **closed.** The surviving sub-question is item 8. |
 | 10 | The size of the gap between "recipes in a dump" and "recipes that executed" (cache-deserialised recipes may not be re-dumped). | a run with the recipe cache cold vs warm, comparing dump contents |
-| 11 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. A *separate* engine-scale intersection — `fp4_dequant` (TPC) × `GEMM` (MME), **1.980 ms/step over 40 windows/step** (§2.9 rule 8) — is measured and reproduces exactly, but it is a **raw interval intersection**, not a validated concurrency claim: nothing here establishes that the two engines were doing useful work at the same time, only that their execution windows intersected. | the engine-side dump paired with the trace |
+| 11 | A worked, *engine-scale* overlap verdict. The harness results in this chapter are synthetic. The project's one engine-scale TPC∥DMA figure moved three times under measurement and is recorded as **UNRESOLVED**, not as a validated concurrency measurement. A *separate* engine-scale intersection — `fp4_dequant` (TPC) × `GEMM` (MME), **1.980 ms/step over 40 windows/step** (§2.9 rule 8) — is measured and reproduces exactly, but it is a **raw interval intersection**, not a validated concurrency claim: nothing here establishes that the two engines were doing useful work at the same time, only that their execution windows intersected. **NARROWED 2026-10-12 — still NOT closed, in either direction.** The engine-scale TPC∥DMA figure is no longer merely "unresolved": it sits **exactly ON the ceiling `O = M`** — ≈100 % of the available DMA work hidden, against ~44 % of the measured `hpu_op` DMA union — so it is **neither established as real concurrency nor dismissed as an artefact**. Quantified: the ceiling for it to be real is **`p ≤ 2.200`**, the measured `p` at the engine's own TPC:DMA ratio is **2.23–2.28**, and `O/M = 1.02` (band 1.01–1.59). Chapter 3 §3.6.3 carries the numbers and the one run that would settle it — an engine-side `DUMP_POST_GRAPHS` on one W0 decode step — **NOT RUN**. | the engine-side dump paired with the trace — **unchanged; that is still the deciding instrument** |
 
 ---
 
