@@ -22,11 +22,14 @@ source activate.sh
 
 ## Environment rules that each cost a run
 
-1. **Do not set `HABANA_VISIBLE_DEVICES`** in a container that already sets it. Disagreeing views
-   give silent mis-pinning.
+1. **Do not set `HABANA_VISIBLE_DEVICES`** in a container that already sets it — inside the
+   container it is **inert** (nothing in the image reads it), so setting it neither helps nor
+   isolates. Pin by **module id** instead (`HLS_MODULE_ID=<module>`, or `set_device` first).
 2. **Never unset `GC_KERNEL_PATH`.** An empty value fails every compile.
-3. **`torch.hpu.set_device(i)` must be the first HPU call** if you pin. There is no working
-   self-report API — read `os.environ["HLS_MODULE_ID"]`.
+3. **Pin by module id.** `HLS_MODULE_ID=<module>` in the environment is the primitive (read lazily,
+   so it may be set after the imports); `torch.hpu.set_device(i)` as the **first** HPU call writes
+   it for you. One module is acquired **exclusively** — give each concurrent job a distinct one.
+   There is no working self-report API — read `os.environ["HLS_MODULE_ID"]` (unset = not pinned).
 4. **Collect `ProfilerActivity.HPU` only.** Adding CPU activity inflates the trace's host span ~3×
    and manufactures a false empty-queue verdict (§2.9, rule 6).
 5. **Stagger concurrent launches by ~2 s** if you run several arms at once; simultaneous starts lost
