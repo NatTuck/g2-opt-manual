@@ -36,9 +36,9 @@ those in from general knowledge.**
 | # | chapter | lines | status |
 |---|---|---|---|
 | **0** | **[TL;DR](00-tldr.md)** | 93 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
-| 1 | [Gaudi/HPU Basics](01-basics.md) | 943 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
+| 1 | [Gaudi/HPU Basics](01-basics.md) | 944 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | 1010 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | 1496 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| 3 | [Porting a large language model to HPU](03-porting.md) | 1504 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 
 Example code lives in [`examples/`](examples/), organized by chapter — **13 files**, of which
 one (`examples/02-regions/03_inspect_graph_dumps.py --demo`) runs CPU-only and has been

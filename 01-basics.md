@@ -807,8 +807,8 @@ looks like a hardware fault:
 **`*_VISIBLE_DEVICES` is a container-runtime input, consumed *outside* the container.** Setting it
 *inside* a container does nothing — nothing in the image reads it; the container's own device flags
 are what select the cards. **INFERRED**
-**`*_VISIBLE_MODULES` is not a filter in this stack.** It is a **local-index → module-id table**, and
-it can differ from the vendor tool's index order. **INFERRED**
+**`*_VISIBLE_MODULES` is not a filter in this stack** (**INFERRED**). It is a **local-index →
+module-id table**, and it can differ from the vendor tool's index order. **MEASURED**
 
 **The failure:** two processes that each pick the same **physical** module under different
 **local** views do **not** both get it. Module acquisition is an **exclusive lock** — one module,
@@ -843,11 +843,12 @@ variables are named per-deployment. The manual does not assume any one container
 
 **What this section does not know.** Whether the module-id table's own value also restricts the
 candidate set the driver picks from when *nothing* is pinned is **not established** — the binary
-analysis says the by-type acquire path does not consult it (**INFERRED**), and the two-process arm
-we *have* (two unpinned processes, watching which modules they take) used the container's **full**
-table, so it cannot separate the table from the container's `--device` cgroup. A **discriminating**
-arm is still open. The deployment-named treatment, the three numberings, and the per-rank rule are
-in **Chapter 3 §3.7**.
+analysis finds the PT-bridge's by-type function does not consult it (**INFERRED**), but the
+driver/thunk level is not settled (`hpu_isolation` §10.2), and the two-process arm we *have*
+(two unpinned processes, watching which modules they take) used the container's **full** table,
+so it cannot separate the table from the container's `--device` cgroup. A **discriminating** arm
+is still open. The deployment-named treatment, the three numberings, and the per-rank rule are in
+**Chapter 3 §3.7**.
 
 ---
 
@@ -901,7 +902,7 @@ Stated here so the gaps are visible, and repeated inline above where they matter
 | 9 | **`per_op_cost`** — the per-op fixed cost term | open; **the corpus does not define one** | a direct measurement; four candidate meanings exist, three orders of magnitude apart |
 | 10 | **Whether one process driving several devices keeps the tid windows** | open | one short run on a multi-device view, checking the three tid sets |
 | 11 | **The measured graph count vs the O(N × buckets) prediction** — §1.4.3 states the arithmetic; we have not checked a real model's executed-graph count against it in this chapter's sources | open | count **distinct compiled graphs executed per step** on a real model and compare against `shapes × layer constants`. This is the check that turns §1.4.3 from an arithmetic into a diagnostic |
-| 12 | **Whether the module-id table also restricts the driver's unpinned choice** (§1.10). The binary analysis says the by-type acquire path does not consult it, but that is **INFERRED**, not measured, and the unset path is otherwise documented as "first free module". | open — the two-process arm we have used the container's **full** table, so it cannot separate the table from the container's `--device` cgroup | a **discriminating** arm: a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the two processes take (`hl-smi -Q index,module_id,memory.used -f csv,nounits`) |
+| 12 | **Whether the module-id table also restricts the driver's unpinned choice** (§1.10). The binary analysis finds the PT-bridge's by-type function does not consult it, but that is **INFERRED**, not measured, the driver/thunk level is **not settled**, and the unset path is otherwise documented as "first free module". | open — the two-process arm we have (two unpinned processes, watching which modules they take) used the container's **full** table, so it cannot separate the table from the container's `--device` cgroup | a **discriminating** arm: a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the two processes take (`hl-smi -Q index,module_id,memory.used -f csv,nounits`) |
 
 **Two kinds of negative, and they are not the same.** Items **1** and **2** are *"we could not
 consult the corpus"* — the tool that would answer them was down, so they carry **no information

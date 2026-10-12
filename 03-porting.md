@@ -1198,8 +1198,9 @@ Nothing in the image reads it, so setting it *inside* a container is **inert** �
 `--device` flags are what actually isolate the cards. **INFERRED**
 `HABANA_VISIBLE_MODULES` **is not a filter in this stack** — no library in `/usr/lib/habanalabs/`
 contains the string, and the one C++ consumer uses it only as a **presence flag** before falling
-through to the by-type acquire. Its real effect is the **local-index → module-id table** that
-`torch.hpu.set_device(i)` indexes. **INFERRED**
+through to the by-type acquire. **INFERRED** *(grep + disassembly; `hpu_isolation` §2.3.)* Its real
+effect is the **local-index → module-id table** that `torch.hpu.set_device(i)` indexes. **MEASURED**
+*(`hls_module_id` §4.7 — the mapping was verified physically for all four indices.)*
 
 ⚠ **Three numberings disagree, and "card N == module N" fails for two of the four `hl-smi` indices
 and three of the four local torch indices.** The arithmetic, from the map below: `hl-smi` index →
@@ -1228,14 +1229,14 @@ module ids listed in `hl-smi` index order, and neither of the other two rows). *
 
 ### 3.7.2 Setting `HABANA_VISIBLE_DEVICES` inside a container that already limited you is INERT — and confusing
 
-**Check first, then decide.** On a bare host you will see 8 AIPs (untested here — §3.9); the
-operative advice is to pin. **In a container
-that has already limited you to 4, the four visible AIPs are already yours — setting
-`HABANA_VISIBLE_DEVICES` in here has NO effect** (nothing in the image reads it; it is a
-`habanalabs-container-runtime` input consumed **outside** the container, and the container's
-`--device` flags are what actually isolate the cards). Do not rely on it, and do not try to pick
-global devices. Use relative numbering. **INFERRED** *(whole-image grep + disassembly of the one
-device-acquire site: `Archive/by-date/2026-10-11/hpu_isolation/REPORT.md` §2.3.)*
+**Check first, then decide.** On a bare host you will see 8 AIPs (untested here — we have only ever
+run in the 4-AIP container); the operative advice is to pin. **In a container that has already
+limited you to 4, the four visible AIPs are already yours — setting `HABANA_VISIBLE_DEVICES` in
+here has NO effect** (nothing in the image reads it; it is a `habanalabs-container-runtime` input
+consumed **outside** the container, and the container's `--device` flags are what actually isolate
+the cards). Do not rely on it, and do not try to pick global devices. Use relative numbering.
+**INFERRED** *(whole-image grep + disassembly of the one device-acquire site:
+`Archive/by-date/2026-10-11/hpu_isolation/REPORT.md` §2.3.)*
 
 On this 4-AIP box the container shows **`HABANA_VISIBLE_DEVICES=0,1,2,3` AND
 `HABANA_VISIBLE_MODULES=0,3,6,7`** — a clean dense local view over a physical subset. **The module
@@ -1275,14 +1276,14 @@ python -c "import torch, torch_hpu; print(torch.hpu.device_count())"
   **MEASURED**
 - **It does not override an existing pin — *except* when that pin is `0`.** An existing
   `HLS_MODULE_ID` wins, so keep the environment pin and any `set_device(i)` **consistent**
-  (**INFERRED** — code analysis of `hpu/__init__.py:352-367`; not executed). The exception is
+  (**INFERRED** — code analysis of `hpu/__init__.py:352-367`, `:381`; not executed). The exception is
   `HLS_MODULE_ID=0`: the guard is keyed on the Python helper `_get_module_id_from_environ()`, whose
-  `if not device_index: device_index = -1` (`hpu/_utils.py:66`) maps `"0"` to `-1`, so the guard
+  `if not device_index: device_index = -1` (`hpu/_utils.py:68`) maps `"0"` to `-1`, so the guard
   does **not** fire and `set_device(i)` **overwrites** the pin — pre-set `0` plus `set_device(3)`
   leaves the environment reading `"7"`. **MEASURED** *(`hpu_pinning/mechanism2_run.log` M3b.)* Note
   the **driver** still honours `0` — it pins to module 0 (`set_device(0)` writes `"0"` and lands on
-  module 0); it is only this Python-side helper that treats `0` as `-1`. Never assume `set_device`
-  is harmless when the pin is `0`.
+  module 0; `hls_module_id` §4.7, `setdev_0/`); it is only this Python-side helper that treats `0`
+  as `-1`. Never assume `set_device` is harmless when the pin is `0`.
 - **The pin set must be a partition.** Because acquisition is exclusive (§3.7.1), N jobs need N
   *distinct* module ids; giving two jobs the same id fails the second one. **MEASURED**
 - **A multi-rank job needs one distinct module per rank.** One shared `HLS_MODULE_ID` for the whole
@@ -1303,7 +1304,7 @@ box: module `0`, then module `3`). Whether that order comes from the module tabl
 driver's own enumeration is **not settled** — the two coincide here, so this arm cannot separate
 them (§3.9, item 16(a)). Two unpinned processes landed on *different* modules, and the pairing is
 **not stable run to run** — it is a race. So unpinned concurrency already spreads; `HLS_MODULE_ID`
-buys **determinism**, not avoidance of contention. **MEASURED**
+buys **determinism**, not collision avoidance. **MEASURED**
 
 **`synStatus=8` is NOT diagnostic.** The identical string arises from **at least three** causes: a
 module id that is **not visible** (`HLS_MODULE_ID=1` where the table is `0,3,6,7`), a module id that
@@ -1344,24 +1345,31 @@ check the process table.**
   modules, but **no run read their placement back**. What *is* measured is the env-var path on a
   bare `torch_hpu` process. The **UNKNOWN register (§3.9, item 16)** carries this with the
   experiment that would settle it.
-- **Whether the module-id table also restricts the driver's unpinned choice** is **INFERRED**, not
-  measured — the binary analysis says the by-type path does not consult it. The two-process arm we
-  *have* (two unpinned processes, watching which modules they take) used the container's **full**
-  table, so it cannot separate the table from the container's `--device` cgroup: both processes land
-  inside the table either way. A **discriminating** arm is still open. *(§3.9, item 16(a);
-  Chapter 1 §1.12.)*
-- **What `torch.device("hpu", N)` does when N ≠ the pinned module's index** — raise, silently
-  remap, or corrupt — is **UNKNOWN**. Until it is settled, keep the environment pin and any
+- **Whether the module-id table also restricts the driver's unpinned choice is UNKNOWN.** The binary
+  analysis finds no `HABANA_VISIBLE_MODULES` string in `libhl-thunk.so`, and the PT-bridge's by-type
+  function does not consult it (**INFERRED**), but the driver/thunk-level candidate set is left open
+  (`hpu_isolation` §10.2). The two-process arm we *have* (two unpinned processes, watching which
+  modules they take) used the container's **full** table, so it cannot separate the table from the
+  container's `--device` cgroup: both processes land inside the table either way. A **discriminating**
+  arm is still open. *(§3.9, item 16(a); Chapter 1 §1.12.)*
+- **What `torch.device("hpu", N)` does when N ≠ the pinned module's index** — **MEASURED for an
+  unpinned process**: the index is ignored, the bridge warns (`"hpu:X" notation is not supported
+  ...`), and every allocation lands on the process's one acquired module (`hls_module_id` §1.2). The
+  *pinned* variant is untested. Until it is settled, keep the environment pin and any
   `set_device(i)` **consistent**.
-- **The `~2 %` device / `~5 %` host figures above (§3.7.4) are *better* controlled than they might
-  read — but they are a bound, not a zero.** Each arm ran `torch.hpu.set_device(idx)` as its first
-  HPU call, so it was **pinned**, and its placement was read back **both** ways: from the arm's own
-  `HLS_MODULE_ID` (`0`, `3`, `6`, `7` for idx `0..3`) and from `hl-smi`
-  (`hl-smi -Q module_id,memory.used,utilization.aip -f csv,nounits`, sampled before / during /
-  after — the neighbour on idx 3 reads as module **7**, the arm on idx 0 as module **0**). What is
-  *not* controlled is the box's other tenants: the run's own drift is **±5–7 %**, which is the
-  dominant error term. **MEASURED** *(`Archive/by-date/2026-10-11/hpu_pinning/`: `timing_arm.py:33`,
-  `toggle_arm.py:39`, `timing_run.log`, `run_timing.sh`, `toggle.jsonl`.)*
+- **The `~2 %` device / `~5 %` host figures above (§3.7.4) are *better* controlled than they
+  might read — but they are a bound, not a zero.** Each arm ran `torch.hpu.set_device(idx)` as
+  its first HPU call, so it was **pinned**, and that pin is read back from the arm's own
+  `HLS_MODULE_ID` (`0`, `3`, `6`, `7` for idx `0..3`). The run also samples `hl-smi` (`hl-smi
+  -Q module_id,memory.used,utilization.aip -f csv,nounits`, before / during / after, around
+  rather than during the arm's own run), which resolves the **neighbour**'s placement — the
+  dev-heavy process on idx 3 reads as module **7** with its own 8389 MiB / 88 % footprint —
+  but **not the arm's own**: module 0 reads the 768 MiB idle baseline in the samples that
+  bracket the arm's run, and the single 98304 MiB reading on it is the init/teardown transient
+  of §3.7.4 gotcha (b), not a steady footprint. What is *not* controlled is the box's other
+  tenants: the run's own drift is **±5–7 %**, which is the dominant error term. **MEASURED**
+  *(`Archive/by-date/2026-10-11/hpu_pinning/`: `timing_arm.py:33`, `timing_run.log`,
+  `run_timing.sh`.)*
 
 ---
 
@@ -1420,7 +1428,7 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 | 13 | **The exact tensor/line that introduces a data-dependent size into the graph** on our own port. Candidate identified, not pinned. | Per-region guard-key inspection. |
 | ~~14~~ | ~~**Whether the fp8 reserved-bin rule is ENGINE-DEPENDENT** — i.e. whether the MME could decode the reserved bin differently from the TPC.~~ **CLOSED — RESOLVED 2026-10-11. NO: the rule is a property of the device, not of an engine.** **`MME == TPC byte-for-byte over all 256 codes: True`**, same 14-code mismatch set, measured **within one process on one code set** (so a within-run two-engine comparison, not two measurements days apart). Calibration passed first — **242/242 exact through the MME** — so the readout is a pure decode. **`e4m3fnuz` is excluded twice over on the MME**: it reads `0x76` as **224** (fnuz would be 112) and `0x80` as **0** (fnuz would be NaN). **⇒ the format statement needs no engine qualifier, and the guard's byte set `0x78–0x7E` / `0xF8–0xFE` is confirmed for BOTH engines.** *Mechanism worth keeping: the fp8 decode happens **inside the GEMM node** — a post-graph dump shows `MME GEMM ['hfloat8','hfloat8'] → ['bf16']` consuming fp8 directly with **no intervening cast**, so **no engine-attribution pass can ever see it** and would have reported "MME, no fp8 cast" and been silently wrong.* **Full statement: §3.4.1** (see also the closed item 10 above for the format itself). *Provenance: a second disclosed ~11-second device probe, with its own post-graph dump.* | — **done** |
 | **15** | **What SELECTS the fp8 exponent bias in a given recipe, and whether it is readable back.** The bias is **selectable** (`{3, 7, 11, 15}`, default **7**) and is carried **per op in the H2D scale tensor** (§3.4.1), but *which* mechanism sets it for a given op, and whether a compiled recipe's chosen bias is **observable** from a trace or a dump, is **not established**. This matters because §3.4.1's poison set is stated **for the default bias** — a recipe that selects another bias has a **different reserved bin**. | A recipe/dump inspection for a bias field, or a decode readout on an arm known to select a non-default bias. *(**Opened** by the bias finding — recorded rather than left implicit, so the closures of items 10 and 14 are not read as "fp8 is fully understood".)* |
-| **16** | **How a real `vllm serve` pins its workers end-to-end — and therefore whether a TP=N launch is deterministic or a race.** vllm-gaudi **never references `HLS_MODULE_ID`** (grep, whole tree) and calls `torch.accelerator.set_device_index(local_rank)`, which **does not route** to the device-acquire path (`HPUHooks` does not override `setCurrentDevice`). The measured per-rank mechanism (`HLS_MODULE_ID` distinct per rank) was proven on bare `torch_hpu` processes only; the vLLM integration was deliberately not run. Two further device-pinning questions sit in the same place: **(a)** whether the module-id table also restricts the driver's unpinned by-type choice (**INFERRED** that it does not), and **(b)** what `torch.device("hpu", N)` does when N ≠ the pinned module's index. | Launch the **real TP=4 server** with and without `HLS_MODULE_ID` exported per rank, and read each worker's device off `hl-smi`'s process table / `hl-smi -Q index,module_id,memory.used -f csv,nounits`. For (a): a **discriminating** two-process arm — a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the processes take (the two-process arm we already have used the container's *full* table, so it cannot separate the table from the cgroup). For (b): one probe that pins module 6 and then allocates on `hpu:1` / `hpu:2`. *(Opened 2026-10-12; sources: `Archive/by-date/2026-10-11/hls_module_id/REPORT.md` §8, `hpu_isolation/REPORT.md` §10.1–§10.2.)* |
+| **16** | **How a real `vllm serve` pins its workers end-to-end — and therefore whether a TP=N launch is deterministic or a race.** vllm-gaudi **never references `HLS_MODULE_ID`** (grep, whole tree) and calls `torch.accelerator.set_device_index(local_rank)`, which **does not route** to the device-acquire path (`HPUHooks` does not override `setCurrentDevice`). The measured per-rank mechanism (`HLS_MODULE_ID` distinct per rank) was proven on bare `torch_hpu` processes only; the vLLM integration was deliberately not run. Two further device-pinning questions sit in the same place: **(a)** whether the module-id table also restricts the driver's unpinned by-type choice (**UNKNOWN** — the PT-bridge does not consult it (**INFERRED**), but the driver/thunk level is not settled; `hpu_isolation` §10.2), and **(b)** what `torch.device("hpu", N)` does when N ≠ the pinned module's index (**MEASURED** for an unpinned process — the index is ignored and the bridge warns; only the *pinned* variant is untested). | Launch the **real TP=4 server** with and without `HLS_MODULE_ID` exported per rank, and read each worker's device off `hl-smi`'s process table / `hl-smi -Q index,module_id,memory.used -f csv,nounits`. For (a): a **discriminating** two-process arm — a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the processes take (the two-process arm we already have used the container's *full* table, so it cannot separate the table from the cgroup). For (b): one probe that pins module 6 and then allocates on `hpu:1` / `hpu:2`. *(Opened 2026-10-12; sources: `Archive/by-date/2026-10-11/hls_module_id/REPORT.md` §8, `hpu_isolation/REPORT.md` §10.1–§10.2.)* |
 
 ---
 
@@ -1435,12 +1443,12 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 2. If a container already limited you, **do not set `HABANA_VISIBLE_DEVICES`** — inside the container
    it is **inert** (nothing in the image reads it), so it neither helps nor isolates.
 3. **Pin by module id, and make the pin set a partition.** Export `HLS_MODULE_ID=<module>` per job.
-   It is read **lazily** at device-acquire time, so a launcher that *spawns* the worker may set it
-   in the worker's environment after `import` — but never after the worker's first HPU tensor; or
-   use `torch.hpu.set_device(i)` as the **first** HPU call, which writes it for you. For a
-   multi-worker job, give each rank a **distinct** module — one shared value kills the workers.
-   Read back `os.environ["HLS_MODULE_ID"]` (the self-report APIs all lie; unset means **not
-   pinned**).
+   It is read **lazily** at device-acquire time, so code in the worker may set it after `import`
+   (and a launcher may set it in the environment it hands to a spawned worker); either way it must
+   precede the worker's first HPU tensor; or use `torch.hpu.set_device(i)` as the **first** HPU
+   call, which writes it for you. For a multi-worker job, give each rank a **distinct** module —
+   one shared value kills the workers. Read back `os.environ["HLS_MODULE_ID"]` (the self-report
+   APIs all lie; unset means **not pinned**).
 4. Confirm a clean idle baseline (~768 MiB per device) before and after every run.
 5. If scheduling several runs, **stagger them ~2 s** and never sample `hl-smi` during
    startup/teardown.

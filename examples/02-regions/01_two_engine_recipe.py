@@ -35,8 +35,8 @@ RUNNING IT
   ./venv/bin/python 01_two_engine_recipe.py
 
 Environment notes that each cost a run:
-  * do NOT set HABANA_VISIBLE_DEVICES in a container that already sets it -- inside the
-    container it is inert (nothing in the image reads it), so it neither helps nor isolates;
+  * do NOT set HABANA_VISIBLE_DEVICES in a container that already sets it -- inside the container
+    it is inert (INFERRED: nothing in the image reads it), so it neither helps nor isolates;
   * GC_KERNEL_PATH must never be unset (an empty value fails every compile);
   * collect ONLY ProfilerActivity.HPU.  Adding CPU activity inflates the trace's
     host span ~3x and manufactures a false empty-queue verdict (section 2.9, rule 6).
