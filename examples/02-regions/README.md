@@ -23,8 +23,9 @@ source activate.sh
 ## Environment rules that each cost a run
 
 1. **Do not set `HABANA_VISIBLE_DEVICES`** in a container that already sets it — inside the
-   container it is **inert** (nothing in the image reads it), so setting it neither helps nor
-   isolates. Pin by **module id** instead (`HLS_MODULE_ID=<module>`, or `set_device` first).
+   container it is **inert** (**INFERRED**: nothing in the image reads it), so setting it neither
+   helps nor isolates. Pin by **module id** instead (`HLS_MODULE_ID=<module>`, or `set_device`
+   first).
 2. **Never unset `GC_KERNEL_PATH`.** An empty value fails every compile.
 3. **Pin by module id.** `HLS_MODULE_ID=<module>` in the environment is the primitive (read lazily,
    so it may be set after the imports); `torch.hpu.set_device(i)` as the **first** HPU call writes

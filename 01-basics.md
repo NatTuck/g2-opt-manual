@@ -833,18 +833,21 @@ no state in which both run**. **MEASURED**
    `0` regardless. **Read the module-id environment variable** (the one the runtime writes, or the
    one you exported) rather than asking the tensor. **MEASURED**
 5. **Pin to an idle device; a device above baseline is *held*, not shared.** Acquisition is
-   exclusive (rule 3's failure mode), so a device showing much more than the idle footprint has a
-   process on it — yours, or one that is not an HPU process at all. A pin set must therefore be a
-   **partition**: one distinct module per job.
+   exclusive (the failure mode described above), so a device showing much more than the idle
+   footprint has a process **holding** it — ordinarily **another HPU job** (another agent's, another
+   user's, or yours), and only secondarily a non-HPU holder or a stale/interrupted run. A pin set
+   must therefore be a **partition**: one distinct module per job.
 
 This section is deliberately general: it is about the *mechanism*, and the specific environment
 variables are named per-deployment. The manual does not assume any one container layout.
 
 **What this section does not know.** Whether the module-id table's own value also restricts the
 candidate set the driver picks from when *nothing* is pinned is **not established** — the binary
-analysis says the by-type acquire path does not consult it (**INFERRED**), and the two-process test
-that would settle it has not been run. The deployment-named treatment, the three numberings, and the
-per-rank rule are in **Chapter 3 §3.7**.
+analysis says the by-type acquire path does not consult it (**INFERRED**), and the two-process arm
+we *have* (two unpinned processes, watching which modules they take) used the container's **full**
+table, so it cannot separate the table from the container's `--device` cgroup. A **discriminating**
+arm is still open. The deployment-named treatment, the three numberings, and the per-rank rule are
+in **Chapter 3 §3.7**.
 
 ---
 
@@ -886,19 +889,19 @@ ability to re-verify the vendor rows, and those rows are the ones least likely t
 Stated here so the gaps are visible, and repeated inline above where they matter.
 
 | # | UNKNOWN | status | what would settle it |
-|---|---|---|---|---|
+|---|---|---|---|
 | 1 | **The TPC cost model's clock** | ⚠ **corpus not successfully consulted** — the symbol-index tool failed on **every** attempt (`deadline exceeded`), and lexical search found nothing. **This is NOT "the corpus says no".** | retry `lookup_symbol` / `search_binary_strings` on `TPCCostModel` / `getClockFreqMHz` once the tool is healthy; or disassemble the TPC cost model |
 | 2 | **Whether the TPC/DMA cost models use the 21 %-high general HAL reader** | ⚠ **corpus not successfully consulted** (same cause) | the same retry, or the same disassembly |
 | 3 | **The DMA driver's exact round-robin queue-selection rule** | open — the queue *families* are now documented (§1.2); the *rule* is not. Note the raw thunk path takes a **caller-supplied queue index**, so the round-robin we measured must be chosen **above** the driver | symbol access into the runtime library that assigns the queue |
 | 4 | **Which queue family tids `4073/4082/4083` belong to** | **supported, not settled** — a third family (NIC) exists (§1.2), which is consistent with our split; the **tid→queue mapping was not given** | the profiler's `thread_name` for those tids, against the queue-name table |
 | 5 | **Are the per-TPC AXI rate limiters programmed?** — `mmDCORE0_TPC0_CFG_RD_RATE_LIMIT` `0x400BDA8` / `WR_RATE_LIMIT` `0x400BDAC` exist with `ENABLE` (bit 0) / `SATURATION` (bits 1–8) / `TIMEOUT` (bits 9–16); likewise QMAN `HBW_RD_RATE_LIM_CFG_0/1`, `LBW_WR_RATE_LIM_CFG_0/1` and the XBAR limiters. The corpus found **no programmed values**. | **NEW, open.** If they *are* programmed they would cap per-TPC bandwidth and could explain part of the **2,147 GB/s measured vs 2,450 GB/s nominal** gap | read the registers on a live device, or find the firmware init sequence that writes them |
-| ~~6~~ | ~~**The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations.~~ **CLOSED — RESOLVED 2026-10-11.** The figure was **wrong for two independent reasons**: a **per-repetition `launch → sync`** wall time read as a device time (bench median **622.1 µs** against a device union of **530.5 µs**, a ~90 µs per-rep overhead; the **union is identical** whether you sync once or per rep), **and** a **4.6 % arithmetic slip** (`1,073,741,824 / 0.6221 ms` = **1,726**, not 1,646). Corrected value: **2,023 GB/s**, and the curve is **monotone in size**. The 2-D-vs-1-D shape hypothesis is **refuted** (0.03 % apart). See §1.6. | — **done.** *The remaining DMA gap is **below 16 MB**, where we have **no DMA-engine measurement** — and the TPC/GEMV cliff must not be substituted for it.* |
+| ~~6~~ | ~~**The 512 MiB C++ bench point (1,646 GB/s)** — outlier, two untested explanations.~~ | **CLOSED — RESOLVED 2026-10-11.** The figure was **wrong for two independent reasons**: a **per-repetition `launch → sync`** wall time read as a device time (bench median **622.1 µs** against a device union of **530.5 µs**, a ~90 µs per-rep overhead; the **union is identical** whether you sync once or per rep), **and** a **4.6 % arithmetic slip** (`1,073,741,824 / 0.6221 ms` = **1,726**, not 1,646). Corrected value: **2,023 GB/s**, and the curve is **monotone in size**. The 2-D-vs-1-D shape hypothesis is **refuted** (0.03 % apart). See §1.6. | — **done.** *The remaining DMA gap is **below 16 MB**, where we have **no DMA-engine measurement** — and the TPC/GEMV cliff must not be substituted for it.* |
 | 7 | **The MME rate's absolute value — a 2× unit ambiguity** | open | the artifact's own label reads "215 TFLOPS" where the arithmetic gives 430; settling the unit convention settles the number |
 | 8 | **The MME rate at shapes other than the 4096³ family** | open | a rate sweep across shapes, each arm asserting `device_busy ≥ 80 %` |
 | 9 | **`per_op_cost`** — the per-op fixed cost term | open; **the corpus does not define one** | a direct measurement; four candidate meanings exist, three orders of magnitude apart |
 | 10 | **Whether one process driving several devices keeps the tid windows** | open | one short run on a multi-device view, checking the three tid sets |
 | 11 | **The measured graph count vs the O(N × buckets) prediction** — §1.4.3 states the arithmetic; we have not checked a real model's executed-graph count against it in this chapter's sources | open | count **distinct compiled graphs executed per step** on a real model and compare against `shapes × layer constants`. This is the check that turns §1.4.3 from an arithmetic into a diagnostic |
-| 12 | **Whether the module-id table also restricts the driver's unpinned choice** (§1.10). The binary analysis says the by-type acquire path does not consult it, but that is **INFERRED**, not measured, and the unset path is otherwise documented as "first free module". | Two processes with the *same* module-id table and **no** pin, watching which modules they take (`hl-smi -Q index,module_id,memory.used -f csv,nounits`). |
+| 12 | **Whether the module-id table also restricts the driver's unpinned choice** (§1.10). The binary analysis says the by-type acquire path does not consult it, but that is **INFERRED**, not measured, and the unset path is otherwise documented as "first free module". | open — the two-process arm we have used the container's **full** table, so it cannot separate the table from the container's `--device` cgroup | a **discriminating** arm: a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the two processes take (`hl-smi -Q index,module_id,memory.used -f csv,nounits`) |
 
 **Two kinds of negative, and they are not the same.** Items **1** and **2** are *"we could not
 consult the corpus"* — the tool that would answer them was down, so they carry **no information

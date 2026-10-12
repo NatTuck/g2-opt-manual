@@ -76,8 +76,11 @@ int main(int argc, char** argv) {
 
     synDeviceId dev = 0;
     if (module_id >= 0) {
-        // Pin by PHYSICAL module id. See the manual's section on device identity: pinning by
-        // a dense local index instead is a different thing and can collide silently.
+        // Pin by PHYSICAL module id. See the manual's section on device identity: a dense
+        // local index is NOT a card selector here -- the vendor tool's accel order (0,6,7,3)
+        // and the torch local index order (0,3,6,7) differ, so deriving the module id from
+        // the wrong order silently pins the WRONG CARD, with no error. A module another
+        // process already holds is not silent: it hard-fails with synStatus=8. Never shared.
         CHECK(synDeviceAcquireByModuleId(&dev, (synModuleId)module_id));
     } else {
         CHECK(synDeviceAcquireByDeviceType(&dev, synDeviceGaudi2));
