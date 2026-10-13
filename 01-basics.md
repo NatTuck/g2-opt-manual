@@ -676,12 +676,19 @@ above. The single figure is **replaced** by the size-dependent pair. **MEASURED*
 The TPC side has a cost field (`tpc_tpc_cycles`) and a working-engine count
 (`tpc_working_engines`, e.g. `[24,24,24]`). **The clock it uses to convert cycles to time is
 UNKNOWN**, and the "general HAL reader is 21 % high" note above is the specific worry. *(Refined
-2026-10-13: the field is **gated**, not absent — the serializer emits it only under
-`DUMP_TPC_COST_MODEL_DATA=1`, and only for kernels built with `--kernel-cost`. **MEASURED:** with the
-env var set, **11** stock elementwise nodes still emit no `tpc_tpc_cycles`, so the *second* gate is
-the one that fails on this stack. "Not obtained" is the accurate state, and the reason is now named.
-The companion field is better understood: `tpc_working_engines` is the **dispatch width**, and it is
-now **exactly predictable** from the glue's declared index space —
+2026-10-13; mechanism **corrected** the same day. The field is **gated**, not absent, and the gate is
+**two-part**: `DUMP_TPC_COST_MODEL_DATA=1` **and** `ENABLE_EXPERIMENTAL_FLAGS=1` — without the latter
+the config is **silently ignored** (libSynapse: *"is internal config. cannot be set without
+ENABLE_EXPERIMENTAL_FLAGS"*; a sibling `DUMP_*` config writes no file without it and a 51 KB JSON with
+it). **But the kernel-side half cannot be satisfied on this compiler:** the gate's own message names
+`--kernel-cost`, and `tpc-clang` **2.7.33 has no such flag** — rejected as a driver option, as
+`-mllvm`, and through `CCC_OVERRIDE_OPTIONS`, with the string occurring **0** times in the binary. The
+nearest real cost-json flags are **inert**: no pass in the codegen pipeline at any `-O` level writes
+the cost model, so they set a variable nothing reads. **MEASURED:** a dumped node carries **21 keys
+whose only `tpc_*` key is `tpc_working_engines`**, and **11** stock elementwise nodes in the same dump
+emit no `tpc_tpc_cycles` either. So **"not obtained"** is the accurate state. The companion field is
+better understood: `tpc_working_engines` is the **dispatch width**, and it is now **exactly
+predictable** from the glue's declared index space —
 [Chapter 4 §4.2.8](04-execution-model.md).)*
 
 **Be precise about which kind of unknown this is.** We tried to settle it by looking the clock up

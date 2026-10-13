@@ -411,7 +411,11 @@ on dim 1, i.e. torch `d0`. So `a1` is the **second**-dimension step and `lanes` 
 those two are exactly the two terms of that formula.)*
 
 **The kernel body does not matter at all** (three kernels at 2.75 / 31.25 / 20.0 bundles per iteration,
-same grid → identical `WE`), and neither does the graph context.
+same grid → identical `WE`), and neither does the graph context. **The glue's `preferredSplitDim` is not
+a lever either — a measured negative** (25 device compiles over 7 shapes × `{0,1,2,3}` give an identical
+`WE`, including `(256,1024)` → 22 where a dim-0-first split would have given 24; the glue prints the
+value it sets, so this is not a null test), which leaves the declared index space as the only `WE`
+control found.
 
 > ⚠ **The "fixed per-TPC cost" is not fixed.** At one point per TPC the non-work time measures
 > **1.26 / 1.80 / 4.12 / 16.4 µs** for `dep U = 1/4/16/64` and **0.62 / 2.38 µs** for `copy U = 4/64`
@@ -672,7 +676,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 |---|---|---|---|
 | 1 | **Whether 4 slots is architectural or a compiler maximum** | every one of 8,483 censused bundles has ≤4 real instructions and the compiler names exactly four slots — so 4 is *at least* the compiler's maximum; whether the silicon has a fifth resource (e.g. a second scalar pipe) is unchecked | a TPC disassembly, or a vendor statement |
 | 2 | **Why `{vliw-td, fast, linearize}` pack and the others do not** | open — `fast` ≡ `linearize` byte-for-byte is unexplained by their descriptions | compiler instrumentation (`-print-after`, a debug build) |
-| 3 | **The TPC clock in Hz** | **unobservable** on this build — no counter of any name. Every figure above is in ns; any cycle figure is **INFERRED** | a newer/privileged `hl-smi`, or a firmware route |
+| 3 | **The TPC clock in Hz** | **unobservable** on this build — no counter of any name. Every figure above is in ns; any cycle figure is **INFERRED**. A cross-check that inverts a measured duration at the assumed rate gives **0.577–0.603 ns/bundle** against §4.2.1's 0.5556 — but **inverting a duration by an assumed rate cannot validate the rate**, so this is **INDETERMINATE** and neither corroborates nor contradicts §4.2.1. **The clock stays UNKNOWN** | a newer/privileged `hl-smi`, or a firmware route |
 | 4 | **Whether `vliw-td` is safe for the whole model** | **NOT RUN** — bit-exact on 14 kernel bodies over the exhaustive domain plus four real shapes, but **no model run** | a model run with output comparison |
 | 5 | **`shuffle.i8`: ISA or lowering?** | **UNRESOLVED** — the bare-kernel control was **INCONCLUSIVE** | a probe with a purpose-built 1-D access pattern |
 | 6 | **Whether `--pre-RA-sched=vliw-td` survives a compiler/Synapse bump** | **UNKNOWN** — it is an LLVM hidden option with no vendor statement. The failure mode is loud (an unknown `-mllvm` option fails the build), so a stale build cannot pass unnoticed | a vendor statement, or the next compiler release |
