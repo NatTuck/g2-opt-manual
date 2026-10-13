@@ -1089,6 +1089,7 @@ and the union when you are describing occupancy — and never substitute one for
 the recipe still occupies that time. **MEASURED** *(artifact: `Archive/by-date/2026-10-12/span-ranking/`
 — the event-subset table, `sr8_spans.py`, `sr11_final.py`; the family unions and `merged` cross-check
 against the project's own per-family LOO ranking.)*
+
 **A span table should also report, per span, how many recipe LAUNCHES it contains** — a span's
 headline cost can be dominated by a per-launch structural cost its boundary happens to enclose
 (Chapter 3 §3.6.5).
@@ -1253,7 +1254,7 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
 | `guid`, `type` | all nodes | op identity (e.g. `gemm`/`GEMM`, `memcpy_dma`/`DmaMemcpy`) |
 | `exec_order_idx` | all nodes | position in the execution order |
 | `bundle_index` | many nodes | which bundle/slice group the node belongs to |
-| `origin_nodes` | all nodes | the IR node ids this physical task came from. **Present and non-empty everywhere, but not always resolvable** — treat it as a hint, never as a naming instrument (trap 4) |
+| `origin_nodes` | all nodes | the IR node ids this physical task came from. **Present and non-empty in all 118 staging nodes censused, but not always resolvable** — treat it as a hint, never as a naming instrument (trap 4) |
 | `is_logical` | all nodes | `true` for wrappers only — **all `engine=None`** |
 | `input_tensors` / `output_tensors` | all nodes | tensor ids into the graph's own `tensors` list, which carries `max_shape`/`min_shape`/`dtype` |
 | `mme_node_strategy` | MME | the geometry string (`Name=`, `Width=`, `Height=`, `Pattern=`, `BatchConcurrency=`, …) |

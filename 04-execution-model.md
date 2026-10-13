@@ -616,11 +616,13 @@ the point count and the work distribution are held fixed and only the code size 
 | `dep32_U32` (WE 24) | 915 → 352 | 2.60 | **437 → 491** | 8.6385 → 3.9245 | 2.201 |
 | `dep128_U128` (WE 22) | 3,984 → 3,500 | 1.14 | **1,749 → 4,530** | 28.979 → 23.771 | 1.219 |
 
-**Read the two `fs` rows against the four `dep` rows.** In all fifteen pairs the intercept moves with
-the bundle count, and in none of them does it stay put while bundles move; the flagged arm carries
-**more** real instruction slots than its twin in **every** pair, so the fall cannot be a fall in work.
-Where the scheduler changes *nothing* — straight-line bodies it already packs — the intercept moves
-by **0.1 % and 0.5 %**. The sharpest single case is `dep8_U8`: **270** bundles and 133 slots at
+**Read the two `fs` rows against the four `dep` rows.** In the **thirteen pairs where the bundle count
+moves by more than 1 %** the intercept moves with it, and in none of them does it stay put while
+bundles move; the flagged arm carries **more** real instruction slots than its twin in **13 of the 15
+pairs** and **equal** slots in the two no-change controls (`fs32_U1` **66 → 66**, `fs256_U1`
+**290 → 290**), so the fall cannot be a fall in work. Where the scheduler changes *nothing* —
+straight-line bodies it already packs — the intercept moves by **0.1 % and 0.5 %**. The sharpest
+single case is `dep8_U8`: **270** bundles and 133 slots at
 `a = 3.1316 µs` against `vtdep8_U8`'s **145** bundles and **142** slots at `a = 2.2742 µs` — **more**
 slots, **fewer** bundles, **1.377× lower**. **MEASURED.** *(Artifact:
 `Archive/by-date/2026-10-13/tpc-launch-cost-vs-codesize/` — `REPORT.md` §1.4, `logs/extra.log` §A,
@@ -986,8 +988,9 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 11. **The per-launch term is a bundle law, and it is sublinear.** `a(µs) = 0.6706 + 8.8911 ns ×
     bundles` over the 65 of 71 arms whose fit reaches R² > 0.995; `a = 0.0531 × bundles^0.736`. The
     causal variable is the **emitted bundle count**, not the instruction count — 15 matched scheduler
-    pairs with `WE` held fixed inside every pair, and the flagged arm carrying **more** slots every
-    time. **The mechanism is UNKNOWN; do not invent one.** Fit **`span_min`**, never `dur_min`.
+    pairs with `WE` held fixed inside every pair, and the flagged arm carrying **more** slots in **13
+    of the 15 pairs** (equal in the two no-change controls). **The mechanism is UNKNOWN; do not invent
+    one.** Fit **`span_min`**, never `dur_min`.
 
 ---
 

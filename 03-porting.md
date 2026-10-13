@@ -1665,9 +1665,10 @@ count (**14.2 → 14.5**) and the instruction count (**24.75 → 25.75** non-NOP
 > headers). Nothing here covers prefill, the compressor path, or the other 42 layers' tie
 > populations. **NOT RUN.** (§3.9 item 21.)
 
-*Artifact: `scratch/fp4-lut-promotion-safety/REPORT.md` and its logs (`logs_device_probe.txt:4-14`,
-`:50-61`, `:93-97`, `:102-109`, `:138-150`; `logs_lut_model_safety.txt:46-55`, `:62-66`, `:71-73`;
-`logs_lut_tables.txt:4-6`; `logs_variant_gate.txt:76-78`, `:87`, `:112`, `:122`). The 3.853× timing and
+*Artifact: `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` and its logs
+(`logs_device_probe.txt:4-14`, `:50-61`, `:93-97`, `:102-109`, `:138-150`;
+`logs_lut_model_safety.txt:46-55`, `:62-66`, `:71-73`; `logs_lut_tables.txt:4-6`;
+`logs_variant_gate.txt:76-78`, `:87`, `:112`, `:122`). The 3.853× timing and
 its bundle/vector-op census: `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §1–§2. The
 late-write evidence: the archived `fp4-e2e-variant` report's `[latewrite] wiring verdict = applied`
 and `THE FP4 OP DID NOT RUN: … synStatus=synStatus 26` probe output.*
@@ -1909,9 +1910,10 @@ different `merged`), it is the family's own busy-set union.
 | `gather_nd_*_u8` | 3,096 | 4.3820 | **2.0692** | **47.2 %** |
 | `fused_wqa_wkv` *(an event-subset cut, not a family)* | — | 0.2505 | **0.0000** | **0 %** |
 
-**Three families are 46 % of `merged`.** **MEASURED [DSv4F]**. Note the shape of this table: the two
-largest *op counts* are not the two largest *time* items, and the family with the largest op count is
-not in the top three by time. **Count and cost are different questions.**
+**Three families are 46 % of `merged` (by the LOO column; 77 % by union).** **MEASURED [DSv4F]**. Note
+the shape of this table: the two largest *op counts* are not the two largest *time* items, and the
+family with the largest op count is not in the top three by time. **Count and cost are different
+questions.**
 
 > **⚠ Read the LOO column, not the union column, when you are pricing a change.**
 >
@@ -1998,17 +2000,54 @@ all 2,422 blocks, as a bf16 tensor. `n_blocks = 2422` and `block = 64` are fixed
 staged destination (dense, MEASURED)   32768 × 2422 × 2 B   =    158,728,192 B  = 158.7 MB / launch
   × 43 launches/step                                        =  6,825,312,256 B  = 6.825 GB/step (one way)
   round trip (strided read + dense write)                   =  13.65 GB/step
-byte floor  13.65 GB / 1.81 TB/s (the DMA envelope, §1.6)   =      7.542 ms/step
-measured S4 union (this span's own stage)                   =      7.7751 ms/step  ->  **1.031×**
+byte floor  13.65 GB / 1.81 TB/s  (ASSUMED: midpoint of a RETRACTED range)  =  7.542 ms/step
+  the same floor at the four MEASURED DMA points, 16 / 64 / 256 / 1024 MB (§1.6):
+    13.65 GB / 1.7751 / 1.7766 / 2.0213 / 2.0284 TB/s       = 7.6897 / 7.6832 / 6.7531 / 6.7294 ms/step
+measured S4 union (this span's own stage)                   =      7.7751 ms/step
+  -> 1.011× / 1.012× / 1.151× / 1.155× those floors        = 98.9 / 98.8 / 86.9 / 86.6 % of envelope
 ```
 
-**The pass runs at ~97 % of the DMA envelope.** It is **not inefficient — it is efficiently doing
-work that should not need doing**, which is the same shape of finding as the fp4 decode's fold
-(§3.4.5) and the same one-line lesson: *check the job before you optimise the kernel.* **The lever is
-therefore TRAFFIC, not descriptor count.** An earlier reading of this stage bounded its byte floor at
-"≤0.72 ms/step" from an assumed ≤30 MB/layer staging budget and concluded that the **descriptor**
-count (**5.425 ms/step**) was the binding floor; the dump's real budget **refutes that byte floor by
-≥10×** and displaces it. **MEASURED / DERIVED.**
+**The pass runs at 87–99 % of the DMA envelope — and the `~97 %` that used to stand here rests on a
+denominator that is ASSUMED, not measured.** It is **not inefficient — it is efficiently doing work
+that should not need doing**, which is the same shape of finding as the fp4 decode's fold (§3.4.5) and
+the same one-line lesson: *check the job before you optimise the kernel.* **The lever is therefore
+TRAFFIC, not descriptor count.**
+
+- **`1.81 TB/s` is not a measurement.** It is the arithmetic midpoint of the range `1,731–1,888 GB/s`,
+  and **that clause was retracted on 2026-10-11**: those points are the **TPC `memcpy_u8`** path, not
+  the DMA engine. **§1.6 carries no `1.81 TB/s` figure at all** — its DMA numbers are **1,775.1 /
+  1,776.6 / 2,021.3 / 2,028.4 GB/s** — and §1.6 explicitly rules this size class out: *"Below 16 MB
+  we have no DMA-engine measurement at all."* **ASSUMED.**
+- **Against the four real DMA-engine points the honest figure is a band, not a point.** At the four
+  measured points the byte floor is **7.6897 / 7.6832 / 6.7531 / 6.7294 ms/step**, so the stage sits at
+  **98.9 % / 98.8 % / 86.9 % / 86.6 %** of the envelope. **The verdict weakens and does not survive as
+  stated — but it does not reverse.**
+- **The denominator is unmeasured in the regime this stage lives in.** Per descriptor the pass moves
+  **130,640 B** (`158,728,192 ÷ 1,215`) — **128× below** the smallest DMA-engine point (**16 MB** per
+  copy). So we **cannot tell** whether **7.7751 ms/step** is the DMA engine's floor for this access
+  pattern. **UNKNOWN** — a negative from a completed search, not a failed one.
+- **The ratio is circular, and that is the most instructive part.** At `1.81 TB/s` the measurement
+  implies **14.07 GB** of traffic against the counted **13.651 GB** — a **3.1 %** excess that *is* the
+  "**1.031×**". At `2.0213 TB/s` it implies **15.77 GB**. **The denominator was selected to make the
+  floor land on the measurement. That is fitting, not bounding.**
+- **And a stronger constraint comes free from this section's own data: a floor cannot exceed its
+  measurement.** At `1.731 TB/s` the byte floor would be **7.886 ms/step, above the measured
+  7.7751** — impossible — so the envelope is bounded **below** by
+  `13.651 GB ÷ 7.7751 ms` = **1.756 TB/s**, which **excludes the low end of the cited range on our
+  own evidence**.
+
+**What survives is the structural claim, and it is the one that matters: the pass is a 13.65 GB round
+trip serving ~2.8 MB of useful fp8 KV.** An earlier reading of this stage bounded its byte floor at
+"≤0.72 ms/step" from an assumed ≤30 MB/layer staging budget and concluded that the **descriptor** count
+(**5.425 ms/step**) was the binding floor; the dump's real budget **refutes that byte floor by ≥10×**
+and displaces it. **MEASURED / DERIVED** for the traffic and the counted bytes; **ASSUMED** for the
+envelope; **UNKNOWN** for the envelope below 16 MB.
+
+> **Provenance note, because it is how the wrong number got in.** The `~97 %` came from
+> `Archive/by-date/2026-10-13/staging-origin-nodes-dump/REPORT.md`, which states the `1.81 TB/s`
+> denominator flatly; the rewrite plan
+> (`Archive/by-date/2026-10-13/attn-preamble-rewrite-plan/REPORT.md` §0.8) carries the **same number
+> with the retraction attached**. **This section inherited the weaker source on exactly this point.**
 
 > **One tension, flagged rather than smoothed over.** The same arithmetic implies **~101.6 GB/s per
 > busy engine** at the trace's achieved concurrency of **17.27**, which is above the **75.4 GB/s**
@@ -2329,7 +2368,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
-| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **It is also not established that the timed variant and the bit-exact variant are the same configuration.** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `scratch/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
+| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **It is also not established that the timed variant and the bit-exact variant are the same configuration.** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
 
 ---
 
