@@ -684,6 +684,10 @@ matters: a failed lookup must not be allowed to harden into a vendor statement. 
 it:* symbol access into the cost-model libraries, or the same disassembly method that settled the
 MME clock.
 
+> **If you are writing your own TPC kernel, the unit of cost is the VLIW *bundle*, not the
+> instruction** — an *issue group*, **not** the graph `bundle_index` sense of §1.3.
+> [Chapter 4](04-execution-model.md) prices TPC code that way.
+
 ### The rule that follows
 
 > **Two cost models, same field family, different error signs.** The MME model is **accurate
