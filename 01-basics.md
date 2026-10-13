@@ -685,14 +685,16 @@ it). **But the kernel-side half cannot be satisfied on this compiler:** the gate
 `-mllvm`, and through `CCC_OVERRIDE_OPTIONS`, with the string occurring **0** times in the binary. The
 nearest real cost-json flags are **inert**: no pass in the codegen pipeline at any `-O` level writes
 the cost model, so they set a variable nothing reads. **MEASURED:** a dumped node carries **21 keys
-whose only `tpc_*` key is `tpc_working_engines`**, and **11** stock elementwise nodes in the same dump
-emit no `tpc_tpc_cycles` either. So **"not obtained"** is the accurate state. The companion field is
+whose only `tpc_*` key is `tpc_working_engines`** — the stock `relu_fwd_bf16` node compiled in the
+same process behaves identically — and across **every** node in every dump taken that session
+(**11** nodes in the `ENABLE_EXPERIMENTAL_FLAGS` run), the set of keys matching `cycle` or `asic` is
+**empty**. So **"not obtained"** is the accurate state. The companion field is
 better understood: `tpc_working_engines` is the **dispatch width**, and it is now **exactly
 predictable** from the glue's declared index space —
 [Chapter 4 §4.2.8](04-execution-model.md).)*
 
 **Be precise about which kind of unknown this is.** We tried to settle it by looking the clock up
-in the shipped cost-model libraries and **could not complete the check** — so this is
+in the shipped cost-model libraries and **could not complete that check** — so *that route* is
 *"not checked"*, **not** *"checked and absent"*. §1.12 records the distinction explicitly, and it
 matters: a failed lookup must not be allowed to harden into a vendor statement. *What would settle
 it:* symbol access into the cost-model libraries, or the same disassembly method that settled the
