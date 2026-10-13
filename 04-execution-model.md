@@ -366,6 +366,53 @@ vector chain should be re-scheduled before it is believed to be at a ceiling.** 
 > count moves with the added instructions, the cost is a scheduling effect; if it does not, it is a
 > chain effect.
 
+### 4.2.8 How many TPCs does a node get? — `WE` is derived, not chosen
+
+The model in §4.2.1 is **per TPC**, so its last term is the split: how many TPCs the node runs on —
+`WE`, the `tpc_working_engines` field. **It is computed exactly, and it is predictable on the host
+with no device. MEASURED: 1,579 device-measured `WE` values, 0 wrong.**
+
+**The input is the index-space grid, in the graph compiler's own dim order — and the GC's dim 0 is the
+*torch-last*, fastest-varying dim.** For a torch tensor `(d0, d1)` and a glue whose AP is
+`a = (lanes, a1)`:
+
+```
+grid = [ ceil(d1 / lanes), ceil(d0 / a1), 1, 1, 1 ]    lanes = 256 (i8) / 128 (bf16) / 64 (f32)
+```
+
+**1-D closed form** (verified for all `G = 1 … 19 999`):
+
+```
+WE = 24                      if 24 | G
+WE = ceil(G / ceil(G/24))    otherwise
+```
+
+**A 2-D grid is a genuine competition** between two trials on *box size* — a **GCD** trial and a
+**naive** trial, over **one** dim-preference permutation, with `numTpcEngs = 24`. That competition
+**is** the non-monotonicity: the GCD trial splits a dim by `gcd(24, dim)` and wins whenever its box is
+smaller. The worked pair, `i8`, `grid = [g0, 64]`: **`g0 = 3` → 24** but **`g0 = 4` → 22**.
+
+**Two controls, and they are the evidence.** Take the GC's dim order away — use the torch order — and
+the model is right on only **179/547** of the dense `U=4` sweep instead of **547/547**. Replace the
+single permutation with the *full* permutation search and it matches **483/547** instead of **547/547**
+(the device agrees with single-permutation **64/64** where the two differ).
+
+**`WE` is not requestable — but the glue's declared index space is the control.** There is no API:
+`synUserProgrammability` carries only `userExecOrder` and `userBundling`, so
+`synNodeSetUserProgrammability` cannot set a TPC count. The lever is the **grid**, i.e. the AP step
+`a1` and the tensor shape — **the same mechanism as any `a`-driven speedup**, because moving `a` moves
+the grid and hence both the point count *and* `WE`. A glue that wants 24 engines can now choose them.
+**The kernel body does not matter at all** (three kernels at 2.75 / 31.25 / 20.0 bundles per iteration,
+same grid → identical `WE`), and neither does the graph context.
+
+> ⚠ **The "fixed per-TPC cost" is not fixed.** At one point per TPC the non-work time measures
+> **1.26 / 1.80 / 4.12 / 16.4 µs** for `dep U = 1/4/16/64` and **0.62 / 2.38 µs** for `copy U = 4/64`
+> — it tracks the kernel's **unrolled inner-loop code size**, not `WE`, not the grid, and not the
+> launch. **Cause UNKNOWN.**
+
+*Artifact: `Archive/by-date/2026-10-13/we-rule/` — `REPORT.md` §2, and `we_model.py`, which predicts
+`WE` for any shape with no device.*
+
 ---
 
 ## 4.3 Vector registers and dtype rules
@@ -598,8 +645,14 @@ and they run against any TPC kernel you already have.)*
 > (1650 MHz flat), `clocks.max.soc`, `clocks.limit.soc` and `clocks.limit.tpc` (1800 MHz); its
 > utilisation keys are `utilization.aip` and `utilization.memory`. `hl-smi -Q tpc_tpc_cycles`
 > and `-Q clocks.current.tpc` both return *"Invalid --query-aip parameter"*. This is **"no such key on
-> this build"** (the whole key list was enumerated), **not** "we could not look". **UNKNOWN** whether a
+> this build" (the whole key list was enumerated), **not** "we could not look". **UNKNOWN** whether a
 > newer or privileged build exposes them.
+>
+> ⚠ **And a hand-built C-API graph cannot be device-traced at all.** `synProfilerQueryRequiredMemory`
+> and `synProfilerStart` return **`synUnsupported(18)`** for `synTraceDevice`, `synTraceAll` *and*
+> `synTraceHost`, with `HABANA_PLUGINS_LIB_PATH` set — so the device trace is reachable only through
+> the torch plugin path, and any C-API-only question needing execution windows is currently
+> unanswerable by that route. **MEASURED.** *(Recorded so the next person does not re-try it.)*
 
 ---
 

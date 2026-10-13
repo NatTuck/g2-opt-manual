@@ -66,13 +66,38 @@ DMA = `DmaTranspose`/`DmaMemcpy`/`transpose_dma`/…, TPC = everything else.
 > **`CROSS > 0` iff ALL FOUR hold:**
 > 1. **ONE Synapse submission** for the whole group (`Launch`/step == 1);
 > 2. the groups are on **different engines**;
-> 3. there is **no dataflow edge** between the groups;
+> 3. there is **no dataflow edge** between the groups — **and, for a same-engine elementwise
+>    edge, no fusion** (see the split below);
 > 4. the groups' **durations are comparable**.
 >
 > **Miss any one and `CROSS` is exactly `0.0000`.**
 
 **MEASURED** (all four conditions were separated by matched arms). The four conditions are not
 independent advice — they are a conjunction.
+
+**Condition 3 is two conditions wearing one name**, and which one you have depends only on whether
+the edge crosses an engine boundary. **MEASURED** (both forms, same harness, one recipe each).
+
+| edge | what it lowers to | how to see it | what it costs |
+|---|---|---|---|
+| **cross-engine** | a **monitor on the producer engine's sync object** — the consumer's queue entry waits until that engine's counter reaches a threshold | the compiler's sync-scheme log prints, on the consumer, `Dependencies (monitors): Wait on type: <ENGINE> to reach (>=) sig-val: N`; an independent node prints `Dependencies (monitors): none` | **a runtime dependency** |
+| **same-engine, fusable elementwise** | **fusion into ONE kernel** | the graph dump shows a single `fused_kernel_<hash>_<n>_<dtype>` node where the unfused body had two | **not a wait at all** — the win is a saved memory pass |
+
+**The cross-engine form is structural, not an inference.** The `DUMP_POST_GRAPHS` node sets are
+**identical** between the edge and no-edge arms (`dmatpc`: 1 `DmaMemcpy` + 1 `relu_fwd_f32` each) —
+no fusion, no placement change, one recipe, one `synLaunch`. Only the monitor differs.
+
+**The same-engine form, quantified.** Two `relu_fwd_f32` nodes joined by an edge compile to **one**
+node (`fusedTPCNode_0_0`, `type=fused_kernel_0xF54BCFA8_1_f32`, `input=[pIn]`, `output=[pOut,
+qOut]`) and measure **395.9 µs against 520.6 µs** at R=8192 for the same two nodes with the edge
+removed. The fused kernel does read + 2 writes = **3** memory passes where the unfused pair does
+2 reads + 2 writes = **4** — and 1.5× a single `relu` is **369.9 µs** predicted against **395.9**
+observed. Nothing synchronises; the compiler merged the kernels and deleted a read. `memcpy_dma`
+does **not** fuse this way (two chained copies stay two nodes) — the fuser is TPC-only.
+
+**Why the split matters for a port.** A cross-engine edge is fixed by removing the dependency or by
+accepting a wait. A same-engine elementwise edge is fixed by *code generation*: it is usually a
+**win**, and "avoid the edge" is the wrong move.
 
 **One refinement, because it changes how you use the list.** Conditions 1–3 have a **total**
 failure mode: violating any of them gives exactly `0.0000`, not a reduced value, and the arms
@@ -83,6 +108,14 @@ table below violates it and still reports `CROSS = 0.0248` (independent) vs `0.0
 i.e. **small and non-discriminating rather than zero**. So: read 1–3 as "if violated, there is no
 overlap"; read 4 as "if violated, you have not measured anything either way". **MEASURED**, and it
 is the reason condition 4 is stated as a requirement on the *experiment* as well as on the code.
+
+**Label the observable, though, because condition 4 is dual.** The reading above is about
+**`CROSS`**. For **wall-clock absorption** condition 4 is an **existence** condition, not a
+detectability one: at TPC:MME = **1:12** the saving is **exactly `0 %`** — indistinguishable from a
+violation of 1–3 — and it only plateaus at **≈ 45 %** once the TPC is about a third of the MME.
+Both readings hold at once (a pair can have intersecting windows and still save nothing, if both
+legs are HBM-bound), which is exactly why they need separate labels. **MEASURED** — see the
+2026-10-13 UPDATE below.
 
 ### The evidence
 
@@ -111,8 +144,12 @@ their own precondition (§2.8), and all use **duration-matched** ops (§2.2 cond
 
 *(all **MEASURED**)*
 
-Read the TPC×MME rows across: in every overlapping arm `union(all) == union(TPC)` **exactly** — the
-*whole* MME family disappears under the TPC, at 2, 4 and 8 ops. The saving therefore **grows with
+Read the TPC×MME rows across: in every overlapping arm `union(all) == union(TPC)` **exactly over
+the kernel channel** (`TPC`/`MME`/`DMAk`) — the *whole* MME family disappears under the TPC, at 2, 4
+and 8 ops. *(2026-10-13: putting the `hpu_op` DMA channel back — the MME's staging `DmaMemcpy`,
+which `t2_census.py:99`'s `cat == "kernel"` filter drops — leaves the equality off by a constant
+**+1.6–1.8 µs/step (0.2–0.8 %)**, one ~1–2 µs sliver per step, and leaves `ov`(TPC,MME) at exactly
+`1.000`. Re-reduced: `Archive/by-date/2026-10-13/eocensus-t2-rereduce/`.)* The saving therefore **grows with
 depth** (0.2019 → 0.4021 → 0.8080) instead of saturating at one op's worth, which is what you would
 see if the scheduler were only hiding a fixed slice.
 
@@ -120,10 +157,14 @@ see if the scheduler were only hiding a fixed slice.
 >
 > **The primary result, and the strongest statement in this chapter. MEASURED.**
 >
-> **In a single submission with independent branches, `union(all) == union(TPC)` EXACTLY — the entire
-> MME family hides behind TPC, with `ov = 1.000` across 13 arms.** Every size, every TPC load, every
-> orchestration that keeps one submission. **This is not partial overlap: the MME contributes
-> *nothing* to the union.** (`ov = (t_a + t_b − t_ab) / min(t_a, t_b)`, on **device unions**; the
+> **In a single submission with independent branches, `union(all) == union(TPC)` EXACTLY over the
+> kernel channel (`TPC`/`MME`/`DMAk`) — the entire MME family hides behind TPC, with `ov = 1.000`
+> across 13 arms.** Every size, every TPC load, every orchestration that keeps one submission.
+> **This is not partial overlap: the MME's `GEMM` contributes *nothing* to the union.** *(Scope added
+> 2026-10-13 — the *family* is **99.2–99.8 %** hidden, not 100 %: its staging `DmaMemcpy` rides the
+> **`hpu_op`** channel and adds a constant **+1.6–1.8 µs/step**; `ov` stays exactly `1.000`.
+> `Archive/by-date/2026-10-13/eocensus-t2-rereduce/`.)* (`ov = (t_a + t_b − t_ab) / min(t_a, t_b)`,
+> on **device unions**; the
 > harness that produced it is 33 arm-runs, each a single `torch.compile(fullgraph=True,
 > dynamic=False)` region — or a deliberately uncompiled control — replayed 20 steps after a 6-step
 > warm-up at the correct shapes.)
@@ -142,7 +183,8 @@ see if the scheduler were only hiding a fixed slice.
 >
 > * **Two HPU streams, device-bound: `ov = 0.0000` exactly, both runs.** The precondition is asserted,
 >   not assumed — **18.5 ops outstanding at `H_end`, 83.5 % device busy** (run 1) and **55.9 / 97.0 %**
->   (run 2) — and `union(all) = TPC + MME` to four decimals in both. **A sentence of history, because
+>   (run 2) — and `union(all) = TPC + MME` to four decimals in both (the arm carries **zero**
+>   `hpu_op` DMA events, so the channel scope above does not touch it). **A sentence of history, because
 >   it is the reason this arm had to be re-run:** the E5 audit's two-stream arm (`07_streams_indep`)
 >   was a **0/40-ops-in-flight null test** (host-bound, 10.9 % busy), which is what left the audit's
 >   cases (d)/(e) open. **That null is not the arm §2.12 quotes, though** — §2.12's arm is
@@ -194,7 +236,10 @@ dependencies**. Size-match your groups before you conclude anything.
 The size-matched pair above is the cleanest evidence for the dataflow condition, because
 `torch.hpu.synchronize()` is called before **every** recipe call, so exactly one recipe is ever in
 flight and cross-step pipelining is impossible. Independent body: `union(all) == union(MME)` — the
-TPC is *entirely* hidden. Dependent body: `union(all) == Σ(families)` **exactly**. Same ops, same
+TPC is *entirely* hidden (the arm carries **zero** `hpu_op` DMA events, so the channel scope above
+does not touch it). Dependent body: `union(all) == Σ(families)` **exactly over the kernel channels**
+— and even with the `hpu_op` channel counted, that body's DMA union (0.147 ms/step) adds only
+**+4.7 µs/step** to the union, i.e. **97 %** of it was already inside. Same ops, same
 shapes, same submission count, one edge. **MEASURED.**
 
 ### How to check each condition
@@ -203,7 +248,7 @@ shapes, same submission count, one edge. **MEASURED.**
 |---|---|
 | 1. one submission | `Launch`/step == 1 **and** all your ops carry the **same** `recipeHandle`. `LaunchRecipe` alone is not enough (§2.1). |
 | 2. cross-engine | read the per-node `engine` field in the graph dump (§2.10). Do **not** infer the engine from an op name. |
-| 3. no dataflow edge | read the FX graph / JIT IR and confirm the nodes' operand sets are disjoint. Note that an edge can exist *only* through buffer reuse or aliasing — check for that too. |
+| 3. no dataflow edge (and, same-engine, no fusion) | read the FX graph / JIT IR and confirm the nodes' operand sets are disjoint. Note that an edge can exist *only* through buffer reuse or aliasing — check for that too. Then read the compiler's **sync-scheme log** (`LOG_LEVEL_ALL=1`, category `SYNC_SCHEME`): a cross-engine edge shows up as `Dependencies (monitors): Wait on type: <ENGINE> to reach (>=) sig-val: N` on the consumer, and an independent node shows `none`. This is the structural check — it needs no profiler. Same-engine, look for a single `fused_kernel_*` node instead. |
 | 4. comparable durations | measure each group **solo** in the same context (§2.7) and confirm the ratio is within ~2×. |
 
 ### A caution about "`union(all) == union(TPC)`"
@@ -214,6 +259,26 @@ blocks and 20 merged MME blocks and **each MME block *k* nests inside TPC block 
 0…19, **zero straddles**; under cross-step pipelining MME block *k* would straddle TPC blocks *k*
 and *k+1* (**MEASURED**). Any future claim of intra-graph overlap should carry either the interval
 nesting or an isolated single-shot run.
+
+> ### UPDATE 2026-10-13 — the ratio is the variable, and an UNRESOLVED residual
+>
+> **MEASURED**, hand-built single-recipe C-API arms (one `synLaunch` each, physical module 3, `min`
+> over 30 reps):
+>
+> | TPC:MME | harness | absorbed |
+> |---|---|---|
+> | **1:12** | C-API | **0 %** |
+> | ≈1:3 | C-API | **≈ 45 %** (plateau) |
+> | ≈1:1.5 | `torch.compile` | **53–56 %** |
+> | ≈1:1.1 | `torch.compile` | **90 %** |
+>
+> **The node count is not the lever.** Holding the TPC work fixed at 64 MB and the `gemm` fixed at
+> 2048³, the total is **flat across K = 1/2/4/8** — **228.0 / 229.3 / 229.1 / 231.3 µs**.
+>
+> **⚠ UNRESOLVED, and this is the bound: no wall-clock arm reproduces the exact
+> `union(all) == union(TPC)`.** The best absorption measured is **90 %** (torch) and **46 %**
+> (C-API) — a ~10 % gap remains on the best arm, and the event-filter question stays open.
+> **This block does not close it.**
 
 ---
 
@@ -233,7 +298,8 @@ same independent MME and solo durations matched within 1.18×:
 | **C** | `torch.add` | no | **0.4179** | **1.00** | **yes** |
 
 **A and B are both custom ops and differ in exactly one measured respect — `Launch`/step 1.00 vs
-2.00 — and the outcome flips.** In A and C, `union(all) == union(TPC)` exactly: the whole MME
+2.00 — and the outcome flips.** In A and C, `union(all) == union(TPC)` exactly over the kernel
+channel: the whole MME
 family is hidden. Nesting confirms it: in A and C, MME block *k* nests inside TPC block *k* for all
 20 with zero straddles; in B, all 20 **straddle**.
 
@@ -380,9 +446,12 @@ pass that prints the placement and the reason per node).
 >      namespace costs `kchain::alu` the overlap is **MEASURED**; that it does the same for the
 >      other four `kchain` ops — `fp4_base`, `fp4_arith2`, `fp4_lutptr`, `ident` — follows from the
 >      same measured namespace rule and is **INFERRED**, not separately measured.)*
-> 2. **Keep the body a DAG with no dataflow edge to the MME/DMA branch.** One edge drops every
->    **TPC-involving** pairwise intersection to exactly `0.000` (measured above with three engines);
->    the `MME∥DMAk` pair survives at 0.0939, which is what the residual `CROSS` becomes.
+> 2. **Keep the body a DAG with no dataflow edge to the MME/DMA branch.** A **cross-engine** edge
+>    lowers to a monitor on the producer engine, and it drops every **TPC-involving** pairwise
+>    intersection to exactly `0.000` (measured above with three engines);
+>    the `MME∥DMAk` pair survives at 0.0939, which is what the residual `CROSS` becomes. *(A
+>    **same-engine** TPC→TPC elementwise edge is the opposite case — the compiler fuses the two
+>    nodes into one kernel; see §2.2.)*
 > 3. **Duration-match** the branches to within ~2× (condition 4).
 > 4. **Verify; do not assume.** Register a `PRE_PARTITIONER` pass and print
 >    `node.meta["placement"]` — `hpu_cluster` means it is in the recipe. The whole check is ~100
