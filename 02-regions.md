@@ -238,8 +238,9 @@ The size-matched pair above is the cleanest evidence for the dataflow condition,
 flight and cross-step pipelining is impossible. Independent body: `union(all) == union(MME)` — the
 TPC is *entirely* hidden (the arm carries **zero** `hpu_op` DMA events, so the channel scope above
 does not touch it). Dependent body: `union(all) == Σ(families)` **exactly over the kernel channels**
-— and even with the `hpu_op` channel counted, that body's DMA union (0.147 ms/step) adds only
-**+4.7 µs/step** to the union, i.e. **97 %** of it was already inside. Same ops, same
+— and even with the `hpu_op` channel counted, that body's DMA union (**0.2457 ms/call**) adds only
+**+7.9 µs/call** to the union, i.e. **97 %** of it was already inside. *(This arm is normalised per
+**call**, not per step: 12 calls.)* Same ops, same
 shapes, same submission count, one edge. **MEASURED.**
 
 ### How to check each condition
