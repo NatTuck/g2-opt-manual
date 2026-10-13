@@ -810,7 +810,7 @@ with TPC:  W ≈ 96.0 + 2.164·M        (~96 µs fixed offset; a 2.16× per-byte
 >   with §2.9 rule 2.
 > * **The window is invariant to DMA queue load but sensitive to a TPC co-tenant.** The same node
 >   (`…/memcpy/0`, 3072² shape) measures **8.89 µs** with no co-tenant (identical in both runs) and **22.4 µs** with one TPC
->   mul (**run 2; run 1 measures 23.12 µs**) — 2.5× (run 1: 2.6×). Yet at fixed DMA it is **flat** across TPC load: W = 77.2 / 76.3 / 75.4 µs for 1 / 2 /
+>   mul (**run 2; run 1 measures 23.12 µs**) — 2.5× (run 2) / 2.6× (run 1). Yet at fixed DMA it is **flat** across TPC load: W = 77.2 / 76.3 / 75.4 µs for 1 / 2 /
 >   4 TPC muls. So the inflation is a **step change when the first co-tenant appears, plus a weaker
 >   per-byte term** — a threshold, not a proportion. **Why** it is a threshold rather than
 >   proportional was not isolated (HBM contention vs residency vs queue interaction): **UNKNOWN.**
