@@ -111,8 +111,9 @@ is the reason condition 4 is stated as a requirement on the *experiment* as well
 
 **Label the observable, though, because condition 4 is dual.** The reading above is about
 **`CROSS`**. For **wall-clock absorption** condition 4 is an **existence** condition, not a
-detectability one: at TPC:MME = **1:12** the saving is **exactly `0 %`** — indistinguishable from a
-violation of 1–3 — and it only plateaus at **≈ 45 %** once the TPC is about a third of the MME.
+detectability one: at TPC:MME = **1:12** the saving is **`0 %` to within the instrument's ±5 µs** —
+indistinguishable from a violation of 1–3 — and it only plateaus at **≈ 45 %** once the TPC is about
+a third of the MME.
 Both readings hold at once (a pair can have intersecting windows and still save nothing, if both
 legs are HBM-bound), which is exactly why they need separate labels. **MEASURED** — see the
 2026-10-13 UPDATE below.
@@ -131,10 +132,10 @@ their own precondition (§2.8), and all use **duration-matched** ops (§2.2 cond
 
 | arm | structure | `CROSS` (ms/step) | `Launch`/step | one submission? | verdict |
 |---|---|---:|---:|:---:|---|
-| TPC × MME, 2 ops | one region, independent | **0.2019** | 1.00 | yes | overlap — MME **entirely** hidden |
+| TPC × MME, 2 ops | one region, independent | **0.2019** | 1.00 | yes | overlap — MME **entirely** hidden (kernel channel) |
 | TPC × DMA, 2 ops | one region, independent | **0.2496** | 1.00 | yes | overlap — TPC **entirely** hidden |
 | TPC × MME, 4 ops | one region, independent | **0.4021** | 1.00 | yes | overlap, and it **scales** |
-| TPC × MME, 8 ops | one region, independent | **0.8080** | 1.00 | yes | overlap, whole MME family hidden |
+| TPC × MME, 8 ops | one region, independent | **0.8080** | 1.00 | yes | overlap, whole MME family hidden (kernel channel) |
 | TPC × TPC, 2/4 ops | one region, independent | 0.0000 | 1.00 | yes | **same engine** ⇒ serialised |
 | MME × MME, 2/8 ops | one region, independent | 0.0000 | 1.00 | yes | **same engine** ⇒ serialised |
 | TPC × MME | **uncompiled dispatch** (one host call per op) | 0.0000 | 2.00 | no | not one submission |
@@ -263,12 +264,13 @@ nesting or an isolated single-shot run.
 
 > ### UPDATE 2026-10-13 — the ratio is the variable, and an UNRESOLVED residual
 >
-> **MEASURED**, hand-built single-recipe C-API arms (one `synLaunch` each, physical module 3, `min`
-> over 30 reps):
+> **MEASURED.** The two C-API rows are hand-built single-recipe graphs (one `synLaunch` each,
+> physical module 3, `min` over 30 reps); the two `torch.compile` rows are single-recipe
+> `torch.compile` arms on the same module:
 >
 > | TPC:MME | harness | absorbed |
 > |---|---|---|
-> | **1:12** | C-API | **0 %** |
+> | **1:12** | C-API | **0 %** *(to within ±5 µs)* |
 > | ≈1:3 | C-API | **≈ 45 %** (plateau) |
 > | ≈1:1.5 | `torch.compile` | **53–56 %** |
 > | ≈1:1.1 | `torch.compile` | **90 %** |
@@ -276,10 +278,16 @@ nesting or an isolated single-shot run.
 > **The node count is not the lever.** Holding the TPC work fixed at 64 MB and the `gemm` fixed at
 > 2048³, the total is **flat across K = 1/2/4/8** — **228.0 / 229.3 / 229.1 / 231.3 µs**.
 >
+> **Read the 0 % against the instrument.** This timer's floor (a one-node 8×8-`relu` recipe, `min`
+> over 30–40 reps) is **27.5–33.3 µs** and its resolution on a *difference of two arms* is
+> **≈ ±5 µs** — so the 1:12 row is **0 % to within ±5 µs**, not an exact zero.
+>
 > **⚠ UNRESOLVED, and this is the bound: no wall-clock arm reproduces the exact
 > `union(all) == union(TPC)`.** The best absorption measured is **90 %** (torch) and **46 %**
 > (C-API) — a ~10 % gap remains on the best arm, and the event-filter question stays open.
 > **This block does not close it.**
+>
+> *(Source: `Archive/by-date/2026-10-13/dependency-semantics/`.)*
 
 ---
 

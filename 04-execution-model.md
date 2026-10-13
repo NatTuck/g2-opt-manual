@@ -401,9 +401,15 @@ single-permutation on **167/167** of them.
 
 **`WE` is not requestable — but the glue's declared index space is the control.** There is no API:
 `synUserProgrammability` carries only `userExecOrder` and `userBundling`, so
-`synNodeSetUserProgrammability` cannot set a TPC count. The lever is the **grid**, i.e. the AP step
-`a1` and the tensor shape — **the same mechanism as any `a`-driven speedup**, because moving `a` moves
-the grid and hence both the point count *and* `WE`. A glue that wants 24 engines can now choose them.
+`synNodeSetUserProgrammability` cannot set a TPC count. The lever is the **grid** — the glue's
+`TensorAccessPattern` `a = (lanes, a1)`, i.e. the per-dimension step it declares, together with the
+tensor shape — because moving `a` moves the grid and hence both the point count *and* `WE`. A glue
+that wants 24 engines can now choose them. *(In the GC's own dim order — the order the `grid` formula
+above is written in — `a[0] = lanes` is the step on dim 0, the fastest-varying dim, i.e. torch `d1`,
+and it is the dtype's native lane count; `a[1] = a1` is the step on dim 1, i.e. torch `d0`. So `a1`
+is the **second**-dimension step and `lanes` the **first**, and those two are exactly the two terms
+of that formula.)*
+
 **The kernel body does not matter at all** (three kernels at 2.75 / 31.25 / 20.0 bundles per iteration,
 same grid → identical `WE`), and neither does the graph context.
 
@@ -670,7 +676,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | 4 | **Whether `vliw-td` is safe for the whole model** | **NOT RUN** — bit-exact on 14 kernel bodies over the exhaustive domain plus four real shapes, but **no model run** | a model run with output comparison |
 | 5 | **`shuffle.i8`: ISA or lowering?** | **UNRESOLVED** — the bare-kernel control was **INCONCLUSIVE** | a probe with a purpose-built 1-D access pattern |
 | 6 | **Whether `--pre-RA-sched=vliw-td` survives a compiler/Synapse bump** | **UNKNOWN** — it is an LLVM hidden option with no vendor statement. The failure mode is loud (an unknown `-mllvm` option fails the build), so a stale build cannot pass unnoticed | a vendor statement, or the next compiler release |
-| 7 | **The exact fixed per-launch term** | estimates range **0.8–4.0 µs** across fits, and the cross-arm fit and the per-kernel size fits disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level | a fit that identifies the second-order term (outer-loop / first-touch), or a clock that can be pinned |
+| 7 | **The exact fixed per-launch term** | estimates range **0.8–4.0 µs** across fits, and the cross-arm fit and the per-kernel size fits disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level. **Widened 2026-10-13:** there is no single fixed *per-TPC* term either — §4.2.8 measures **1.26–16.4 µs** at one point per TPC, tracking the kernel's unrolled code size (cause UNKNOWN) | a fit that identifies the second-order term (outer-loop / first-touch), a clock that can be pinned, or a disassembly that names the per-TPC overhead |
 | 8 | **Whether the bundle win generalises in wall time to the other kernel families** | **NOT MEASURED** — bundle ratios exist for 12 more kernels (up to 1.84×); only the fp4 kernel was timed | time the `lutptr` / `lut` arms |
 | 9 | **The TPC ELF encoding** | no `tpc-objdump`/`llvm-objdump` in the image. `.text` bytes per bundle are 21.3–23.1 across seven kernels (~22), consistent with a fixed-width bundle word plus a variable-length immediate extension — but that is **INFERRED** from byte counts | a disassembler |
 
