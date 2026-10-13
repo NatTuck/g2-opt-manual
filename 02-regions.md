@@ -1072,6 +1072,27 @@ order of magnitude: **925.1 ms/step of summed device work executes inside a 70.5
 parallelism** (**MEASURED**). Only the **un-overlapped** part of a reduction counts. A useful
 corollary for optimisation: *reducing summed work is not the lever; reducing occupancy is.*
 
+**A union is an occupancy, not a removal price — and this is the second half of rule 1.** Once you
+have a union, the natural next step is to read it as *"what this family costs me"*. It is not. The
+most a change that **removes** a family can free is that family's **leave-one-out** (LOO) — how much
+the merged union actually falls when its intervals vanish — and **the LOO is smaller than the
+family's own union, because families overlap.** Measured on the decode trace: the **710** family
+unions sum to **88.65 ms** against a merged union of **66.14 ms**, so **22.5 ms (25 %)** of the summed
+union is cross-family overlap; and over the **seven** event-subset cuts whose LOO is fractional, **the
+LOO is only 23.4 %–65.5 % of the cut's own union** — `fp4_dequant` 22.6330 → 12.0862 (53.4 %),
+`DmaMemcpy` 16.9399 → 10.7841 (63.7 %), the `_internal` staging subset 16.9219 → 10.7751 (63.7 %),
+`GEMM` 11.4767 → 7.5155 (65.5 %), `DmaTranspose` 7.0449 → 1.6471 (23.4 %), `DmaBroadcast` 5.0750 →
+1.5357 (30.3 %), `gather_nd_*_u8` 4.3820 → 2.0692 (47.2 %). **So quote the LOO when you are pricing
+and the union when you are describing occupancy — and never substitute one for the other.**
+*(Chapter 3 §3.6.4 carries the same table with both columns.)* The limit case is instructive: a cut
+**inside** a recipe can have an LOO of **exactly 0.0000** on **0.2505 ms** of work, because the rest of
+the recipe still occupies that time. **MEASURED** *(artifact: `Archive/by-date/2026-10-12/span-ranking/`
+— the event-subset table, `sr8_spans.py`, `sr11_final.py`; the family unions and `merged` cross-check
+against the project's own per-family LOO ranking.)*
+**A span table should also report, per span, how many recipe LAUNCHES it contains** — a span's
+headline cost can be dominated by a per-launch structural cost its boundary happens to enclose
+(Chapter 3 §3.6.5).
+
 Corollary for engine attribution: the same engine can be recorded **twice**, and the two records
 disagree. On one trace the DMA engine's union was **21.713 ms** via one channel and **7.045 ms** via
 another, on the same tids with the same marker — so at least one of those interval sets is not an
@@ -1232,7 +1253,7 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
 | `guid`, `type` | all nodes | op identity (e.g. `gemm`/`GEMM`, `memcpy_dma`/`DmaMemcpy`) |
 | `exec_order_idx` | all nodes | position in the execution order |
 | `bundle_index` | many nodes | which bundle/slice group the node belongs to |
-| `origin_nodes` | all nodes | the IR node ids this physical task came from |
+| `origin_nodes` | all nodes | the IR node ids this physical task came from. **Present and non-empty everywhere, but not always resolvable** — treat it as a hint, never as a naming instrument (trap 4) |
 | `is_logical` | all nodes | `true` for wrappers only — **all `engine=None`** |
 | `input_tensors` / `output_tensors` | all nodes | tensor ids into the graph's own `tensors` list, which carries `max_shape`/`min_shape`/`dtype` |
 | `mme_node_strategy` | MME | the geometry string (`Name=`, `Width=`, `Height=`, `Pattern=`, `BatchConcurrency=`, …) |
@@ -1251,7 +1272,7 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
 3. **The modelled cost**, which you can compare against a measured window to get an error *sign*
    (see the caveat below).
 
-### Three traps
+### Four traps
 
 1. **`mkdir -p` the dump directory first, every time.** A dump target that does not exist is treated
    as a **FILE**; concurrent dump writers then race and **fail the compile**:
@@ -1266,7 +1287,19 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
    no contention** — i.e. the *optimistic* side. Measured against real transfers it is **~16 %
    optimistic at 64 MB and ~3 % at ≥256 MB** (**MEASURED**). Two consequences: (a) never treat it as
    a time; (b) when you divide a measured window by it, you are computing *"measured ÷ optimistic
-   estimate"*, which is why a ratio near 1.15 validates and a ratio of 5.5 does not.
+   estimate"*, which is why a ratio near 1.15 validates and a ratio of 5.5 does not. **Its sign is
+   not global** — on a **243-ROI** node of the model's own decode graph the same field is
+   **1.19× HIGH** against the trace's summed descriptor durations (§3.6.5). The two readings are not
+   the same quantity: a node's *window* versus a *sum of descriptor durations over a multi-ROI node*.
+   Say which you mean.
+4. **`origin_nodes` is not a naming instrument, and its ids may not resolve.** On the model's own
+   decode graph the staging node carries `origin_nodes: [97147]`, and **that id is not in the post
+   graph's own node-id set** (the graph's ids run 97422…97661) — so the field cannot name the tensor
+   it came from, even though it is present and non-empty (which is why "absent/empty" tests do not
+   fire on it either). **The instrument that does name the tensor is `input_tensors` /
+   `output_tensors` resolved through the graph's own `tensors` table**, which carries `dtype`,
+   `max_shape`, `strides`, `alias_of`, `offset`, `allocation` and `persistent`. **MEASURED**
+   *(Chapter 3 §3.6.5; `Archive/by-date/2026-10-13/staging-origin-nodes-dump/`.)*
 
 ### A note on the MME cost model
 
@@ -1291,9 +1324,13 @@ immediate in the disassembly; it is derived from geometry). *(Artifact for both:
 * **No per-rank uniqueness by default.** With TP > 1 the workers share one dump directory unless you
   rewrite `DUMP_POST_GRAPHS` per rank *before any compile happens*; a shared directory reproduces the
   `synStatus 26` race above. **MEASURED.**
-* **Not every graph.** Recipes deserialised from the recipe cache may never be re-dumped, so a dump
-  directory can under-represent what actually executed. **INFERRED** from the cache behaviour; we did
-  not measure the size of the gap.
+* **Not every graph — and a warm recipe cache gives an EMPTY dump.** Recipes deserialised from the
+  recipe cache are never re-dumped, so a dump directory can under-represent what actually executed.
+  **Upgraded 2026-10-13 from INFERRED to MEASURED, and the failure mode is the bad one:**
+  `DUMP_POST_GRAPHS` is written by the graph compiler, and a Synapse **recipe-cache hit loads a
+  compiled blob and builds no graph** — so a warm cache yields an **empty dump directory and a false
+  negative**, not an error. **Point `LAD_RECIPE_CACHE_ROOT` at a fresh empty directory whenever a
+  dump is the instrument.** *(The size of the gap on a *partially* warm cache is still **UNKNOWN**.)*
 
 ---
 

@@ -1013,10 +1013,20 @@ error is left in the safe direction and bounded. Recorded so nobody re-derives i
 
 #### The OTHER end of the fold — the subnormal FLOOR, and it is not guarded
 
-> **Status: REAL GAP, NOT FIXED, and LIVE on this checkpoint.** Found 2026-10-12 while chasing a side
-> finding in the vendor-conformance probe. Instruments + report:
+> **Status: REAL GAP, NOT FIXED in the shipped kernel, and LIVE on this checkpoint.** Found
+> 2026-10-12 while chasing a side finding in the vendor-conformance probe. Instruments + report:
 > `Archive/by-date/2026-10-12/fp4-op-contract/`. **No code was changed** — this section is the
 > specification of the fix, not the fix.
+>
+> **Update 2026-10-13 — the kernel half of the fix now exists in a variant, and it is measured.** A
+> promoted fp4 LUT library carries a variant whose 240-cell table changes exactly the **2** `k = −9`
+> tie cells this section names (codes `0x1`/`0x9`), i.e. it emits ±0 where the shipped decode emits
+> ±2⁻⁹ — the *intended* floor fix, and the variant this checkpoint's scale bounds select. Its
+> divergence from the shipped op is therefore **bounded and confined**: **954 of 65,536** block
+> outputs, `max|d| = 2.441e−04` against `max|A| = 1.572e−01`, and **1084 of 218,103,808** weight bytes
+> (= the 1084 engaging tie weights). **The load-time guard this section also specifies is a separate
+> change and is not what that is** — do not read the two as one. Full statement, including why the
+> two relative-error columns must be quoted together: **§3.4.8**.
 
 The upper clamp above guards `t = exp + k` **above**. The same expression is unguarded **below**, and
 the subnormal branch is where it shows:
@@ -1359,7 +1369,10 @@ actually tracks: whether the requested **kernel name is present in the active li
 The GC never calls `InstantiateTpcKernel` for a missing name — the failing step is a lookup *before*
 instantiation — the error surfaces at the next `synchronize()` rather than at the op call, and **no
 log at the default level names the missing kernel** (a search of `/var/log/habana_logs` after the
-failure found **zero** occurrences of the absent name). The identical string is produced by a missing
+failure found **zero** occurrences of the absent name). A concrete instance of this class is now
+measured: a **late `GC_KERNEL_PATH` write** reports `applied` and then dies `synStatus 26` at the
+first fp4 compile, because the library was never swapped at all — the requested name *is* in the
+active table, and the table is the wrong one (§3.4.8). The identical string is produced by a missing
 GUID with a **single** extension loaded, and is **absent** when two extensions are loaded and every
 GUID is present — so it is not evidence about extension count either, contrary to a rule we had
 recorded in three places in the source project. Never read it as "the shape was wrong", "the dtype was
@@ -1525,6 +1538,139 @@ like-for-like chain benchmark is not yet built.**
 | 4 | **multi-expert correctness** | the probe used one expert; a `topk` routing table is a different contract, and a naive all-zeros table gave garbage. (§3.9 item 19.) |
 | 5 | like-for-like cost of the vendor op vs a dequant + fp8-GEMM chain | not built (above). (§3.9 item 20.) |
 | 6 | cost at the real production shape and real expert count | the microbenchmark shape is synthetic. (§3.9 item 20.) |
+
+---
+
+### 3.4.8 Promoting a custom kernel variant: the library is the interface
+
+*(Added 2026-10-13. This is the fp4 decode's variant-selection question — the fix §3.4.5 specifies for
+the subnormal floor lives in one of the variants — and it **corrects a reading of our own**: the
+wiring's blocker had been recorded as a missing GUID. It is not.)*
+
+**The problem.** A variant-selection wiring (`dsv4_fp4_variant.py`) picks a kernel variant from the
+checkpoint's routed-expert scale bounds and then writes the environment:
+
+```
+643  prev = os.environ.get("GC_KERNEL_PATH")
+644  os.environ["GC_KERNEL_PATH"] = target          <-- the write
+```
+
+**That write cannot work.** The worker fixes its kernel database at its **first HPU op**, ~40 s before
+the load path has the scales, so the write lands **too late**. And the failure is not loud: with
+`GC_KERNEL_PATH` at the **image default** (`/usr/lib/habanalabs/libtpc_kernels.so`) the wiring's
+`too_late` detector is **blind** — the image default is deliberately excluded from
+`known_kernel_libs()`, because it is mapped in every process from habana init — so the wiring
+**reports `applied`**, writes a path nothing will read, and the run then dies at the first fp4
+compile with **`synStatus 26`**. **MEASURED.**
+
+> **The correction, stated plainly.** **The blocker is the late write, not the GUID gap.** The GUID
+> gap is a **separate, one-line fix**, and it only matters at **`DSV4_COMPRESSOR_OP=1`**: the
+> single-GUID arm libraries bind one GUID where the shipped library binds two, and the wiring's own
+> warning is conditional on exactly that variable
+> (`if os.environ.get("DSV4_COMPRESSOR_OP", "0") == "1":` → *"the arm libraries expose ONE GUID … The
+> E3a node will fail to instantiate"*). At the default `DSV4_COMPRESSOR_OP=0` it is **inert**. The
+> promoted library does not have the gap at all. **MEASURED.**
+
+**The fix that dissolves it: promotion.** Instead of writing a path at run time, put the kernel's
+*name* into the **active** library's `GetKernelGuids` table. Then there is nothing to write — the
+launch names the promoted library and the op is callable from the first compile. The promoted library
+is a **superset** of the shipped one, so it can be `GC_KERNEL_PATH` for a whole run:
+
+| library | md5 | size | GUIDs for `DEVICE_ID_GAUDI2` |
+|---|---|---:|---|
+| `libfp4_dequant_kernels.so` (shipped; the promotion never writes it) | `25c54d818a4c60e222720adbc155e741` | 62,624 B | 2 — `fp4_dequant_fwd_gaudi2`, `dsv4_comp_ident_gaudi2` |
+| `libfp4_dequant_lut_kernels.so` (promoted) | `abf368253d1433c3a79134863850d901` | 87,704 B | **3** — the two above + `fp4_dequant_lutptr_rc_gaudi2` |
+
+plus a **new op registered in the EXISTING `custom_op` namespace** (`custom_op::fp4_dequant_lut`) —
+which is also exactly what §2.4's engineering recipe requires, and for a measured reason: the backend
+short-circuits on `node.target.namespace == "custom_op"` and clusters the node regardless of what the
+shared-layer validator would say, so a defensive new namespace would **cost the co-scheduling**.
+
+**`GetKernelGuids` is per-`DeviceId`, and that is what makes the table a gate.** It is read by calling
+the library's own exported function in the same two-call shape the graph compiler uses — query the
+count, then fill:
+
+| `DeviceId` | label | GUIDs | ours |
+|---|---:|---:|---|
+| 1 | GAUDI | 2,021 | `[]` |
+| **3** | **GAUDI2** | **3,253** | `['fp4_dequant_fwd_gaudi2', 'dsv4_comp_ident_gaudi2', 'fp4_dequant_lutptr_rc_gaudi2']` |
+| 4 | GAUDI3 | 3,358 | `[]` |
+
+All three of ours are present for GAUDI2 and **only** for GAUDI2 — the library's `is_ours()` is
+`deviceId == DEVICE_ID_GAUDI2`. **MEASURED.** *(A docstring in the wiring says **3252**; the measured
+value is **3253**. The comment is stale and was left alone.)*
+
+**Selection is active three independent ways.** *(a)* The graph compiler's own instantiation
+handshake fires for the promoted name — `InstantiateTpcKernel LUT name='fp4_dequant_lutptr_rc_gaudi2'`
+→ `18` ("not found, build it") then → `0` (success). *(b)* The load path's own gate reads the
+`GetKernelGuids` table rather than trusting the build: `_install_fp4_lut('noguard_floor') -> True`.
+*(c)* **The activity falsifier**: an all-zero 240-byte table changes **65,536 of 65,536** block
+outputs, so the table flows into the compiled graph as **runtime data** and is not baked in at trace
+time. The timing corroborates it — the two *branch* compiles cost **30.17 s and 29.98 s**, while two
+new table *values* cost **0.02 s each** because they reuse the compiled graph. **MEASURED.**
+
+**Block-level safety — and it is a BLOCK, not a model.** `_compute_v4_routed` (the model's own MoE
+function) compiled with `torch.compile(fullgraph=True)`, on **real layer-39 checkpoint weights** (all
+256 experts), at `H=4096, inter=2048, T=16, topk=6, g=96`, with all **26** byte-118 experts forced
+into the gathered set. The output block is `(16, 4096)` bf16 = **65,536** elements:
+
+| arm | table | op taken | vs shipped | differing | `max\|d\|` | `max_rel_vs_maxA` | `max_rel_on_differing` |
+|---|---|---|---|---:|---:|---:|---:|
+| `A_shipped` | none | `fp4_dequant_fwd_gaudi2` | — | — | — | — | — |
+| `B_lut_guarded` | `guarded` | `_FP4_LUT_OP` | **bit-exact** | **0 / 65,536** | 0.000e+00 | 0.000e+00 | 0.000e+00 |
+| `C_lut_noguard_floor` | `noguard_floor` | `_FP4_LUT_OP` | divergent | **954 / 65,536** | **2.441e−04** | **1.553e−03** | **2.209e+01** |
+| `D_lut_all_zeros` | 240 zero bytes | `_FP4_LUT_OP` | falsifier | 65,536 / 65,536 | 1.572e−01 | 1.000e+00 | 1.000e+00 |
+
+**Quote both relative columns.** `max_rel_vs_maxA = 1.553e−03` is the flattering one — its denominator
+is `max|A| = 1.572e−01`, a large output. `max_rel_on_differing = 2.209e+01` is the relative error
+**on the differing elements only**, where the output is near zero. The divergence is bounded in
+**magnitude** (`max|d| = 2.441e−04`, `rms|d| = 6.669e−06`) and **unbounded in relative terms**. **The
+flattering column must not stand alone.** **MEASURED.** At the weight level, straight through the two
+ops on the 26 experts' real `w1` (**218,103,808** bytes): `guarded` **0 differ**,
+`noguard_floor` **1084 differ** — exactly the **1084** engaging tie weights in those experts' **842**
+byte-118 groups. **MEASURED.**
+
+**The divergence is confined to the `k = −9` floor fix — and it is the fix §3.4.5 asks for.** The two
+tables differ on **2 of 240** cells, both at `k = −9`, nibble codes `0x1` and `0x9` (the `t = −3`
+tie): the `guarded` table emits `0x01`/`0x81` (the shipped ±2⁻⁹) where `noguard_floor` emits
+`0x00`/`0x80` (±0). That is precisely the **subnormal-floor correction** §3.4.5 specifies as *not
+fixed*, and **the variant this checkpoint's scale bounds select is `noguard_floor`**. **MEASURED.**
+*Consequence for anyone promoting a LUT: **a promoted LUT needs a table per variant.** The 240-cell
+table **is** the variant's specification, so two variants cannot share one table — and the table is a
+runtime op input, so nothing about it is checked at build time.*
+
+**The cost, and its scope — read this next to the safety result.** The flagged `lutptr` arm with
+`-mllvm --pre-RA-sched=vliw-td` at `[4096,2048]` measures **17.794 µs / 1885.7 GB/s** against the
+shipped kernel's **68.553 µs / 489.5 GB/s** — a composed **3.853×** — landing at **77.6 %** of the
+box's measured **2.431 TB/s** peak (`n = 60`, `warm = 5`, 3/3 reps identical to ≤0.06 µs, one process,
+arms interleaved, and the three control arms reproducing the archived module-0 numbers to 0.13 %).
+The flag moves the **bundle** count (**38.25 → 20.75** per iteration) and leaves the **vector-op**
+count (**14.2 → 14.5**) and the instruction count (**24.75 → 25.75** non-NOP) where they were —
+**scheduling headroom, not arithmetic headroom** (§4.2.7's lever, applied to the LUT arm). **MEASURED.**
+
+> ⚠ **The 3.853× and the bit-exactness are NOT established to be the same configuration.** The
+> 3.853× was timed on the **`lutptr`** arm, whose table is the **archived pre-guard** one (md5
+> `c2f51a5fb811cf711a4c969a0400cef0`); the bit-exactness in the table above is the **`guarded`**
+> arm's. On the **timed** distribution every arm is bit-exact against the shipped kernel, and on the
+> exhaustive domain `lutptr` differs from it by **384 of 8,192** cells — the pre-existing pre-guard
+> difference, **not** a `vliw-td` effect (the diff counts are identical for both schedules). But
+> **whether the guarded variant times the same as the timed variant is NOT YET ESTABLISHED.**
+> **Do not let the two results merge into one claim.**
+>
+> **What is outstanding, stated as outstanding: a whole-model decode at TP=4.** The block test above
+> cannot see a model-level effect — its **activations and routing are synthetic** (only the weights,
+> the code path and the kernel are real) — and the engine's decode step was **not run**: the profiler
+> harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card
+> (**150.59 GB total, 37.65 GB/rank at TP=4**, re-derived from the checkpoint's own safetensors
+> headers). Nothing here covers prefill, the compressor path, or the other 42 layers' tie
+> populations. **NOT RUN.** (§3.9 item 21.)
+
+*Artifact: `scratch/fp4-lut-promotion-safety/REPORT.md` and its logs (`logs_device_probe.txt:4-14`,
+`:50-61`, `:93-97`, `:102-109`, `:138-150`; `logs_lut_model_safety.txt:46-55`, `:62-66`, `:71-73`;
+`logs_lut_tables.txt:4-6`; `logs_variant_gate.txt:76-78`, `:87`, `:112`, `:122`). The 3.853× timing and
+its bundle/vector-op census: `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §1–§2. The
+late-write evidence: the archived `fp4-e2e-variant` report's `[latewrite] wiring verdict = applied`
+and `THE FP4 OP DID NOT RUN: … synStatus=synStatus 26` probe output.*
 
 ---
 
@@ -1747,18 +1893,179 @@ We got this wrong once by quoting the relation without its limits. Do not repeat
 
 ### 3.6.4 The device-time decomposition, for orientation [DSv4F]
 
-| family | ops/step | merged ms/step |
-|---|---|---|
-| `fp4_dequant` | 9,288 | 22.63 |
-| `DmaMemcpy` | 84,090 | 16.94 |
-| `GEMM` | 8,924 | 11.48 |
-| `gather_nd_*_u8` | 3,096 | 4.38 |
-| `DmaTranspose` | 50,790 | 7.05 |
-| `DmaBroadcast` | 6,235 | 5.08 |
+**The column is the family's own UNION — its device *occupancy* — and it is NOT a removal price.**
+That distinction was missing from this table until 2026-10-13, and the header even called the column
+`merged`; it is not `merged` (which is the whole step's union, **66.1349 ms/step**), it is the
+family's own busy-set union.
+
+| family | ops/step | union ms/step | **leave-one-out (LOO)** | **LOO / union** |
+|---|---:|---:|---:|---:|
+| `fp4_dequant` | 9,288 | 22.6330 | **12.0862** | **53.4 %** |
+| `DmaMemcpy` | 84,090 | 16.9399 | **10.7841** | **63.7 %** |
+| `GEMM` | 8,924 | 11.4767 | **7.5155** | **65.5 %** |
+| `DmaTranspose` | 50,790 | 7.0449 | **1.6471** | **23.4 %** |
+| `DmaBroadcast` | 6,235 | 5.0750 | **1.5357** | **30.3 %** |
+| `gather_nd_*_u8` | 3,096 | 4.3820 | **2.0692** | **47.2 %** |
+| `fused_wqa_wkv` *(an event-subset cut, not a family)* | — | 0.2505 | **0.0000** | **0 %** |
 
 **Three families are 46 % of `merged`.** **MEASURED [DSv4F]**. Note the shape of this table: the two
 largest *op counts* are not the two largest *time* items, and the family with the largest op count is
 not in the top three by time. **Count and cost are different questions.**
+
+> **⚠ Read the LOO column, not the union column, when you are pricing a change.**
+>
+> **A family's union is an *occupancy*; the most a change that removes that family can free is its
+> *leave-one-out* — how much `merged` actually falls when the family's intervals vanish.** The LOO
+> is **below** the union, and the reason is arithmetic: families overlap. On this trace the **710**
+> family unions sum to **88.65 ms** — the 16 named rows of the per-family ranking summing to
+> **76.884** plus that ranking's own derived 694-family remainder of **11.768** — against a `merged`
+> of **66.14 ms**, so **22.5 ms (25 %)** of the summed union is cross-family overlap.
+>
+> Over the **seven** event-subset cuts whose LOO is fractional — the six families above plus the
+> `_internal` staging subset, which keeps 63.7 % — **the LOO spans 23.4 %–65.5 % of the cut's own
+> union.** So the two readings are not interchangeable in either direction: **the union *overstates*
+> what a removal buys** (by **1.5–4.3×** on these rows), and **the LOO *understates* the family's
+> coverage** of that time, for the same reason. **Quote the LOO when you are pricing; quote the union
+> when you are describing occupancy; never substitute one for the other.**
+>
+> The `fused_wqa_wkv` row is the sharpest case, and it is not a rounding artefact: **0.2505 ms of
+> work and a marginal of exactly 0.0000** — the rest of its recipe still occupies that time, so
+> removing it buys **nothing**. **You cannot cut inside a recipe and expect a saving.** That is why
+> the span boundaries that matter are **recipe** boundaries.
+>
+> *Two controls from the same artifact, because the table alone cannot tell you which regime you are
+> in.* **(a)** For a **handle-complete** span the trace price is essentially exact: the one clean
+> single-variable ablation the archive holds (W1 = W0 with the `fp4_dequant` device body removed, same
+> op, same signature, same launches, same recipes) takes `merged` **66.1349 → 51.5456**, a **−14.5892**
+> fall, of which `Δ own_union(MOE_ROUTED) = −14.5465` is **99.7 %**. **(b)** For a cut **inside a
+> run** the trace is a **lower bound** and under-prices by a measured **21.1 %**
+> (LSO predicts W1 `merged = 54.0936`, measured 51.5456 — the complement's union *shrinks* by 2.55 ms
+> once 22.6 ms of TPC work vanishes, because the non-fp4 events **inside the same recipes**
+> re-overlap). **The gap is intra-recipe, which is consistent with the measured fact that
+> cross-recipe overlap is exactly zero.**
+>
+> **MEASURED** *(all rows and both controls re-derived for this table from the archived scripts:
+> `Archive/by-date/2026-10-12/span-ranking/` — `REPORT.md` §3's event-subset table, `sr8_spans.py`,
+> `sr11_final.py`, `sr9_ablation.py`; the family unions and `merged` cross-check against the
+> per-family leave-one-out ranking in the same project's `notes/interval-census.md` §5.1.)*
+
+### 3.6.5 The largest single node in the decode step is a KV-slab materialisation — and it is BYTE-bound
+
+*(Added 2026-10-13. A single-node finding from one decode run of the port at **TP=4 across all four
+modules, unpinned**. It is a **compiled-graph** measurement plus trace arithmetic, not a timing run,
+and it is `[DSv4F]`.)*
+
+**What the node is.** The decode `ATTN_PREAMBLE` recipe compiles to **one** 111-node graph
+(engines: `None` 53 / `TPC` 47 / `DMA` 9 / `MME` 2), and **exactly one** of its nodes is a staging
+copy — `24_memcpy_116119_internal`, engine `DMA`, type `DmaMemcpy`, guid `memcpy_dma`,
+`num_of_ROIs` **243**, `dma_expected_duration` **3719.180392235825** µs, `origin_nodes [97147]`. It
+is **99.96 %** of that graph's whole DMA budget (3719.18 of 3720.59 µs). The operation it performs,
+read from the **pre** graph for the same recipe (which has **no** memcpy node at all — the staging is
+inserted by placement):
+
+```
+pre graph:  slice_7/slice/16750   guid "slice"   in ["8"]   out ["24"]
+   8  : bf16 [800000, 2422]  strides [2, 1600000, 3875200000]   <- STRIDED view of the int8 slab
+   24 : bf16 [32768, 2422]   strides [2, 65536, 158728192]      <- DENSE
+        32768 x 2 = 65536;  2422 x 65536 = 158,728,192          <- the density check
+   31 : bf16 [512, 64, 2422] strides [2, 1024, 65536, 158728192]
+post graph: the node, inserted by placement
+   24_memcpy_116119_internal  (engine DMA)   in [24_memcpy_116119]   out [24]
+   24_memcpy_116119 : bf16 [32768,2422]  alias_of "124"  strides [2, 1600000, 3875200000]
+   24               : bf16 [32768,2422]  alias_of "124"  strides [2, 1600000, 3875200000]
+         ^ identical descriptors — an ADDRESS-ASSIGNMENT ARTEFACT, which reads as a self-copy.
+           The pre graph is what settles the operation.
+downstream (both graphs):  reshape -> [512, 64, 2422] = [head_dim, block, n_blocks]
+   -> index_put/scatter_nd_onnx_fwd_bf16 (TPC)   <- the SWA cache WRITE
+   -> ... -> int8 slab 123 -> ... -> 125
+   -> index_select_1/gather_fwd_bf16 (TPC)       <- the SWA window READ
+   -> gather/gather_elements_fwd_bf16 (TPC)
+```
+
+**The origin is the paged KV-cache slab.** The base tensor is int8 `[1600000, 2422]` =
+**3,875,200,000 B = 3.875 GB**, `is_dense`, `persistent`, in DRAM; the node's input is a **bf16
+strided view** of it and its output is the **dense** form. So the operation is a **strided → dense
+materialisation of `32768 × 2422 × 2 = 158,728,192 B (158.7 MB)` per layer-launch** — the whole slab,
+all 2,422 blocks, as a bf16 tensor. `n_blocks = 2422` and `block = 64` are fixed by the
+`[512, 155008]` input of the `gather_fwd_bf16` in the `ATTN_CORE` instance, since
+`155008 = 2422 × 64`.
+
+**It is BYTE-bound, not descriptor-bound — and that reframes the fix.** Byte accounting from the dump:
+
+```
+staged destination (dense, MEASURED)   32768 × 2422 × 2 B   =    158,728,192 B  = 158.7 MB / launch
+  × 43 launches/step                                        =  6,825,312,256 B  = 6.825 GB/step (one way)
+  round trip (strided read + dense write)                   =  13.65 GB/step
+byte floor  13.65 GB / 1.81 TB/s (the DMA envelope, §1.6)   =      7.542 ms/step
+measured S4 union (this span's own stage)                   =      7.7751 ms/step  ->  **1.031×**
+```
+
+**The pass runs at ~97 % of the DMA envelope.** It is **not inefficient — it is efficiently doing
+work that should not need doing**, which is the same shape of finding as the fp4 decode's fold
+(§3.4.5) and the same one-line lesson: *check the job before you optimise the kernel.* **The lever is
+therefore TRAFFIC, not descriptor count.** An earlier reading of this stage bounded its byte floor at
+"≤0.72 ms/step" from an assumed ≤30 MB/layer staging budget and concluded that the **descriptor**
+count (**5.425 ms/step**) was the binding floor; the dump's real budget **refutes that byte floor by
+≥10×** and displaces it. **MEASURED / DERIVED.**
+
+> **One tension, flagged rather than smoothed over.** The same arithmetic implies **~101.6 GB/s per
+> busy engine** at the trace's achieved concurrency of **17.27**, which is above the **75.4 GB/s**
+> implied by 24 engines. So either the effective concurrency is **≈17.3, not 24**, or the effective
+> round trip is **~0.72×** the count above. **Either way the binding floor is in the 5.4–7.5 ms/step
+> band, and the *byte* reading is the one the dump supports.** **UNKNOWN** which of the two
+> reconciliations holds.
+
+**Two identities, and one UNKNOWN that must stay UNKNOWN.**
+
+* **`1,215 = 243 ROIs × 5`, verified on two independent nodes.** A 243-ROI node contributes 9,720
+  trace events over 8 launches = **1,215 per launch**; a **1**-ROI node contributes 40 events over 8
+  launches = **5 per launch**, i.e. **5.0 per ROI**. The same ×5 closes the step total:
+  `52,245 descriptors/step ÷ 43 launches = 1,215.0`. **The mechanism of the 5:1 ratio is UNKNOWN** —
+  measured on two nodes, unexplained, and immaterial to the identity, which the node name, the budget
+  and the count all fix independently. **Do not invent one.**
+* **`dma_expected_duration` here is a computed value, not a measurement — and it OVER-predicts.**
+  It is bit-identical (**3719.180392235825**) in all **118** instances of this node, across 4 ranks,
+  both recipes, and both the decode and prefill compilations. And the trace's own `Σdur` for the
+  `24_memcpy_*` population is **536.977 ms over 4 frames = 134.244 ms/step** (208,980 events =
+  52,245/step) = **3.1220 ms/launch** — against the model's 3.7192: the model is **1.19× high**.
+  **Quote both; use neither as the other.** *(Read this against §1.7's per-transfer reading of the
+  same field, where the measured window is **1.03–1.16× the model** — the opposite sign. The two are
+  not the same quantity: §1.7 compares one node's **window** with the model, this compares the model
+  with a **sum of descriptor durations over a 243-ROI node**. Neither number transfers to the other
+  case, and §2.10 trap 3's "optimistic lower bound" framing is therefore **size- and
+  granularity-dependent, not a global sign**.)*
+* **The census: 118 instances, ONE distinct staging origin.** Over **21,763** post-graph files,
+  **118** staging nodes appear — **31** decode + **28** prefill in `ATTN_PREAMBLE`, **30** decode +
+  **29** prefill in `ATTN_CORE` — and there is **one** distinct staging origin class: a strided bf16
+  `[32768, 2422]` view of an int8 paged slab, materialised dense. In `ATTN_PREAMBLE` the slab is base
+  `123`/`124`; in `ATTN_CORE` it is base `9` — two slabs of the same shape class and nothing else.
+  **No weight or operand tensor appears in any staging node's dataflow.** **MEASURED.**
+
+> **The instrument lesson, and it is worth more than the node: `origin_nodes` is a red herring.**
+> Its value is `[97147]`, and **that id is not in the post graph's own node-id set** (the graph's ids
+> run **97422…97661**), so `origin_nodes` alone **cannot name anything**. The instrument that *does*
+> name the tensor is the node's **`input_tensors` / `output_tensors` resolved through the graph's own
+> `tensors` table**, which carries `dtype`, `max_shape`, `strides`, `alias_of`, `offset`,
+> `allocation` and `persistent`. **Read the tensors, not the origin ids.** (§2.10.)
+
+**The generalisable lesson for any span ranking: report LAUNCHES-PER-SPAN.** `ATTN_PREAMBLE`'s
+**9.8171 ms/step** own union is **79 % a per-launch structural cost that its boundary happens to
+enclose**, not its own work — and it is simultaneously the largest span whose boundary passes the
+acceptance tests *and* the one enclosing **43** large attention launches. A span's headline cost can
+be dominated by what the boundary happens to contain, so **any span table should report, per span,
+the number of recipe launches it holds**, alongside its milliseconds. **MEASURED / DERIVED.**
+
+**And the instrument has a hard precondition: a COLD recipe cache.** `DUMP_POST_GRAPHS` is written by
+the graph compiler, and a Synapse **recipe-cache hit loads a compiled blob and builds no graph** — so
+a warm cache yields an **empty dump directory and a false negative**. This run therefore pointed
+`LAD_RECIPE_CACHE_ROOT` at a fresh empty directory and cold-compiled every decode recipe. This
+upgrades §2.10's last bullet from **INFERRED** to **MEASURED**: the failure mode is a *silently
+empty* dump, not an error. **MEASURED.**
+
+*Artifact: `Archive/by-date/2026-10-13/staging-origin-nodes-dump/` — `REPORT.md` §1–§3, §5–§6,
+`evidence/post_decode_ATTN_PREAMBLE_111node.json`, `evidence/pre_decode_ATTN_PREAMBLE_111node.json`,
+`trace_census.json`, `staging_243.json`, `run.log`. The byte floor, the measured union and the 79 %
+share are the rewrite plan's own §0.3/§1.3/§0.7 arithmetic, restated here.*
 
 ---
 
@@ -1983,7 +2290,8 @@ bias 7. That is the **configured default** — the bias is **selectable**; see t
 §3.4.1.)*
 
 **Items 17–20 are new, opened 2026-10-12 by the vendor-MXFP4-op conformance probe (§3.4.7) — they are
-additions, not closures.** They are registered here rather than left inside §3.4.7 so that a reader who
+additions, not closures.** **Item 21 is new, opened 2026-10-13 by the fp4 LUT promotion (§3.4.8).**
+They are registered here rather than left inside §3.4.7 so that a reader who
 consults this register to find out what we do *not* know gets a complete answer.
 
 > **The habit that keeps this honest, and it is cheap.** When a later section **corrects or supersedes**
@@ -2019,6 +2327,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
+| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **It is also not established that the timed variant and the bit-exact variant are the same configuration.** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `scratch/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
 
 ---
 

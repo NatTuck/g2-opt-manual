@@ -483,10 +483,21 @@ a lever either — a measured negative** (25 device compiles over 7 shapes × `{
 value it sets, so this is not a null test), which leaves the declared index space as the only `WE`
 control found.
 
-> ⚠ **The "fixed per-TPC cost" is not fixed.** At one point per TPC the non-work time measures
-> **1.26 / 1.80 / 4.12 / 16.4 µs** for `dep U = 1/4/16/64` and **0.62 / 2.38 µs** for `copy U = 4/64`
-> — it tracks the kernel's **unrolled inner-loop code size**, not `WE`, not the grid, and not the
-> launch. **Cause UNKNOWN.**
+> ⚠ **The "fixed per-TPC cost" is not fixed — and the four figures this note used to carry are NOT
+> measurements.** They read **1.26 / 1.80 / 4.12 / 16.4 µs** for `dep U = 1/4/16/64` and
+> **0.62 / 2.38 µs** for `copy U = 4/64`. Those are the residue
+> `dur − P × (31.25 bundles/iteration) × 0.556 ns / WE` — the **complement of a bundle model**, not a
+> fitted intercept — so each is a measurement only where that model happens to be right.
+> **Corrected 2026-10-13.** Re-derived with no device from the archived `psweep_dep.json`
+> (`Archive/by-date/2026-10-13/tpc-launch-cost-vs-codesize/tools/archived_fit.py`, re-run for this
+> text), the **model-free** `dur_med` intercept of that same `dep U=4` sweep is **1.7972 µs**
+> (23 rows, x = 2.91–85.33 points/TPC, slope 75.124 ns/pt/TPC, R² 0.99825). It coincides with the
+> `1.80` residue **only because at `U=4` the bundle model is nearly right** — its slope 75.1 ns/pt
+> against the model's 69.45, a factor of 1.08. At `U = 1/16/64` the model's own slope grows with the
+> body (§4.2.10), so those three are complements, not three more measurements of one quantity.
+> **Do not quote the four as a measured curve.** **MEASURED** *(the re-derivation; the four residues
+> themselves are **inherited from the source report's prose**).* The per-launch term is now measured
+> directly, and it is a **bundle law** — §4.2.10.
 
 *Artifact: `Archive/by-date/2026-10-13/we-rule/` — `REPORT.md` §2, and `we_model.py`, which predicts
 `WE` for any shape with no device.*
@@ -553,6 +564,99 @@ as a control, which is correct practice, but the value is part of the result.)*
 
 *Artifact: `Archive/by-date/2026-10-13/tpc-wave/` — `REPORT.md` §2 and §5, `json/psweep_dep.json`,
 `json/roi_sweep.json`, `json/confirm.json`, `json/drive.json`.*
+
+### 4.2.10 The per-launch term is a bundle law — and it is SUBLINEAR
+
+§4.2.9's model has a fixed term `a` that was previously only bounded. It is now measured directly:
+**the per-launch intercept is a function of the kernel's emitted bundle count**, and that function is
+**sublinear**.
+
+**The measurement.** One GC kernel library of **71 TPC kernels**, one torch op per arm, each an
+elementwise 2-in/1-out body on a 256-byte `i8` vector register with the convention
+`grid (GC order) = [ceil(d_last/256), ceil(d_prev/U)]`. Each arm is swept over a ladder of shapes at
+fixed per-point work; each point is 5 warm-up launches then a `torch.profiler` window of **n = 30**
+launches, each launch its own single-node graph execution. Population: **425 measurement points over
+71 kernels** (sweep 1, 345 points / 59 arms; sweep 2, 80 points / 12 arms), and every row's `WE` is
+**read from a `DUMP_POST_GRAPHS` dump**, not assumed. Range covered: **61 → 3,984 bundles**,
+**33 → 4,530 real slots**, `WE ∈ {16, 22, 24}`, **5.8 → 745 points/TPC**. Every arm's kernel was
+numerically gated before timing. **MEASURED.**
+
+Fitting `span_min = a + b × (points per TPC)` per arm, over the **65 of the 71 arms whose own fit
+reaches R² > 0.995**:
+
+```
+a (µs) = 0.6706 + 8.8911 ns × bundles        R² = 0.9766   rms 0.498 µs
+a (µs) = 0.0531 × bundles^0.736              R²(log-log) = 0.9434   ← SUBLINEAR
+```
+
+`a / bundles` **falls** from **15.7 ns at 64 bundles to 8.7 ns at 2,029** — the cost per bundle
+*declines* with code size, which is why the exponent is 0.74 and not 1. **MEASURED.** *(Population
+note: the regression is over **65 arm-level intercepts**, each itself fitted over its own `n = 30`
+sweep. The 425 points are the campaign's size, not the regression's.)*
+
+**The causal variable is the bundle count, not the instruction count.** Fifteen **matched pairs** —
+*byte-identical source* built twice, once with `-mllvm --pre-RA-sched=vliw-td` (§4.2.5) — separate
+the two, because **`WE` is identical within every pair** (verified 24/24, 22/22, 16/16), so the grid,
+the point count and the work distribution are held fixed and only the code size moves:
+
+| source (identical within the pair) | bundles default → `vliw-td` | ratio | real slots | `a` default → `vliw-td` (µs) | `a` ratio |
+|---|---:|---:|---|---:|---:|
+| `fs32_U1` (WE 24) | 157 → 156 | 1.01 | 66 → 66 | 2.2230 → 2.2245 | **0.999** |
+| `fs256_U1` (WE 24) | 829 → 828 | 1.00 | 290 → 290 | 7.7599 → 7.7991 | **0.995** |
+| `dep8_U8` (WE 16) | 270 → 145 | 1.86 | **133 → 142** | 3.1316 → 2.2742 | **1.377** |
+| `dep16_U16` (WE 24) | 470 → 210 | 2.24 | **229 → 248** | 4.9427 → 2.6777 | 1.846 |
+| `dep32_U32` (WE 24) | 915 → 352 | 2.60 | **437 → 491** | 8.6385 → 3.9245 | 2.201 |
+| `dep128_U128` (WE 22) | 3,984 → 3,500 | 1.14 | **1,749 → 4,530** | 28.979 → 23.771 | 1.219 |
+
+**Read the two `fs` rows against the four `dep` rows.** In all fifteen pairs the intercept moves with
+the bundle count, and in none of them does it stay put while bundles move; the flagged arm carries
+**more** real instruction slots than its twin in **every** pair, so the fall cannot be a fall in work.
+Where the scheduler changes *nothing* — straight-line bodies it already packs — the intercept moves
+by **0.1 % and 0.5 %**. The sharpest single case is `dep8_U8`: **270** bundles and 133 slots at
+`a = 3.1316 µs` against `vtdep8_U8`'s **145** bundles and **142** slots at `a = 2.2742 µs` — **more**
+slots, **fewer** bundles, **1.377× lower**. **MEASURED.** *(Artifact:
+`Archive/by-date/2026-10-13/tpc-launch-cost-vs-codesize/` — `REPORT.md` §1.4, `logs/extra.log` §A,
+`json/verdict_span.json`.)*
+
+> **The cause of the code-size dependence is UNKNOWN.** I-fetch, I-cache, loop setup, prologue cost
+> and a per-bundle decode cost are all consistent with these data, and **none is tested here**. The
+> *relationship* and the *causal variable* are measured; the **mechanism is not**, and it is not
+> guessed. **UNKNOWN.**
+
+**The trap this measurement had to get past: `dur_min` is not the node's cost.** Fitting the
+per-TPC duration instead of the node's span gives **negative** intercepts on the large bodies,
+because the TPC split is uneven at some grids and `min` over TPCs reports the *least*-loaded TPC
+rather than the node. Re-derived here from the archived sweep rows (`json/sweep_all.json`, the same
+6-point ladder per arm):
+
+| arm | `dur_min` intercept | `span_min` intercept | `span_min` R² |
+|---|---:|---:|---:|
+| `fs64_U1` | **−0.974 µs** | +2.796 µs | 0.99998 |
+| `fs128_U1` | **−2.494 µs** | +4.411 µs | 0.99999 |
+| `fs256_U1` | **−5.474 µs** | +7.760 µs | 0.99999 |
+
+The uneven split is visible in one row directly: **`fs16_U1` at 170.67 points/TPC** has a per-TPC
+`dur_min` of **3.280 µs** against a node `span_min` of **8.633 µs** — **2.63×** — because the busiest
+TPC carries much more than the mean. Switching the statistic to `span_min` moves **every** intercept
+positive and takes those arms' R² from ≈0.968 to ≥0.9999. **`span_min` is the right quantity anyway:
+the span is the node's device occupancy, which is what a launch term costs.** **MEASURED**
+*(re-derived from `json/sweep_all.json` for this text).*
+
+**And it is a per-launch cost, not a fresh-launch cost.** Over all 71 arms, `spans[0] / min(spans)` —
+the first launch after warm-up against the best of the 30 — has **median 1.061, min 1.000, max
+1.348**, i.e. inside the launch-to-launch spread. There is **no distinct first-launch penalty**.
+**MEASURED.** *(Caveat: every recipe in this family holds **one** node, so what is measured is the
+cost of a 1-node recipe. Whether the intercept is charged per node or per recipe is **UNKNOWN** here;
+it is cheap to test on the archived multi-node path and it gates nothing.)*
+
+**What the law is for.** It converts a **compile output** into a floor. A fused kernel of **six**
+mixed-op stages at `U = 2` compiles to **147** bundles and fits `a = 1.7715 µs` (R² 0.99946); at its
+own geometry (5.8 points/TPC) its measured span is **1.9131 µs**, i.e. a **0.2127 ms/step** floor over
+43 layer-launches — **46.2×** against the port's **9.8171 ms/step** attention span (§3.6.5). The same
+source under `vliw-td` is **110** bundles at `a = 1.6972 µs`. So a fused body's floor is set by a
+number you can **read off a listing** before you run anything — and it is the number to read, because
+the plan's three candidate floors (0.2155 / 0.3076 / 0.8356 ms/step) are three **bundle counts**:
+**≤147**, **≈388** and **≈1,769**. *(Artifact: the same report's §0 and §2.)*
 
 ---
 
@@ -811,11 +915,12 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | 4 | **Whether `vliw-td` is safe for the whole model** | **NOT RUN** — bit-exact on 14 kernel bodies over the exhaustive domain plus four real shapes, but **no model run** | a model run with output comparison |
 | 5 | **`shuffle.i8`: ISA or lowering?** | **UNRESOLVED** — the bare-kernel control was **INCONCLUSIVE** | a probe with a purpose-built 1-D access pattern |
 | 6 | **Whether `--pre-RA-sched=vliw-td` survives a compiler/Synapse bump** | **UNKNOWN** — it is an LLVM hidden option with no vendor statement. The failure mode is loud (an unknown `-mllvm` option fails the build), so a stale build cannot pass unnoticed | a vendor statement, or the next compiler release |
-| 7 | **The exact fixed per-launch term** | estimates range **0.8–4.0 µs** across fits, and the cross-arm fit and the per-kernel size fits disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level. **Widened 2026-10-13:** there is no single fixed *per-TPC* term either — §4.2.8 measures **1.26–16.4 µs** at one point per TPC, tracking the kernel's unrolled code size (cause UNKNOWN) | a fit that identifies the second-order term (outer-loop / first-touch), a clock that can be pinned, or a disassembly that names the per-TPC overhead |
+| 7 | **The exact fixed per-launch term** | it is **not a constant**: §4.2.10 measures it as a **sublinear function of the emitted bundle count** — `a = 0.6706 + 8.8911 ns × bundles` over 65 arms, R² 0.9766; `a = 0.0531 × bundles^0.736`. The **1.26–16.4 µs** range this row used to carry, "at one point per TPC", was a **bundle-model complement, not a measurement** (§4.2.8). The cross-arm fit and the per-kernel size fits still disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level. **What stays open is the *mechanism*** — item 12 | a fit that identifies the second-order term (outer-loop / first-touch), a clock that can be pinned, or a disassembly that names the per-TPC overhead |
 | 8 | **Whether the bundle win generalises in wall time to the other kernel families** | **NOT MEASURED** — bundle ratios exist for 12 more kernels (up to 1.84×); only the fp4 kernel was timed | time the `lutptr` / `lut` arms |
 | 9 | **The TPC ELF encoding** | no `tpc-objdump`/`llvm-objdump` in the image. `.text` bytes per bundle are 21.3–23.1 across seven kernels (~22), consistent with a fixed-width bundle word plus a variable-length immediate extension — but that is **INFERRED** from byte counts | a disassembler |
 | 10 | **Whether the *silicon* can host two TPC contexts** | **INFERRED: no — but only the scheduler was tested directly.** What is MEASURED is that the runtime never co-schedules two independent TPC nodes, both wanting all 24 TPCs (34,702 kernel events, 0 overlapping intervals on any `tid`); whether the hardware could interleave two SPU contexts if a runtime asked it to is not observable from Python, and we found no way to force a second task onto a TPC | a Synapse C++ recipe with two TPC nodes whose `tpc_working_engines` overlap — the archived multi-node recipe harness (`Archive/by-date/2026-10-11/synapse_cpp/`) is the starting point. If it still serialises, "single-context" is a statement about the hardware; if it overlaps, about the GC's scheduler |
 | 11 | **The split pattern — is a TPC's index-space slice contiguous or strided?** | **UNKNOWN** — not observable from the trace, which gives per-TPC durations and not addresses | a kernel that writes its slice's first index-space offset into a per-TPC output element, then reads the 24 values back |
+| 12 | **Why the per-launch term scales with the emitted bundle count at all** | **UNKNOWN** — §4.2.10 measures the *relationship* (sublinear, exponent 0.736) and the *causal variable* (bundles, by 15 matched scheduler pairs with `WE` fixed), but **not** the mechanism. I-fetch, I-cache, loop setup, prologue cost and a per-bundle decode cost are all consistent with the data; none is tested | a counter or a disassembly that separates fetch from issue, or an arm that moves the bundle count at constant `.text` bytes |
 
 ---
 
@@ -845,6 +950,11 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 10. **Count index-space points, not bytes.** `P = ∏_d ceil(size_d / a_d)` spread over `WE` TPCs at the
     per-point bundle cost; the access pattern's `a` moved a fixed 16 MB tensor **5.235×** with an
     unchanged binary.
+11. **The per-launch term is a bundle law, and it is sublinear.** `a(µs) = 0.6706 + 8.8911 ns ×
+    bundles` over the 65 of 71 arms whose fit reaches R² > 0.995; `a = 0.0531 × bundles^0.736`. The
+    causal variable is the **emitted bundle count**, not the instruction count — 15 matched scheduler
+    pairs with `WE` held fixed inside every pair, and the flagged arm carrying **more** slots every
+    time. **The mechanism is UNKNOWN; do not invent one.** Fit **`span_min`**, never `dur_min`.
 
 ---
 
@@ -859,4 +969,5 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | the `shuffle.i8` refutation, the constant-index rule, the `switches` sweep, the W1 22-instruction case | `Archive/by-date/2026-10-12/lut-build/` (`REPORT.md` §5) and `Archive/by-date/2026-10-12/lut-verify/` |
 | the `+6.08 µs` shuffle/`sel` price over the copy floor | `Archive/by-date/2026-10-12/vector-op-throughput/` (`REPORT.md` §Q4) |
 | no wave / no warp / no occupancy, the index-space point law and the `a` lever, the `WE`-is-not-24 set, the `tpc_working_engines` / `tpc_tpc_cycles` dump census | `Archive/by-date/2026-10-13/tpc-wave/` (`REPORT.md` §1–§5, `tools/overlapcheck.py`, `tools/dumpfields.py`, `json/`) |
+| the per-launch bundle law, the 15 matched scheduler pairs, the `dur_min` trap, the model-free re-derivation of the `1.26/1.80/4.12/16.4` residues | `Archive/by-date/2026-10-13/tpc-launch-cost-vs-codesize/` (`REPORT.md` §0–§3, `logs/extra.log` §A, `json/verdict_span.json`, `json/sweep_all.json`, `tools/archived_fit.py`) |
 | the build path, the zero-edit route, the 14-kernel bit-exactness, the scheduler set, the `.text`-not-`.o` rule | `Archive/by-date/2026-10-13/vliw-buildpath/` (`REPORT.md`) — archived 2026-10-13, **text only**: the `.o`/`.so`/`.pt` build outputs are excluded as regenerable (12.0 MB with them, 3.8 MB without) |
