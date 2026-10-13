@@ -1091,7 +1091,7 @@ the recipe still occupies that time. **MEASURED** *(artifact: `Archive/by-date/2
 against the project's own per-family LOO ranking.)*
 
 **A span table should also report, per span, how many recipe LAUNCHES it contains** — a span's
-headline cost can be dominated by a per-launch structural cost its boundary happens to enclose
+headline cost can be dominated by **one staging node that its boundary happens to enclose**
 (Chapter 3 §3.6.5).
 
 Corollary for engine attribution: the same engine can be recorded **twice**, and the two records
@@ -1327,11 +1327,15 @@ immediate in the disassembly; it is derived from geometry). *(Artifact for both:
   `synStatus 26` race above. **MEASURED.**
 * **Not every graph — and a warm recipe cache gives an EMPTY dump.** Recipes deserialised from the
   recipe cache are never re-dumped, so a dump directory can under-represent what actually executed.
-  **Upgraded 2026-10-13 from INFERRED to MEASURED, and the failure mode is the bad one:**
-  `DUMP_POST_GRAPHS` is written by the graph compiler, and a Synapse **recipe-cache hit loads a
-  compiled blob and builds no graph** — so a warm cache yields an **empty dump directory and a false
-  negative**, not an error. **Point `LAD_RECIPE_CACHE_ROOT` at a fresh empty directory whenever a
-  dump is the instrument.** *(The size of the gap on a *partially* warm cache is still **UNKNOWN**.)*
+  **The cold-cache requirement and the run are MEASURED (2026-10-13):** the dump run pointed
+  `LAD_RECIPE_CACHE_ROOT` at a fresh empty directory, cold-compiled every decode recipe, and wrote
+  **21,763** post-graph files. **The warm-cache consequence is the *stated mechanism* for that
+  precaution, not an observation (`source read`):** `DUMP_POST_GRAPHS` is written by the graph
+  compiler, and a Synapse **recipe-cache hit loads a compiled blob and builds no graph** — so a warm
+  cache yields an **empty dump directory and a false negative**, not an error. **Point
+  `LAD_RECIPE_CACHE_ROOT` at a fresh empty directory whenever a dump is the instrument.** *(No
+  warm-cache dump attempt exists in the archive, so the consequence itself is not measured; the size
+  of the gap on a *partially* warm cache is still **UNKNOWN**.)*
 
 ---
 

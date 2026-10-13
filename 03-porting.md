@@ -1632,14 +1632,19 @@ resolves *away from zero* where RNE — and the HPU's own `cast_to_fp8_v2`, meas
 | `noguard_floor` | md5 `5a1e3296…` | **correctly rounded (RNE)** — `±0` at those cells |
 
 They differ on exactly **2 of 240** cells, both at `k = −9` (nibbles `0x1`/`0x9`), and the
-`5a1e3296…` md5 is the one the engine actually installs. **So the `954 of 65,536` difference between
-the arms is measured against the shipped kernel, and it is a correctness improvement, not a
-regression** — it is the floor fix §3.4.5 specifies, and it moves the decode *toward* the
-correctly-rounded reference. **MEASURED** for the tables and the 2 cells; **source read** for the
-header.
+`5a1e3296…` md5 is the one the engine actually installs. **`guard` and `noguard` carry the *same* 240
+bytes** — both md5 `c713d706…`, because the guard branch fires only at `t ≥ 15`, outside the table's
+`k ∈ [−9, 5]` domain — so the selector's guard half cannot hurt you. The
+**`954 of 65,536` difference between the arms is measured against the shipped kernel, and it is a
+correctness improvement, not a regression** — it is the floor fix §3.4.5 specifies, and it moves the
+decode *toward* the correctly-rounded reference. **MEASURED** for the tables and the 2 cells;
+**source read** for the header.
 
-**No environment variable installs `guarded` — and on correctness grounds that is the right outcome,
-not a workaround.** `DSV4_FP4_VARIANT=guard` is consumed by `apply_selection` for the **library**
+**No environment variable makes the *selector* install `guarded` — and on correctness grounds that is
+the right outcome, not a workaround.** (The one way to install it is the env-gated test seam
+`DSV4_FP4_LUT_TABLE_VARIANT=guard` — `deepseek_v4.py:2898-2912` — which is **default off**: with it
+unset, production behaviour is byte-identical, and it is how the block-test arms above are produced.)
+`DSV4_FP4_VARIANT=guard` is consumed by `apply_selection` for the **library**
 choice, while the **table** comes from `out["decision"].variant`, which that variable does not
 affect — and since the shipped library **is** the `guard` variant, naming it would additionally
 repoint `GC_KERNEL_PATH` at the shipped library, which carries **no LUT kernel**, killing the
@@ -1710,7 +1715,8 @@ count (**14.2 → 14.5**) and the instruction count (**24.75 → 25.75** non-NOP
 
 > The **3.853×** was timed on the **`lutptr`** arm and the bit-exactness on the **`guarded`** arm, but
 > a static census of both listings shows them to be **the same kernel** — identical in every column
-> (**20.75 bundles/iter, 14.5 vector ops, hr 1.431**; the same **3616-byte `.text`**) — because the
+> (**20.75 bundles/iter, 14.5 vector ops, hr 1.431** — the same census; the `3616 B` of `.text` is
+> measured on the timed listing only, and identical counts imply identical length) — because the
 > 240-byte table is a **runtime op input** and cannot change the schedule. Read what "bit-exact" means
 > here: the `guarded` arm is bit-exact **to the shipped kernel — which is the arm that reproduces the
 > `k = −9` tie defect** (§3.4.8); the correctly-rounded arm is **`noguard_floor`**, and that is the one
@@ -2091,13 +2097,13 @@ TRAFFIC, not descriptor count.**
   copy). So we **cannot tell** whether **7.7751 ms/step** is the DMA engine's floor for this access
   pattern. **UNKNOWN** — a negative from a completed search, not a failed one.
 - **The ratio is circular, and that is the most instructive part.** At `1.81 TB/s` the measurement
-  implies **14.07 GB** of traffic against the counted **13.651 GB** — a **3.1 %** excess that *is* the
-  "**1.031×**". At `2.0213 TB/s` it implies **15.77 GB**. **The denominator was selected to make the
+  implies **14.07 GB** of traffic against the counted **13.65 GB** — a **3.1 %** excess that *is* the
+  "**1.031×**". At `2.0213 TB/s` it implies **15.72 GB**. **The denominator was selected to make the
   floor land on the measurement. That is fitting, not bounding.**
 - **And a stronger constraint comes free from this section's own data: a floor cannot exceed its
   measurement.** At `1.731 TB/s` the byte floor would be **7.886 ms/step, above the measured
   7.7751** — impossible — so the envelope is bounded **below** by
-  `13.651 GB ÷ 7.7751 ms` = **1.756 TB/s**, which **excludes the low end of the cited range on our
+  `13.65 GB ÷ 7.7751 ms` = **1.756 TB/s**, which **excludes the low end of the cited range on our
   own evidence**.
 
 **What survives is the structural claim, and it is the one that matters: the pass is a 13.65 GB round
@@ -2113,12 +2119,16 @@ envelope; **UNKNOWN** for the envelope below 16 MB.
 > (`Archive/by-date/2026-10-13/attn-preamble-rewrite-plan/REPORT.md` §0.8) carries the **same number
 > with the retraction attached**. **This section inherited the weaker source on exactly this point.**
 
-> **One tension, flagged rather than smoothed over.** The same arithmetic implies **~101.6 GB/s per
-> busy engine** at the trace's achieved concurrency of **17.27**, which is above the **75.4 GB/s**
-> implied by 24 engines. So either the effective concurrency is **≈17.3, not 24**, or the effective
-> round trip is **~0.72×** the count above. **Either way the binding floor is in the 5.4–7.5 ms/step
-> band, and the *byte* reading is the one the dump supports.** **UNKNOWN** which of the two
-> reconciliations holds.
+> **One apparent tension, and it dissolves — the `17.27` "concurrency" is a marker artefact.** The
+> arithmetic above implies **~101.6 GB/s per busy engine** at a "concurrency" of **17.27** — but
+> **17.28 descriptors in flight on a five-lane pool is impossible** (§1.2, *"five lanes in parallel"*),
+> because the DMA marker **self-overlaps 14.5×** its own union (§2.10 rule 2): `Σdur/union = 17.28` is
+> **self-overlap, not concurrency**, so neither the per-engine rate nor any floor built on it stands.
+> At the real five-lane pool the descriptor floor is **26.04 ms/step = 3.35× the measurement**, and
+> **a floor cannot exceed its measurement**, so the descriptor reading is refuted by its own data.
+> **The only trustworthy S4 quantity is the union, 7.7751 ms/step** — which is exactly the quantity
+> the byte reading uses, and why the *byte* reading is the one the dump supports. *(Artifact:
+> `Archive/by-date/2026-10-13/dma-envelope-provenance/REPORT.md` §5.)*
 
 **Two identities, and one UNKNOWN that must stay UNKNOWN.**
 
@@ -2154,18 +2164,20 @@ envelope; **UNKNOWN** for the envelope below 16 MB.
 > `allocation` and `persistent`. **Read the tensors, not the origin ids.** (§2.10.)
 
 **The generalisable lesson for any span ranking: report LAUNCHES-PER-SPAN.** `ATTN_PREAMBLE`'s
-**9.8171 ms/step** own union is **79 % a per-launch structural cost that its boundary happens to
-enclose**, not its own work — and it is simultaneously the largest span whose boundary passes the
+**9.8171 ms/step** own union is **79 % — one staging node that its boundary happens to enclose**,
+not its own work — and it is simultaneously the largest span whose boundary passes the
 acceptance tests *and* the one enclosing **43** large attention launches. A span's headline cost can
 be dominated by what the boundary happens to contain, so **any span table should report, per span,
 the number of recipe launches it holds**, alongside its milliseconds. **MEASURED / DERIVED.**
 
-**And the instrument has a hard precondition: a COLD recipe cache.** `DUMP_POST_GRAPHS` is written by
-the graph compiler, and a Synapse **recipe-cache hit loads a compiled blob and builds no graph** — so
-a warm cache yields an **empty dump directory and a false negative**. This run therefore pointed
-`LAD_RECIPE_CACHE_ROOT` at a fresh empty directory and cold-compiled every decode recipe. This
-upgrades §2.10's last bullet from **INFERRED** to **MEASURED**: the failure mode is a *silently
-empty* dump, not an error. **MEASURED.**
+**And the instrument has a hard precondition: a COLD recipe cache.** This run pointed
+`LAD_RECIPE_CACHE_ROOT` at a fresh empty directory, cold-compiled every decode recipe, and wrote
+**21,763** post-graph files. **MEASURED** for the requirement and the run. The *reason* the
+precondition is hard is a **stated mechanism, not an observation (`source read`)**: `DUMP_POST_GRAPHS`
+is written by the graph compiler, and a Synapse **recipe-cache hit loads a compiled blob and builds no
+graph** — so a warm cache is *stated* to yield an **empty dump directory and a false negative**, not an
+error. So §2.10's last bullet is **refined**, not upgraded: the cold-cache requirement is measured, and
+the failure mode is the mechanism the precaution is taken against.
 
 *Artifact: `Archive/by-date/2026-10-13/staging-origin-nodes-dump/` — `REPORT.md` §1–§3, §5–§6,
 `evidence/post_decode_ATTN_PREAMBLE_111node.json`, `evidence/pre_decode_ATTN_PREAMBLE_111node.json`,
@@ -2432,7 +2444,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
-| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **The engine *selects* `noguard_floor`, which is the correctly-rounded decode; `guarded` is bit-exact only to the *shipped* kernel, the one carrying the `k = −9` tie defect (§3.4.8). No environment variable installs `guarded`, and whether a real run reaches the tie cells is NOT MEASURED** (at TP=4 a chunk with T ≥ 11 gathers every local expert).** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
+| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **The engine *selects* `noguard_floor`, which is the correctly-rounded decode; `guarded` is bit-exact only to the *shipped* kernel, the one carrying the `k = −9` tie defect (§3.4.8). No environment variable makes the *selector* install `guarded` (the one way is the default-off test seam `DSV4_FP4_LUT_TABLE_VARIANT=guard`, `deepseek_v4.py:2898-2912`, which is how the block-test arms above are produced), and whether a real run reaches the tie cells is NOT MEASURED** (at TP=4 a chunk with T ≥ 11 gathers every local expert).** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
 
 ---
 
