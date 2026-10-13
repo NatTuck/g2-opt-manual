@@ -301,10 +301,11 @@ is one graph → one recipe → one `synLaunch`, `min` over 30–40 reps, physic
 being **+3.8 µs on 540 µs (0.7 %)** and **+8.0 µs on 533 µs (1.5 %)**. The timer's own floor is
 **27.5–33.3 µs** and its resolution on a difference of two arms is **≈ ±5 µs**, so the per-edge
 handoff is **< ~8 µs and consistent with 0 — below this instrument's resolution.** And the
-zero-absorption regime is visible in the ratio, not merely hidden under the floor: at TPC:MME =
-**1:12** the *independent* pair already measures **1.04–1.17× the sum** of its two solo times (four
-pairs). **MEASURED negative, with a bound.** The practical rule: **do not price a dependency in wall
-clock; price it in execution windows** (`CROSS`, above).
+zero-absorption regime is visible in the ratio, not merely hidden under the floor: the *independent*
+pair already measures **1.04–1.17× the sum** of its two solo times (four pairs — the two TPC↔MME rows
+at ≈1:12 give **112 %** and **117 %**; the two DMA↔TPC rows at R=8192, matched within **1.11×**, give
+**104 %** and **105 %**). **MEASURED negative, with a bound.** The practical rule: **do not price a
+dependency in wall clock; price it in execution windows** (`CROSS`, above).
 
 ### How to check each condition
 

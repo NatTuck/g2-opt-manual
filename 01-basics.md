@@ -688,10 +688,14 @@ the cost model, so they set a variable nothing reads. **MEASURED:** a dumped nod
 whose only `tpc_*` key is `tpc_working_engines`** — the stock `relu_fwd_bf16` node compiled in the
 same process behaves identically — and across **every** node in every dump taken that session
 (**11** nodes in the `ENABLE_EXPERIMENTAL_FLAGS` run), the set of keys matching `cycle` or `asic` is
-**empty**. So **"not obtained"** is the accurate state. A larger, independent census in the **default**
-configuration (no `ENABLE_EXPERIMENTAL_FLAGS`) agrees: over **766 of 766 nodes** across six graph-dump
-sets (84 / 150 / 416 / 100 / 8 / 8 — the four surviving dump directories re-derive to **750 of 750**),
-`tpc_working_engines` is present on **every** node and `tpc_tpc_cycles` on **none**. The companion field is
+**empty**. So **"not obtained"** is the accurate state. A larger, independent census agrees — **766 of
+766 nodes** across six graph-dump sets (84 / 150 / 416 / 100 / 8 / 8), with `tpc_working_engines` on
+**every** node and `tpc_tpc_cycles` on **none**; it was taken through a different harness, which sets
+neither `ENABLE_EXPERIMENTAL_FLAGS` nor `DUMP_TPC_COST_MODEL_DATA`. *(That census is **inherited from
+the source report's prose**; its three largest sets — 84 / 150 / 416, i.e. 650 of the 766 — are
+re-derivable from the same report's `logs/dumpfields.log`, `logs/dumpfields2.log` and
+`logs/dumpfields3.log`, each of which reads `tpc_working_engines` equal to its node count and
+`tpc_tpc_cycles` 0.)* The companion field is
 better understood: `tpc_working_engines` is the **dispatch width**, and it is now **exactly
 predictable** from the glue's declared index space —
 [Chapter 4 §4.2.8](04-execution-model.md) — as well as **exactly equal to the trace's `tid` count in
