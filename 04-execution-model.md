@@ -49,19 +49,22 @@ recipe can carry a flawless bundle schedule and have zero cross-engine overlap.
 
 A `{...}` group in a `tpc-clang -S` listing is **not a textual grouping — it is the machine's issue
 group**, a VLIW bundle with exactly **four slots**, named **`load`, `scalar`, `vector`, `store`**.
-**MEASURED** — where "measured" here means *read out of the compiler's own interface*, which is
-stronger than inference and weaker than a device count. The evidence:
+The four slots and their names come out of the compiler's own interface, not off the device. The
+evidence:
 
 * `tpc-clang` has four asm formats. `-mllvm --tpc-asm-format=1` prints **one line per instruction, all
   slots**; `=2` prints **one line per bundle, four `;`-separated fields** in a fixed slot order
-  (measured over 134 lines of one kernel: field 0 = loads/`set_indx`/`event`, field 1 = scalar
-  ALU/branch, field 2 = the vector op, field 3 = stores).
+  (read off 134 lines of one kernel's `=2` listing: field 0 = loads/`set_indx`/`event`, field 1 =
+  scalar ALU/branch, field 2 = the vector op, field 3 = stores).
 * The compiler's own diagnostic vocabulary names the four slots verbatim — `load scalar vector store`,
   next to *"Too many slots"* — and its verifier messages are phrased in bundles: *"THREAD_SYNC must be
   scheduled alone in a bundle"*, *"Only one immediate field is allowed in a VLIW"*.
 * The grouping is produced by the **packetizer**, not the printer: `-mno-packets`,
   `-disable-instruction-scheduling` (*"Disable instruction scheduling and bundling"*),
   `-mllvm --tpc-single-packets` and `-mllvm --disable-tpc-packetizer` each **change the listing**.
+
+**`source read`** *(`/opt/habanalabs/bin/tpc-clang`, TPC C/C++ compiler **2.7.33**, clang 14.0.5: its
+asm-format help, its slot vocabulary, its verifier strings, and the listings its own flags produce.)*
 
 **The decisive identity, and the one to remember.** The *default* (`--tpc-asm-format=0`) listing prints
 each bundle's **real** instructions, and **a single `NOP` for a bundle that has none**. So
@@ -83,10 +86,18 @@ almost never more than one. Whole-kernel census over 2,815 default-build bundles
 |---|---:|---:|---:|---:|---:|
 | bundles | 1192 | 1487 | 120 | 12 | **4** |
 
-and **93 % of the shipping build's bundles carry 0 or 1 real instruction**. No bundle in the 8,483
-censused across three builds ever exceeded 4. **MEASURED.** *(The 4-wide case needs a load + a scalar
-op + a store + a register move. The compiler **never packs two vector ops** — there is only one
-`vector` slot.)*
+and **95.2 % of the shipping build's bundles carry 0 or 1 real instruction** — **2,679 of 2,815**
+(`(1192+1487)/2815`). No bundle in the 8,483 censused across three builds ever exceeded 4.
+**MEASURED.** *(The 4-wide case needs a load + a scalar op + a store + a register move. The compiler
+**never packs two vector ops** — there is only one `vector` slot.)*
+
+*(**Provenance note, 2026-10-13.** The source report's prose says **93 %** in three places (§0 item 2,
+§9, §10 item 2) and its own census does not reproduce it — the histogram above *is* that census, and
+it gives **95.2 %**. 93 % is derivable from no population this census names (occupied bundles only:
+91.6 %; all three builds pooled: 94.1 %; default + `vliw-td` only: 91.2 %). The only `0.93` in that
+report is a **different quantity** — the fp4 body's real-instructions-**per-bundle** ratio
+`70.75/76.00 = 0.9309` (§3.1, §7), i.e. the achieved *co-issue rate*, not a bundle population share.
+That report now carries a dated annotation at each site. **Do not restore 93 %.**)*
 
 **Consequence — the arithmetic floor.** A vector op's floor is **one bundle**, so
 
@@ -108,8 +119,14 @@ t_mem = 15.334                               µs     (at the shape measured)
 t     = MAX(t_ALU, t_mem)
 ```
 
-**MEASURED.** *(The 0.81 µs-per-instruction slope is the same family as chapter 3's "~0.81 µs per
-instruction/iteration" — [§3.4.5](03-porting.md).)*
+**MEASURED.** *(Artifact: the four-arm device family at the production tile `[4096,2048]`, `span`
+statistic — `Archive/by-date/2026-10-09/fp4_arith/README.md` §1.6; the re-fit and the `max` form are
+in `Archive/by-date/2026-10-12/arith_review/FINDINGS.md` §3 and restated in `tpc-coissue/REPORT.md`
+§5. **`t_mem = 15.334 µs` is the `varc` arm's span at that tile, not a hardware floor** — the
+`5.954 µs` floor is the *copy* arm's, at a different shape, and belongs to `tpc-issue-rate-ceiling/`.
+The `6.436 + 0.8189` coefficients are the `span` re-fit; the archived fit reads `6.471 + 0.8183`.)*
+The 0.81 µs-per-instruction slope is the same family as chapter 3's "~0.81 µs per
+instruction/iteration" — [§3.4.5](03-porting.md).
 
 **This is a different mechanism from §4.1.1's co-issue, and one experiment separates them.** The
 evidence is a **hard memory floor** that six different well-packed arms sit on exactly, at
@@ -132,8 +149,10 @@ the memory system became the binding resource at **2.26–2.43 TB/s**. Arms **ab
 ### 4.1.3 Inter-node: TPC ∥ MME ∥ DMA
 
 The third level is across engines, and the manual already has its law: the **four-condition overlap
-law** — one Synapse submission, different engines, no dataflow edge, comparable durations; miss any one
-and `CROSS` is exactly `0.0000` ([§2.2](02-regions.md)). The reason it matters *here* is that it is a
+law** — one Synapse submission, different engines, no dataflow edge, comparable durations; violating
+any of the first three gives `CROSS` exactly `0.0000`, and the fourth is a **detectability** condition
+whose violation gives a *small, non-discriminating* `CROSS` rather than zero
+([§2.2](02-regions.md)). The reason it matters *here* is that it is a
 **different kind of statement** from §4.1.1–§4.1.2: it is about **submission structure**, not
 instruction scheduling. A perfectly packed kernel (§4.2) does nothing for it, and vice versa. For how
 much overlap is *worth*, and the occupancy law that says the wall tracks the **union** and not the sum,
@@ -166,13 +185,16 @@ predicts five arms over four independent kernels to **0.6–1.7 %**:
 | `sel_K8` @16384 | 35.25 | 5504 | 107.80 µs | 109.12 µs | 1.012 |
 
 **MEASURED.** All four slots of a bundle issue in that one cycle — nothing else explains 1.008 at 75
-bundles/iteration carrying 70.75 real instructions.
+bundles/iteration carrying 70.75 real instructions. *(A sixth arm at that shape, `sel_K8v`, is
+**omitted from the table on purpose, and the omission is the point**: it sits on the memory floor of
+§4.1.2 — 44.48 µs at 2.263 TB/s — so an issue-only model does not describe it, and its `meas/pred` is
+**1.238**. The model is validated on the five arms that are issue-bound, not on all six.)*
 
 **This also reconciles two figures that look like different constants.** An earlier measurement of this
-same hardware reported **0.544–0.586 ns per *emitted slot***; this one reports **0.5556 ns per
-*bundle***. They are the same measurement, because in the shipping build the default listing's line
-count *is* the bundle count to within the small number of bundles that carry ≥2 real instructions
-(§4.1.1). The correct statement to carry is:
+same hardware reported **0.544–0.621 ns per *emitted slot*** (the fp4 band within it is
+0.578–0.586); this one reports **0.5556 ns per *bundle***. They are the same measurement, because in
+the shipping build the default listing's line count *is* the bundle count to within the small number
+of bundles that carry ≥2 real instructions (§4.1.1). The correct statement to carry is:
 
 > **0.556 ns per VLIW bundle per TPC at 1.8 GHz, with up to four instructions riding in it.**
 > *(Source for the slot-rate figures: the issue-rate-ceiling study — 0.544 ns/slot marginal best,
@@ -193,7 +215,8 @@ The lever is a **scheduler flag, not a source change**:
 -mllvm --pre-RA-sched=vliw-td
 ```
 
-On the ten kernels measured it cuts bundles **1.19×–3.45×** at **constant or higher** instruction
+On the ten kernels measured it cuts bundles **1.19×–3.45×** on **the nine that change** — the tenth,
+`vecop_i8_copy`, is 1.000 because it has nothing to pack — at **constant or higher** instruction
 count:
 
 | kernel | bundles (default) | bundles (`vliw-td`) | ratio | real instr (def → vliw) |
@@ -268,10 +291,12 @@ CCC_OVERRIDE_OPTIONS="+-mllvm +--pre-RA-sched=vliw-td" bash build.sh
 
 ### 4.2.5 Safety, and two traps
 
-**Bit-exactness, widened.** The flag was validated across **14 distinct kernel bodies**, each built
-twice from byte-identical sources and compared **on device**: the production fp4 kernel + the E3a stub,
-`fp4_dequant_arith` (5 arms), `fp4_dequant_lut` (3), `fp4_dequant_clamp` (3), `lutprobe` (4), `kchain`
-(5). The domain is the **exhaustive per-cell sweep** — all 256 input bytes × 64 values of
+**Bit-exactness, widened.** The flag was validated across **14 distinct kernel source revisions**,
+each built twice from byte-identical sources and compared **on device**. They appear in **22
+arm-comparisons** — a body is counted once per family it is exercised in, so the list below does not
+sum to 14: the production fp4 kernel + the E3a stub (2), `fp4_dequant_arith` (5 arms),
+`fp4_dequant_lut` (3), `fp4_dequant_clamp` (3), `lutprobe` (4), `kchain` (5) = **22**. The domain is
+the **exhaustive per-cell sweep** — all 256 input bytes × 64 values of
 `k ∈ [−16, 47]` — plus four real shapes at the production distribution: **0 mismatches**. And the flag
 **changes every one of their objects** (12 of the 14 get fewer bundles; the two unchanged ones are
 trivial copies with nothing to pack), so the pass is **not vacuous**. **MEASURED.**
@@ -508,7 +533,8 @@ semantics. **The honest statement is: the documented semantics do not hold under
 structure, and the exact trigger is open.** A purpose-built 1-D access pattern is what would settle it.
 
 *(For completeness, the instruction is genuinely cheap: one `shuffle.i8` per 256 lanes, priced like one
-ordinary ALU op — 12.034 µs against the 5.954 µs copy floor, the same +6.08 µs as one `sel`.)*
+ordinary ALU op — 12.034 µs against the 5.954 µs copy floor, the same +6.08 µs as one `sel`. **This
+price is the dtype-sweep study's, not the `lut` studies':** `vector-op-throughput/REPORT.md` §Q4.)*
 
 ---
 
@@ -561,9 +587,13 @@ the check that fails the dead kernel.** **MEASURED.**
 
 **And for builds, compare `.text`, never `.o` md5** (§4.2.5).
 
+*(This chapter has no `examples/04-execution-model/`: the three steps above are the whole instrument,
+and they run against any TPC kernel you already have.)*
+
 > ⚠ **The instrument does not exist for the TPC clock.** `hl-smi` on `hl-1.24.0-fw-62.6.2.0` exposes
-> **no** TPC engine/cycle/clock counter of any name — only `clocks.current.soc` (1650 MHz flat),
-> `clocks.limit.tpc` (1800 MHz), `utilization.aip`, `utilization.memory`. `hl-smi -Q tpc_tpc_cycles`
+> **no** TPC engine/cycle/clock counter of any name. Its clock keys are `clocks.current.soc`
+> (1650 MHz flat), `clocks.max.soc`, `clocks.limit.soc` and `clocks.limit.tpc` (1800 MHz); its
+> utilisation keys are `utilization.aip` and `utilization.memory`. `hl-smi -Q tpc_tpc_cycles`
 > and `-Q clocks.current.tpc` both return *"Invalid --query-aip parameter"*. This is **"no such key on
 > this build"** (the whole key list was enumerated), **not** "we could not look". **UNKNOWN** whether a
 > newer or privileged build exposes them.
@@ -595,9 +625,9 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 2. **The cost currency is the bundle, not the instruction.** `t ≈ bundles × 0.556 ns`; the default
    listing prints one line per real instruction, plus one `NOP` line per empty bundle.
 3. **The shipping scheduler is `source` and packs ~1 instruction per bundle.**
-   `-mllvm --pre-RA-sched=vliw-td` cuts bundles **1.19×–3.45×** and is worth **1.21×** on the shipped
-   fp4 kernel at **more** instructions, bit-exact — **but model-level safety is NOT established
-   (NOT RUN)**.
+   `-mllvm --pre-RA-sched=vliw-td` cuts bundles **1.19×–3.45×** on the nine of ten kernels that
+   change and is worth **1.21×** on the shipped fp4 kernel at **more** instructions, bit-exact — **but
+   model-level safety is NOT established (NOT RUN)**.
 4. **A 256-byte register, one lane width per element size.** Cost is per register:
    `i8 = fp8 : bf16 : f32 = 1 : 2 : 4` per element.
 5. **fp8 is native for the non-arithmetic half and 3 instructions for `+`.** Price fp8 adds.
@@ -615,7 +645,9 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | what | artifact |
 |---|---|
 | the 4-slot bundle, the listing identity, the 1-bundle/cycle model, the scheduler lever, the decisive pair | `Archive/by-date/2026-10-12/tpc-coissue/` (`REPORT.md`, `tools/vliw.py`, `tools/bundles.py`) |
-| the emitted-slot rate, the NOP-inclusive count, the memory floor, the TPC-clock query absence | `Archive/by-date/2026-10-12/tpc-issue-rate-ceiling/` (`tools/slots.py`) |
+| the emitted-slot rate, the NOP-inclusive count, the *copy* arm's `5.954 µs` floor, the TPC-clock query absence | `Archive/by-date/2026-10-12/tpc-issue-rate-ceiling/` (`tools/slots.py`) |
+| the `MAX(t_ALU, t_mem)` pipe-overlap model (the `t_ALU` fit, `t_mem = 15.334 µs`) | `Archive/by-date/2026-10-09/fp4_arith/` (`README.md` §1.6), re-fit in `Archive/by-date/2026-10-12/arith_review/` (`FINDINGS.md` §3) |
 | the nine-dtype sweep, widths, folding, ILP, pack/unpack, the operand-aware gate | `Archive/by-date/2026-10-12/vector-op-throughput/` (`tools/isa_gate.py`, `listings2/`) |
 | the `shuffle.i8` refutation, the constant-index rule, the `switches` sweep, the W1 22-instruction case | `Archive/by-date/2026-10-12/lut-build/` (`REPORT.md` §5) and `Archive/by-date/2026-10-12/lut-verify/` |
-| the build path, the zero-edit route, the 14-kernel bit-exactness, the scheduler set, the `.text`-not-`.o` rule | `scratch/vliw-buildpath/REPORT.md` — **not yet archived** at the time of writing |
+| the `+6.08 µs` shuffle/`sel` price over the copy floor | `Archive/by-date/2026-10-12/vector-op-throughput/` (`REPORT.md` §Q4) |
+| the build path, the zero-edit route, the 14-kernel bit-exactness, the scheduler set, the `.text`-not-`.o` rule | `Archive/by-date/2026-10-13/vliw-buildpath/` (`REPORT.md`) — archived 2026-10-13, **text only**: the `.o`/`.so`/`.pt` build outputs are excluded as regenerable (12.0 MB with them, 3.8 MB without) |

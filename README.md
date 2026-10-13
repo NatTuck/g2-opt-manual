@@ -49,7 +49,7 @@ those in from general knowledge.**
 | 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
-figures maintained by hand, and **two of the four had gone stale** — chapter 1 read 944 against an
+figures maintained by hand, and **two of the five had gone stale** — chapter 1 read 944 against an
 actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked. An exact number here
 is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
 not cite it.**
