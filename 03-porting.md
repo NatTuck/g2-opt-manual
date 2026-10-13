@@ -1609,6 +1609,66 @@ outputs, so the table flows into the compiled graph as **runtime data** and is n
 time. The timing corroborates it — the two *branch* compiles cost **30.17 s and 29.98 s**, while two
 new table *values* cost **0.02 s each** because they reuse the compiled graph. **MEASURED.**
 
+**Which variant this checkpoint selects — the mechanism, and the half that is operational.** The
+selection runs on the load path: `_prep_compress_caches` → `_check_v4_routed_all` →
+`_select_fp4_variant_all`, which calls `decide_and_apply_from_bounds(hi, lo)` and then
+`_install_fp4_lut(out["decision"].variant)` (`deepseek_v4.py:3337`/`:3340`). On this checkpoint the
+routed-expert scale exponent bytes are `[118, 126]`, so `top_guard_needed=False` (the upper guard's
+cheapest firing needs byte 133) and `floor_fix_needed=True` with **zero margin** (byte 118 *is* the
+boundary) → **`noguard_floor`**. Both predicates are tight, and the decision logic is **correct, not
+defective**. **source read.** *(The single byte-127 element is in the `mtp.` head, which is not
+instantiated.)*
+
+**`guarded` means "reproduces the shipped kernel" — and the shipped kernel is the arm with the
+defect. "Bit-exact" does not mean "correct".** The shipped decode says so in its own header: below
+`t = -3` the two terms of the subnormal branch are each clamped where their *sum* should be rounded,
+so the magnitude **FLOORS** to `2⁻⁹`, and at the `t = -3` **exact tie** (true value `2⁻¹⁰`) the code
+resolves *away from zero* where RNE — and the HPU's own `cast_to_fp8_v2`, measured — resolve it to `0`
+(`src/custom_ops/fp4_dequant/kernels/gaudi2/fp4_dequant_fwd_gaudi2.c:25-39`). So the two arms are:
+
+| variant | its 240-byte table | what it is |
+|---|---|---|
+| `guarded` | md5 `c713d706…` | **reproduces the shipped kernel's `k = −9`, `t = −3` behaviour** (the `±2⁻⁹` floor) |
+| `noguard_floor` | md5 `5a1e3296…` | **correctly rounded (RNE)** — `±0` at those cells |
+
+They differ on exactly **2 of 240** cells, both at `k = −9` (nibbles `0x1`/`0x9`), and the
+`5a1e3296…` md5 is the one the engine actually installs. **So the `954 of 65,536` difference between
+the arms is measured against the shipped kernel, and it is a correctness improvement, not a
+regression** — it is the floor fix §3.4.5 specifies, and it moves the decode *toward* the
+correctly-rounded reference. **MEASURED** for the tables and the 2 cells; **source read** for the
+header.
+
+**No environment variable installs `guarded` — and on correctness grounds that is the right outcome,
+not a workaround.** `DSV4_FP4_VARIANT=guard` is consumed by `apply_selection` for the **library**
+choice, while the **table** comes from `out["decision"].variant`, which that variable does not
+affect — and since the shipped library **is** the `guard` variant, naming it would additionally
+repoint `GC_KERNEL_PATH` at the shipped library, which carries **no LUT kernel**, killing the
+promotion. The variant the engine selects is the **correctly-rounded** one. **source read.**
+
+**What is and is not established about whether the tie cells are reached.** *Established from the
+checkpoint's own packed bytes:* **1,070** byte-118 groups, of which **316** carry at least one tie
+nibble — **1,399** tie nibbles in **23** (layer, expert) pairs in layers 34/35/37/39/40 — and at TP=4
+(`n_local = 64`, `g = min(n_local, T·K)`) a chunk with **T ≥ 11** gathers **every** local expert, with
+all four ranks holding tie-carrying experts (**387 / 562 / 131 / 319** nibbles). The earlier TP=1 test
+had to **force** the 26 byte-118 experts in; a TP=4 prefill does not. *Not settleable from disk:*
+whether a **specific deployed run** reaches those cells — prefill depends on chunk size, decode on
+routing. **The measurement that settles it: log the gathered expert ids in a real engine forward
+pass, or diff `noguard_floor` against `guarded` end to end. NOT MEASURED.**
+
+**Two latent defects on this path, both zero-effect on this checkpoint — state them, and do not read
+them as live.** *(a)* `VARIANT_DECODE["guard_floor"] = "guarded"` (`lut_tables.py:107`) **silently
+drops the floor fix** for a variant whose own predicate says the fix is needed, and **no guard+floor
+decode exists at all** — contradicting the design's own rule that the floor fix must be present in
+**both** variants. It is latent because `guard_floor` needs `max_byte > 132`, which the fresh-load
+upper-bound assertion forbids — but the **snapshot-restore path skips that assertion** and feeds the
+selected variant straight to `_install_fp4_lut`, so a restored snapshot with `max_byte > 132` gets a
+table that omits the fix. *(b)* **Structural:** the LUT kernel clamps `k` into `[−9, 5]`
+(`fp4_dequant_lutptr_rc_gaudi2.c:63`), so the promoted LUT **cannot express the upper guard at all**
+(the guard fires at `k ≥ 6`) — a `k = 6` group is decoded with the `k = 5` row. For any checkpoint
+that needs the guard, the LUT path is wrong by construction, not merely unselected. **source read.**
+*Both defects are off-checkpoint and neither affects this checkpoint's bytes; they are recorded
+because they are live on the restore path.*
+
 **Block-level safety — and it is a BLOCK, not a model.** `_compute_v4_routed` (the model's own MoE
 function) compiled with `torch.compile(fullgraph=True)`, on **real layer-39 checkpoint weights** (all
 256 experts), at `H=4096, inter=2048, T=16, topk=6, g=96`, with all **26** byte-118 experts forced
@@ -1648,14 +1708,17 @@ The flag moves the **bundle** count (**38.25 → 20.75** per iteration) and leav
 count (**14.2 → 14.5**) and the instruction count (**24.75 → 25.75** non-NOP) where they were —
 **scheduling headroom, not arithmetic headroom** (§4.2.7's lever, applied to the LUT arm). **MEASURED.**
 
-> ⚠ **The 3.853× and the bit-exactness are NOT established to be the same configuration.** The
-> 3.853× was timed on the **`lutptr`** arm, whose table is the **archived pre-guard** one (md5
-> `c2f51a5fb811cf711a4c969a0400cef0`); the bit-exactness in the table above is the **`guarded`**
-> arm's. On the **timed** distribution every arm is bit-exact against the shipped kernel, and on the
-> exhaustive domain `lutptr` differs from it by **384 of 8,192** cells — the pre-existing pre-guard
-> difference, **not** a `vliw-td` effect (the diff counts are identical for both schedules). But
-> **whether the guarded variant times the same as the timed variant is NOT YET ESTABLISHED.**
-> **Do not let the two results merge into one claim.**
+> The **3.853×** was timed on the **`lutptr`** arm and the bit-exactness on the **`guarded`** arm, but
+> a static census of both listings shows them to be **the same kernel** — identical in every column
+> (**20.75 bundles/iter, 14.5 vector ops, hr 1.431**; the same **3616-byte `.text`**) — because the
+> 240-byte table is a **runtime op input** and cannot change the schedule. Read what "bit-exact" means
+> here: the `guarded` arm is bit-exact **to the shipped kernel — which is the arm that reproduces the
+> `k = −9` tie defect** (§3.4.8); the correctly-rounded arm is **`noguard_floor`**, and that is the one
+> the engine installs. **What remains untimed is the `noguard_floor` table itself** — a **0.02 s** swap
+> on the same compiled graph, not a safety margin. On the **timed** distribution every arm is
+> bit-exact against the shipped kernel, and on the exhaustive domain `lutptr` differs from it by
+> **384 of 8,192** cells — the pre-existing pre-guard difference, **not** a `vliw-td` effect (the diff
+> counts are identical for both schedules).
 >
 > **What is outstanding, stated as outstanding: a whole-model decode at TP=4.** The block test above
 > cannot see a model-level effect — its **activations and routing are synthetic** (only the weights,
@@ -1668,9 +1731,10 @@ count (**14.2 → 14.5**) and the instruction count (**24.75 → 25.75** non-NOP
 *Artifact: `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` and its logs
 (`logs_device_probe.txt:4-14`, `:50-61`, `:93-97`, `:102-109`, `:138-150`;
 `logs_lut_model_safety.txt:46-55`, `:62-66`, `:71-73`; `logs_lut_tables.txt:4-6`;
-`logs_variant_gate.txt:76-78`, `:87`, `:112`, `:122`). The 3.853× timing and
-its bundle/vector-op census: `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §1–§2. The
-late-write evidence: the archived `fp4-e2e-variant` report's `[latewrite] wiring verdict = applied`
+`logs_variant_gate.txt:76-78`, `:87`, `:112`, `:122`). The variant semantics, the tie census and the
+latent defects: `Archive/by-date/2026-10-13/variant-decision-semantics/REPORT.md` §1–§4. The 3.853×
+timing and its bundle/vector-op census: `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §1–§2.
+The late-write evidence: the archived `fp4-e2e-variant` report's `[latewrite] wiring verdict = applied`
 and `THE FP4 OP DID NOT RUN: … synStatus=synStatus 26` probe output.*
 
 ---
@@ -2368,7 +2432,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
-| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **It is also not established that the timed variant and the bit-exact variant are the same configuration.** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
+| **21** | **Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.** **NOT RUN.** The bit-exactness is a **block** (`_compute_v4_routed`, one layer, real weights but **synthetic activations and routing**); the **3.853×** was timed on a **different table** than the one shown bit-exact; and the **GUID gap** and the **late `GC_KERNEL_PATH` write** are two different blockers, of which only the first is a one-line fix. Nothing measured covers the engine's decode step, prefill, the compressor path, or the other 42 layers' tie populations. **The engine *selects* `noguard_floor`, which is the correctly-rounded decode; `guarded` is bit-exact only to the *shipped* kernel, the one carrying the `k = −9` tie defect (§3.4.8). No environment variable installs `guarded`, and whether a real run reaches the tie cells is NOT MEASURED** (at TP=4 a chunk with T ≥ 11 gathers every local expert).** | a **whole-model decode at TP=4** on all four modules, with output comparison — the harness hardcodes `tensor_parallel_size=4` and the routed fp4 does not fit on one card (**150.59 GB total, 37.65 GB/rank at TP=4**). *(Opened 2026-10-13; §3.4.8; `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6 and §9; `Archive/by-date/2026-10-13/fp4-lutptr-vliw/REPORT.md` §6.)* |
 
 ---
 
