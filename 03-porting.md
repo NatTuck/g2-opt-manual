@@ -1616,7 +1616,7 @@ new table *values* cost **0.02 s each** because they reuse the compiled graph. *
 **Which variant this checkpoint selects — the mechanism, and the half that is operational.** The
 selection runs on the load path: `_prep_compress_caches` → `_check_v4_routed_all` →
 `_select_fp4_variant_all`, which calls `decide_and_apply_from_bounds(hi, lo)` and then
-`_install_fp4_lut(out["decision"].variant)` (`deepseek_v4.py:3337`/`:3340`). On this checkpoint the
+`_install_fp4_lut(out["decision"].variant)`. On this checkpoint the
 routed-expert scale exponent bytes are `[118, 126]`, so `top_guard_needed=False` (the upper guard's
 cheapest firing needs byte 133) and `floor_fix_needed=True` with **zero margin** (byte 118 *is* the
 boundary) → **`noguard_floor`**. Both predicates are tight, and the decision logic is **correct, not
@@ -1646,7 +1646,7 @@ decode *toward* the correctly-rounded reference. **MEASURED** for the tables and
 
 **No environment variable makes the *selector* install `guarded` — and on correctness grounds that is
 the right outcome, not a workaround.** (The one way to install it is the env-gated test seam
-`DSV4_FP4_LUT_TABLE_VARIANT=guard` — `deepseek_v4.py:2898-2925` — which is **default off**: with it
+`DSV4_FP4_LUT_TABLE_VARIANT=guard` — which is **default off**: with it
 unset, production behaviour is byte-identical, and it is how the block-test arms above are produced.)
 `DSV4_FP4_VARIANT=guard` is consumed by `apply_selection` for the **library**
 choice, while the **table** comes from `out["decision"].variant`, which that variable does not
@@ -1656,8 +1656,8 @@ promotion. The variant the engine selects is the **correctly-rounded** one. **so
 
 **Whether the tie cells are reached is MEASURED — twice, by two independent instruments — and the
 answer is yes.** *Established from the checkpoint's own packed bytes:* **1,070** byte-118 groups, of
-which **316** carry at least one tie nibble — **1,399** tie nibbles in **23** (layer, expert) pairs in
-layers 34/35/37/39/40 — and at TP=4 (`n_local = 64`, `g = min(n_local, T·K)`) a chunk with **T ≥ 11**
+which **316** carry at least one tie nibble — **1,399** tie nibbles in **23** (layer, expert, tag) pairs,
+every one of them `w1`, in layers 34/35/37/39/40 — and at TP=4 (`n_local = 64`, `g = min(n_local, T·K)`) a chunk with **T ≥ 11**
 gathers **every** local expert, with all four ranks holding tie-carrying experts (**387 / 562 / 131 /
 319** nibbles). The earlier TP=1 test had to **force** the 26 byte-118 experts in; a TP=4 prefill does
 not. **But the gather argument alone proves nothing**: `out = (y * gate_wg).sum(0)` and `gate_w` is
@@ -1767,8 +1767,11 @@ pooled steady steps** (2 × 23). **MEASURED.**
 0/3072 cells, `max|d| = 0`.
 
 **The end-to-end numbers, with their scopes — and they are 1.134× / 1.358×, not 3.853×.** The
-whole-model decode-step speedup is **1.1337×** (`guarded`) / **1.1347×** (`noguard_floor`), and the
-prefill step **1.358×** / **1.352×**. The **3.853×** (above) is a **kernel-local** ratio on the dequant
+whole-model decode-step speedup is **1.1337×** (`guarded`) / **1.1347×** (`noguard_floor`); those
+multiples come from the **unrounded pooled medians** (`0.092696` / `0.081765` / `0.081692 s` over the
+46 pooled steps), not from the 4-dp medians printed above (`0.0927 / 0.0818 = 1.1333`). The prefill
+step is **1.358×** / **1.352×** — the **measured-request-#1** ratios; the second measurement gives
+**1.3538×** / **1.3634×**. The **3.853×** (above) is a **kernel-local** ratio on the dequant
 kernel alone at `[4096,2048]`; the dequant is a small share of a 43-layer step, so the two figures are
 **different quantities** and the 3.853× must not be read as a model speedup. Nor is this a benchmark:
 one prompt, `max_num_seqs = 1`, so these are end-to-end **step walls**, not throughput, and the prefill
@@ -1799,12 +1802,15 @@ are byte `[118, 126]` on ranks 0/2 and `[118, 125]` on ranks 1/3, so `top_guard_
 `=> VARIANT: NOGUARD_FLOOR`**, in the `shipped` arm as well. **MEASURED.**
 
 **The test seam used to produce these arms is default-off, provably inert, and not the shipping
-mechanism.** `src/vllm-gaudi/vllm_gaudi/models/deepseek_v4.py:2898-2925` is the only `src/` file
-touched; with **neither** env var set, the `else` branch executes the pre-edit line unchanged, and the
+mechanism.** `_install_fp4_lut` in `src/vllm-gaudi/vllm_gaudi/models/deepseek_v4.py` is the only `src/`
+file touched; with **neither** env var set, the `else` branch executes the pre-edit line unchanged, and the
 `noguard_floor` arm ran with `DSV4_FP4_LUT_TABLE_VARIANT` **unset** and installed exactly
 `5a1e3296fa3a6ecf3379b688a18e1540` — the same md5 the builder produced before the edit. **If a
 different variant should ship, that is a change to the decision logic, and the seam must not be how it
-is selected.** **MEASURED / source read.**
+is selected.** **MEASURED / source read.** *(No line numbers for that file: it is under active edit and
+this seam is uncommitted, so the symbol — not a line — is the stable anchor. The archived report that
+first recorded the seam keeps its own line numbers: an archive is a record of what was true when it was
+written; this manual is the living document.)*
 
 *Artifact: `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` and its logs
 (`logs_device_probe.txt:4-14`, `:50-61`, `:93-97`, `:102-109`, `:138-150`;
@@ -2200,10 +2206,13 @@ envelope; **UNKNOWN** for the envelope below 16 MB.
 > **One apparent tension, and it dissolves — the `17.27` "concurrency" is a marker artefact.** The
 > arithmetic above implies **~101.6 GB/s per busy engine** at a "concurrency" of **17.27** — but
 > **17.28 descriptors in flight on a five-lane pool is impossible** (§1.2, *"five lanes in parallel"*),
-> because the DMA marker **self-overlaps 14.5×** its own union (§2.10 rule 2): `Σdur/union = 17.28` is
+> because the DMA marker **self-overlaps 14.5×** its own union (§2.9 rule 2): `Σdur/union = 17.28` is
 > **self-overlap, not concurrency**, so neither the per-engine rate nor any floor built on it stands.
 > At the real five-lane pool the descriptor floor is **26.04 ms/step = 3.35× the measurement**, and
-> **a floor cannot exceed its measurement**, so the descriptor reading is refuted by its own data.
+> **a floor cannot exceed its measurement**, so the descriptor reading is refuted by its own data. *(That
+> 26.04 is the plan's **52,460 descriptors/step**; this section's own identity below counts
+> **52,245**/step, at which the same floor is **25.93 ms/step = 3.33×** — the two counts differ by 0.4 %
+> and both refute the reading.)*
 > **The only trustworthy S4 quantity is the union, 7.7751 ms/step** — which is exactly the quantity
 > the byte reading uses, and why the *byte* reading is the one the dump supports. *(Artifact:
 > `Archive/by-date/2026-10-13/dma-envelope-provenance/REPORT.md` §5.)*
@@ -2523,7 +2532,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
-| ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2**. *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
+| ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
 
 ---
 
@@ -2607,10 +2616,11 @@ consults this register to find out what we do *not* know gets a complete answer.
     when the debug flag was simply off and the kernel **had** been instantiated.
 24. **Check for the artifact before believing the exit code.** **MEASURED:** `HPU_DUMP=1` stalls the
     first forward past the EngineCore's RPC timeout, so the harness reported `TimeoutError` then
-    `EngineDeadError` and the workers leaked (all four modules held at ~52.9 GB each, released on
-    their own in ~30 s) — **yet the workers had already written their four dumps**, which is why that
-    run's routing measurement exists at all. On a harness-level failure, **look for the output file**
-    before writing the arm off, and check `hl-smi` for leaked modules before the next launch.
+    `EngineDeadError` and the workers leaked (all four modules held at ~52.9 GB each — held at
+    `15:34:04Z`, free by `15:34:55Z`) — **yet the workers had already written their four dumps**, which
+    is why that run's routing measurement exists at all. The failure is the harness's, not the device's:
+    the work was done while 52.9 GB per module stayed held. On a harness-level failure, **look for the
+    output file** before writing the arm off, and check `hl-smi` for leaked modules before the next launch.
 
 ---
 
