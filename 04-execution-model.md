@@ -70,7 +70,10 @@ asm-format help, its slot vocabulary, its verifier strings, and the listings its
 each bundle's **real** instructions, and **a single `NOP` for a bundle that has none**. So
 
 > **instruction lines in a default listing == `Σ_bundles max(#real instructions in bundle, 1)`
-> == bundles + (#bundles carrying ≥2 real instructions).**
+> == `Σ_bundles #real instructions + #(empty bundles)`
+> == bundles + `Σ_bundles max(#real − 1, 0)` — the *extra* lines from bundles carrying ≥2, not the
+> count of them: a bundle with k ≥ 2 real instructions contributes k lines, so `bundles + #(r ≥ 2)`
+> undercounts by `Σ_bundles max(#real − 2, 0)`.**
 
 Exact on four kernels: `vecop_i8_copy` 94 = 94, `vecop_i8_wide7` 169 = 169, `vecop_i8_sel_K8`
 225 = 225, `vecop_i8_decbody` 394 = 394. **MEASURED.** *(This identity is also a trap. An earlier fit
