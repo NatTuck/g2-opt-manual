@@ -1077,7 +1077,7 @@ header gets wrong is the attribution: *"exact for the checkpoint's scale range"*
 reaches `k = -9`** (byte 118, 1,070 groups). **As fixed, the correction landed at seven sites, not
 five.** This section named the five *copies* — the four sibling kernel arms (`fp4_dequant_arith`,
 `fp4_dequant_lut`, `fp4_dequant_clamp`, `kchain`) and the spec-arm gate's `engine_weight_replica`
-docstring (`src/gates/step12_routed_spec_arm_gate.py:81`). Two more were fixed as well: the **shipped
+docstring (`src/gates/step12_routed_spec_arm_gate.py`). Two more were fixed as well: the **shipped
 kernel header** itself, and a **seventh** the reviewer had not listed — `deepseek_v4.py`'s own
 `_dequant_v4_fp4` docstring, found by grepping the phrase once the first six were fixed.
 (`Archive/by-date/2026-10-12/fp4-op-contract/REPORT.md` §4.6.)
@@ -1288,9 +1288,8 @@ Amplification **13.74×** against the 3.25 GB the path itself reads.
 MXFP4 weights: it takes packed `uint8` weights plus `uint8` E8M0 scales and does the dequantisation,
 the two expert GEMMs, the activation and the routing **inside one op** — i.e. it is the fused
 alternative to the six materialising stages of §3.3. Our tree wraps it at
-`src/vllm-gaudi/vllm_gaudi/extension/ops.py:1841` (`VllmMixtureOfExpertsOpMXFP4`, which passes
-`permuted_weights=True` hardcoded at `:1951` and selects the `bias_*` variant purely on `has_bias`
-at `:1908`). **source read** — the artifact is named and quotable, but nothing was executed.
+`src/vllm-gaudi/vllm_gaudi/extension/ops.py` (`VllmMixtureOfExpertsOpMXFP4`, which passes
+`permuted_weights=True` hardcoded and selects the `bias_*` variant purely on `has_bias`). **source read** — the artifact is named and quotable, but nothing was executed.
 
 **Why this subsection exists.** *"Can we adapt the stock fp4 builtin to our model?"* is a recurring
 question, and the answer is not yes-or-no — it is a **table of axes, each pass / fail / UNKNOWN**.
@@ -1420,7 +1419,7 @@ non-finite).
 routed-expert scales live at bytes `[118, 127]` and the non-expert scales at `[114, 121]`, so byte
 255 is unreachable *here* — which is exactly why the guard is cheap to keep and easy to lose.
 **MEASURED** — the histogram and the byte ranges come from our e8m0 byte-255 gate,
-`src/gates/step_e8m0_byte255_gate.py:19-20`.
+`src/gates/step_e8m0_byte255_gate.py`.
 
 #### ⚠ TRAP 2 — `block_size` is a decoy
 
@@ -1660,7 +1659,7 @@ defect. "Bit-exact" does not mean "correct".** The shipped decode says so in its
 `t = -3` the two terms of the subnormal branch are each clamped where their *sum* should be rounded,
 so the magnitude **FLOORS** to `2⁻⁹`, and at the `t = -3` **exact tie** (true value `2⁻¹⁰`) the code
 resolves *away from zero* where RNE — and the HPU's own `cast_to_fp8_v2`, measured — resolve it to `0`
-(`src/custom_ops/fp4_dequant/kernels/gaudi2/fp4_dequant_fwd_gaudi2.c:25-39`). So the two arms are:
+(`src/custom_ops/fp4_dequant/kernels/gaudi2/fp4_dequant_fwd_gaudi2.c`). So the two arms are:
 
 | variant | its 240-byte table | what it is |
 |---|---|---|
@@ -2194,7 +2193,7 @@ conditionality — the verdict box here, the gate itself at the end of this sect
 > | arm | geometry | graph nodes | `memcpy_dma` staging nodes | nodes with non-zero `dma_expected_duration` |
 > |---|---:|---:|---:|---:|
 > | **control 1** — the shipped chain at this geometry, in the treatment's own process | 2,422 blocks × 1,600,000 B | 33 | **1** (`num_of_ROIs` **243**, dur **3719.180392235825**) | 3 |
-> | **control 2** — the **full model at TP=4**, cold recipe cache, 21,769 post-graphs | real | 111 / 210 / 242 | **116** graphs carry it | **≥116** |
+> | **control 2** — the **full model at TP=4**, cold recipe cache, 21,769 post-graphs | real | 111 / 210 / 242 | **116** graphs carry it | **3,103** (116 of them the staging signature) |
 > | **treatment** — the rewrite's spelling, same geometry, same process | same | 2 | **0** | **0** |
 >
 > **Control 1 reproduces this section's own node bit-for-bit** — same `guid`, same `num_of_ROIs`, same
@@ -2217,7 +2216,9 @@ conditionality — the verdict box here, the gate itself at the end of this sect
 > extracts `evidence/control_SHIP_REAL.json`, `evidence/control_SHIP_REAL_READ.json`,
 > `evidence/control_SHIP_MINI.json`, `evidence/treatment_R3_REAL.json`. The floor composition and the
 > branch table are the rewrite plan's own
-> (`Archive/by-date/2026-10-13/attn-preamble-rewrite-plan/REPORT.md` §0–§0.5).*
+> (`Archive/by-date/2026-10-13/attn-preamble-rewrite-plan/REPORT.md` §0–§0.5; that archived copy
+> **predates the gate**, so its §0 headline still reads *"conditional on an inference"* — the
+> **pre-gate text, retained deliberately as the record**).*
 
 **What the node is.** The decode `ATTN_PREAMBLE` recipe compiles to **one** 111-node graph
 (engines: `None` 53 / `TPC` 47 / `DMA` 9 / `MME` 2), and **exactly one** of its nodes is a staging
@@ -2404,8 +2405,7 @@ is **2,421** rows — one fewer than the **2,422** this section carries — so i
 `dma_expected_duration` is **3717.6702440399486** rather than **3719.180392235825**. The difference is
 entirely the byte count at one bandwidth:
 `32768 × 2422 × 2 B ÷ 3719.180392235825 µs = 42.678271893281 GB/s` and
-`32768 × 2421 × 2 B ÷ 3717.6702440399486 µs = 42.677979913459 GB/s` — **the same bandwidth to six
-significant figures.** The row count is a KV-cache-sizing outcome of the engine build, not something
+`32768 × 2421 × 2 B ÷ 3717.6702440399486 µs = 42.677979913459 GB/s` — **the same bandwidth, agreeing to within ~7×10⁻⁶ relative.** The row count is a KV-cache-sizing outcome of the engine build, not something
 the experiment controls, and **control 1 is the 2,422-row reproduction** — so the two durations are one
 quantity evaluated at two row counts. **Do not read the one-row difference as a contradiction.**
 
@@ -2673,7 +2673,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **15** | **What SELECTS the fp8 exponent bias in a given recipe, and whether it is readable back.** The bias is **selectable** (`{3, 7, 11, 15}`, default **7**) and is carried **per op in the H2D scale tensor** (§3.4.1), but *which* mechanism sets it for a given op, and whether a compiled recipe's chosen bias is **observable** from a trace or a dump, is **not established**. This matters because §3.4.1's poison set is stated **for the default bias** — a recipe that selects another bias has a **different reserved bin**. | A recipe/dump inspection for a bias field, or a decode readout on an arm known to select a non-default bias. *(**Opened** by the bias finding — recorded rather than left implicit, so the closures of items 10 and 14 are not read as "fp8 is fully understood".)* |
 | **16** | **How a real `vllm serve` pins its workers end-to-end — and therefore whether a TP=N launch is deterministic or a race.** vllm-gaudi **never references `HLS_MODULE_ID`** (grep, whole tree) and calls `torch.accelerator.set_device_index(local_rank)`, which **does not route** to the device-acquire path (`HPUHooks` does not override `setCurrentDevice`). The measured per-rank mechanism (`HLS_MODULE_ID` distinct per rank) was proven on bare `torch_hpu` processes only; the vLLM integration was deliberately not run. Two further device-pinning questions sit in the same place: **(a)** whether the module-id table also restricts the driver's unpinned by-type choice (**UNKNOWN** — the PT-bridge does not consult it (**INFERRED**), but the driver/thunk level is not settled; `hpu_isolation` §10.2), and **(b)** what `torch.device("hpu", N)` does when N ≠ the pinned module's index (**MEASURED** for an unpinned process — the index is ignored and the bridge warns; only the *pinned* variant is untested). | Launch the **real TP=4 server** with and without `HLS_MODULE_ID` exported per rank, and read each worker's device off `hl-smi`'s process table / `hl-smi -Q index,module_id,memory.used -f csv,nounits`. For (a): a **discriminating** two-process arm — a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the processes take (the two-process arm we already have used the container's *full* table, so it cannot separate the table from the cgroup). For (b): one probe that pins module 6 and then allocates on `hpu:1` / `hpu:2`. *(Opened 2026-10-12; sources: `Archive/by-date/2026-10-11/hls_module_id/REPORT.md` §8, `hpu_isolation/REPORT.md` §10.1–§10.2.)* |
 | **17** | **The on-device semantics of the vendor MXFP4 op's GPT-SwiGLU / clamped path** — `bias_mxfp4_fused_weights` (`gpt_swiglu = true`, `mixture_of_experts_gen.cpp:1553`): the `limit`, the `alpha`, the `beta` / `(up+1)` term, and **the gate/up split layout**. **This is a different op and a different code path from the one we measured** — the non-bias `mxfp4_fused_weights` is `gpt_swiglu = false` (`:1441`) and its split is **measured as `halves`** (§3.4.7, row 3). The bias path's own split is **not** measured: a bridge test docstring (`tests/pytest_working/any_mode/test_hpu_mixture_of_experts_mxfp4.py:745`) says *interleaved*, while **vllm-gaudi**'s `swiglu_oai` reference (`vllm_gaudi/models/minimax_m3_sparse.py`) says split/first-half — a **doc-against-doc** disagreement we have not resolved. Do not read either document as evidence about the non-bias path. | A `bias_*` arm on a **non-degenerate** configuration (≥ 2 experts, random weights and biases — the vendor's own test shape). The probe's corner configuration (1 expert, `experts_min == experts_max`, identity `w12`, zero biases) **wedged the compute queue** with a 30 s timeout and was deliberately not retried. The cheapest first step is the **bf16** `bias_fused_weights` op, which traverses the same cguid GPT-SwiGLU lowering **without** the fp4 cast nodes, so it isolates whether the hang is fp4-specific. *(Opened 2026-10-12 by the vendor-op probe; §3.4.7; `Archive/by-date/2026-10-12/a1-probe/REPORT.md` §6 and `STATE_AFTER_HANG.md`.)* |
-| **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py:19-20`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
+| **18** | **The vendor MXFP4 op's decode *implementation* — two things about it are measured behaviour only.** **(a)** Whether its byte-255 e8m0 scale is `inf` or `NaN`: even `(code 0, byte 255)` — a weight of exactly `0.0` — returns NaN, which requires the *scale* to be non-finite, and the op **cannot distinguish** the two (`0 × either = NaN`). **(b)** The **mechanism of its flush-to-zero**: byte 0 → scale `2^-127` (an fp32 subnormal) is flushed to `0.0` for every nibble, and a bf16-subnormal product flushes too — measured behaviour, unmeasured cause. | Kernel source, which we do not have. *(Contrast our own stack, which **refuses** `0xFF` at load: §3.4.5; the checkpoint histogram showing `0xFF` is unreachable here — 0 occurrences in 8,858,370,048 routed-expert bytes — is at `src/gates/step_e8m0_byte255_gate.py`.)* *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §2.1 and `REPORT.md` §7 items 1–2.)* |
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
 | ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
@@ -2756,7 +2756,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 23. **A zero count in a log is a claim about the instrument first.** Before reading "0" as "it never
     happened", check whether the emitter is env-gated. **MEASURED:** the graph compiler's own
     instantiation handshake for the promoted fp4 LUT kernel prints **only** when
-    `FP4_WRAPPER_DEBUG=1` (`src/custom_ops/fp4_dequant/src/entry_points.cpp:43-53`, a variable read
+    `FP4_WRAPPER_DEBUG=1` (`src/custom_ops/fp4_dequant/src/entry_points.cpp`, a variable read
     nowhere else), so one arm's **0** `fp4_wrapper` lines read as "the kernel was never instantiated"
     when the debug flag was simply off and the kernel **had** been instantiated.
 24. **Check for the artifact before believing the exit code.** **MEASURED:** `HPU_DUMP=1` stalls the

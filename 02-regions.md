@@ -506,7 +506,7 @@ pass that prints the placement and the reason per node).
 > 1. **Register it in the EXISTING `custom_op` library — do not create a new namespace.** Add its
 >    `m.def` / `m.impl` lines to the existing `TORCH_LIBRARY(custom_op, …)` block and to the
 >    `TORCH_LIBRARY_IMPL(custom_op, HPU/Meta, …)` blocks (in this project,
->    `src/custom_ops/fp4_dequant/hpu_custom_fp4_dequant.cpp:42/45/48`), rather than shipping a new
+>    `src/custom_ops/fp4_dequant/hpu_custom_fp4_dequant.cpp`), rather than shipping a new
 >    extension under a new namespace.
 >    * **A defensive new namespace is exactly what costs you the overlap.** It is the natural thing
 >      to do — it is what `kchain` did, and the reason recorded in its own header is mechanical:

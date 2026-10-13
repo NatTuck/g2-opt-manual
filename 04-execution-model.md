@@ -666,10 +666,9 @@ own geometry (5.8 points/TPC) its measured span is **1.9131 µs**, which the pla
 R1's fp8 weight read — turns into a **0.2127 ms/step** floor over 43 layer-launches: **46.2×** against
 the port's **9.8171 ms/step** attention span (§3.6.5). *(Note it is **not** `43 × 1.9131 µs =
 0.0823 ms`: the 43 launches contribute only the `0.043 × i` term, `0.0823` of the `0.2127`.)* *(The
-plan has since revised R's floor to **`0.2324 ms/step` / 42.2×**, a different composition of the
-launch and handoff terms — that is the figure §3.6.5's gate discharged the condition for; this
-paragraph keeps the `tpc-launch-cost-vs-codesize` report's own arithmetic, which is where `0.2127` is
-computed.)* The same
+plan has since **corrected the handoff term** — `0.0044` was `43 × 2.482 ÷ 24` under the retracted
+`C_max = 24`, and `0.0213` is the corrected term — so **`0.2324 ms/step` / 42.2× governs** and
+**`46.2×` must not be quoted as R's floor**.)* The same
 source under `vliw-td` is **110** bundles at `a = 1.6972 µs`. So a fused body's floor is set by a
 number you can **read off a listing** before you run anything — and it is the number to read, because
 the plan's three candidate floors (0.2155 / 0.3076 / 0.8356 ms/step) are three **bundle counts**:
@@ -822,8 +821,8 @@ out[L] = a[ (L & ~3) | (b[L] & 3) ]      if (b[L] & 0x3C) == 0 and bit 7 of b[L]
 
 **One clause of that rule is *not* measured, and it is the one a kernel writer would act on.** The
 probe passes `income = BCAST(0)` — the call is `v_i8_shuffle_b(win, (uchar256)idx, 0, BCAST(0), 1, 0)`
-(`src/custom_ops/lutprobe/kernels/gaudi2/shuffle_repl_gaudi2.c:37`, with
-`#define BCAST(x) v_i8_mov_b((char)(x))` two lines above it at `:34`) — so **"the disabled lanes take
+in the `repl16` helper (`src/custom_ops/lutprobe/kernels/gaudi2/shuffle_repl_gaudi2.c`), with
+`#define BCAST(x) v_i8_mov_b((char)(x))` defined just above it) — so **"the disabled lanes take
 the `income` operand" and "the instruction writes zero" are indistinguishable in this probe.** What is
 *measured* is that the disabled lanes come out **0**; that the value came from the operand is **not**
 measured. The `= income` reading is the vendor header's *documented* semantics, not a device result.
