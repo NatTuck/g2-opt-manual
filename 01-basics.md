@@ -688,10 +688,15 @@ the cost model, so they set a variable nothing reads. **MEASURED:** a dumped nod
 whose only `tpc_*` key is `tpc_working_engines`** — the stock `relu_fwd_bf16` node compiled in the
 same process behaves identically — and across **every** node in every dump taken that session
 (**11** nodes in the `ENABLE_EXPERIMENTAL_FLAGS` run), the set of keys matching `cycle` or `asic` is
-**empty**. So **"not obtained"** is the accurate state. The companion field is
+**empty**. So **"not obtained"** is the accurate state. A larger, independent census in the **default**
+configuration (no `ENABLE_EXPERIMENTAL_FLAGS`) agrees: over **766 of 766 nodes** across six graph-dump
+sets (84 / 150 / 416 / 100 / 8 / 8 — the four surviving dump directories re-derive to **750 of 750**),
+`tpc_working_engines` is present on **every** node and `tpc_tpc_cycles` on **none**. The companion field is
 better understood: `tpc_working_engines` is the **dispatch width**, and it is now **exactly
 predictable** from the glue's declared index space —
-[Chapter 4 §4.2.8](04-execution-model.md).)*
+[Chapter 4 §4.2.8](04-execution-model.md) — as well as **exactly equal to the trace's `tid` count in
+14 of 14** dumped shapes, which is what makes it a cheap instrument you can trust
+([Chapter 4 §4.1.4](04-execution-model.md)).)*
 
 **Be precise about which kind of unknown this is.** We tried to settle it by looking the clock up
 in the shipped cost-model libraries and **could not complete that check** — so *that route* is

@@ -40,6 +40,22 @@ You need four nouns. They are nested:
 co-schedules **independent nodes inside one submission**; it does nothing across submissions.
 Every rule in §2.2–§2.5 is a consequence of that sentence.
 
+> **A submission has a *constructor* on this stack, not only a reader.** A hand-built Synapse C-API
+> graph — nodes created with `synNodeCreate`, edges expressed as **shared tensor handles** (there is
+> no explicit edge call; that is the normal Synapse idiom) — compiles to **one recipe** and dispatches
+> with **one `synLaunch`**. A 4-node dependent DAG (`relu` → `relu` → `concat` → `gemm`) compiles and
+> runs as one submission with every stage verified non-zero. **MEASURED.**
+>
+> **One lever that does *not* exist.** `synNodeSetUserProgrammability` **does** set a node's execution
+> rank, and the GC honours it by emitting `blocking_nodes` — but it is **coupled to a dependency**.
+> Applied to *independent* work it serialises the pair: forcing an independent DMA node to rank 0 made
+> the span **worse in 3 of 3 rounds** (min-of-3 **0.798 → 0.890 ms**, +11 %) and landed within 11 % of
+> the pure serial prediction `T(dma) + T(mme)`. **You cannot reorder independent work in this API
+> without creating an edge to it** — so "reorder without changing the dependency structure" is not
+> expressible, and any experiment that needs it must say so. **MEASURED.** *(Source:
+> `Archive/by-date/2026-10-13/recipe-capability/`; `synNodeDependencySet` is accepted and **inert** in
+> this configuration — an exported symbol returning `synSuccess` is not evidence the GC honours it.)*
+
 > **Two counts that are easy to confuse, and only one of them is the submission count.**
 > `LaunchRecipe` counts **recipe launches**, not device submissions. An `eager`-placed node runs
 > *outside* every recipe and emits **no** `LaunchRecipe` — so a body consisting only of one eager
@@ -243,6 +259,52 @@ does not touch it). Dependent body: `union(all) == Σ(families)` **exactly over 
 **+7.9 µs/call** to the union, i.e. **97 %** of it was already inside. *(This arm is normalised per
 **call**, not per step: 12 calls.)* Same ops, same
 shapes, same submission count, one edge. **MEASURED.**
+
+### What a dependency is enforced *on* — a byte range, not a node
+
+Condition 3 says "no dataflow edge". It is worth knowing exactly what the compiler does when there
+*is* one, because the granularity is **finer than the graph**.
+
+**The mechanism, from the compiler's own sync-scheme log.** A cross-engine edge lowers to a **counted
+semaphore** — a monotonic per-logical-engine counter (a "virtual sync object bank"; Gaudi 2 has four
+logical engine queues, MME / TPC / DMA / ROT). The producer's activation **increments** its engine's
+bank; the consumer's queue entry carries **at most one monitor per engine** — a 4-bit engine bitmap
+plus a **delta threshold** relative to the last dependency that node's queue recorded — and is
+released when the bank reaches it. On the runtime side it is a queue-manager fence + monitor. The
+encoding is asymmetric: the TPC bank advances **32** per activation, MME/DMA/ROT advance **1**.
+**MEASURED.**
+
+**The dependency is computed from byte ranges, so it is per (consumer, *overlapping byte-range*) and
+resolved to a producer activation** — not per node, and not per tensor. The consequence to carry is
+that **partial consumption is real, and the compiler arranges it.** In one observed recipe a TPC node
+sliced three ways is consumed by two consumers at two different granularities:
+
+```
+t0_bundle_0/op_0   (TPC)   pipeline 0/1/2 -> emits sig-vals 32 / 33 / 34
+  .../memcpy/0     (DMA)   waits on TPC >= 32, then >= 33, then >= 34   <- per slice
+  mm0_bundle_0/op_2 (MME)  waits on TPC >= 34                           <- the whole node
+```
+
+— the DMA copy pipelines against the producer's slices while the GEMM waits for all of it. **Same
+producer, same recipe, two granularities, chosen by the ROI overlap. MEASURED.**
+
+**And same-engine ordering costs nothing.** Two slices of one TPC node both read
+`Dependencies (monitors): none`; within-engine order is **queue order**, and every monitor observed
+was cross-engine. So the asymmetry that matters is **same-engine (free) vs cross-engine (a monitor)**,
+not one engine versus another. **MEASURED.** *(Source:
+`Archive/by-date/2026-10-13/dependency-semantics/` — `REPORT.md` §2, §4, §5.2.)*
+
+**What an edge costs in wall clock: a measured negative, with a bound.** Across the **11 cross-engine
+arm-pairs** of a 13-row matrix (the two `TPC→TPC` rows are the fusion case and are excluded; each arm
+is one graph → one recipe → one `synLaunch`, `min` over 30–40 reps, physical module 3), every
+`T(dep) − T(indep)` lies within **±8.0 µs** with **mixed signs** — the two cleanest large-node pairs
+being **+3.8 µs on 540 µs (0.7 %)** and **+8.0 µs on 533 µs (1.5 %)**. The timer's own floor is
+**27.5–33.3 µs** and its resolution on a difference of two arms is **≈ ±5 µs**, so the per-edge
+handoff is **< ~8 µs and consistent with 0 — below this instrument's resolution.** And the
+zero-absorption regime is visible in the ratio, not merely hidden under the floor: at TPC:MME =
+**1:12** the *independent* pair already measures **1.04–1.17× the sum** of its two solo times (four
+pairs). **MEASURED negative, with a bound.** The practical rule: **do not price a dependency in wall
+clock; price it in execution windows** (`CROSS`, above).
 
 ### How to check each condition
 
@@ -1175,7 +1237,9 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
 | `mme_node_strategy` | MME | the geometry string (`Name=`, `Width=`, `Height=`, `Pattern=`, `BatchConcurrency=`, …) |
 | `mme_expected_compute_cycles`, `unsliced_expected_compute_cycles`, `unsliced_expected_compute_utilization`, `rollups` | MME | the MME cost model |
 | `dma_expected_duration` | DMA | the DMA cost model, µs (**a lower bound — see below**) |
-| `tpc_working_engines` | some TPC | which TPCs the kernel was compiled for |
+| `tpc_working_engines` | all TPC | **the number of TPCs that ROI runs on** — an array with **one entry per ROI** (`[24]`, `[24,24,24]`), not a list of TPC ids. It is present on every TPC node in the census behind [Chapter 1 §1.7](01-basics.md) (**766 of 766** nodes) and equals the trace's `tid` count in **14 of 14** dumped shapes. *(The TPC *cycle* fields `tpc_tpc_cycles` / `tpc_asic_cycles` / `tpc_asic_time` are **not obtainable** — §1.7.)* |
+| `num_of_ROIs` | all nodes | how many **passes** the node's index space is cut into — one `tpc_working_engines` entry per ROI. It is the **wave counter**: stock `relu_fwd_bf16` = 3, an archived `relu_fwd_f32` on 128 MB = 8, our custom nodes = 1 even at 128 MB. **The ROIs execute serially.** |
+| `blocking_nodes` | all nodes | the compiler's own statement of which nodes this one waits on — **`[]` means independent**, and it is the field to read before claiming two nodes can co-schedule. It is also the observable for a **user-imposed** order: `synNodeSetUserProgrammability` makes the GC emit them (§2.1). |
 
 **Three things the dump gives you that a trace cannot:**
 

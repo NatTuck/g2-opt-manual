@@ -45,6 +45,11 @@ confuse, and each has a different unit:
 about another: a kernel can be perfectly packed at the bundle level and still be memory-bound, and a
 recipe can carry a flawless bundle schedule and have zero cross-engine overlap.
 
+**And there is no fourth level.** The concurrency inside a TPC is not "more work items per core" —
+the TPC is a **single-context** core, so there is no wave, no warp and **no occupancy to tune**. The
+negative is stated with its evidence in §4.1.4, and it is load-bearing: it is what makes §4.1.2 a
+`MAX` rather than a `SUM`.
+
 ### 4.1.1 Intra-instruction: `{...}` is a 4-slot VLIW bundle
 
 A `{...}` group in a `tpc-clang -S` listing is **not a textual grouping — it is the machine's issue
@@ -114,7 +119,9 @@ can hide *load/store/scalar* work behind vector work; it **cannot** multiply vec
 
 The second level is *within* a single TPC and needs **no same-cycle issue at all**. The load/store
 slots hand requests to the memory system, which drains them **asynchronously** while the vector pipe
-keeps issuing. The measured relation is a **max**:
+keeps issuing. **This is the only overlap a TPC has** — the core is single-context, so there is no
+second work item to fill the pipe while the memory drain proceeds (§4.1.4) — which is why the
+relation below is a `MAX` and not a sum. The measured relation is a **max**:
 
 ```
 t_ALU = 6.436 + 0.8189 × (instr/iteration)   µs
@@ -160,6 +167,61 @@ whose violation gives a *small, non-discriminating* `CROSS` rather than zero
 instruction scheduling. A perfectly packed kernel (§4.2) does nothing for it, and vice versa. For how
 much overlap is *worth*, and the occupancy law that says the wall tracks the **union** and not the sum,
 see [§2.6](02-regions.md) and [chapter 0](00-tldr.md#the-one-measurement-rule-that-changes-what-you-optimise).
+
+### 4.1.4 There is no fourth level: no wave, no warp, no occupancy
+
+The three levels above are all there is, and the negative is load-bearing enough to state with its
+evidence: **the TPC is a single-context core.** There is no wave, no warp, no lockstep width below
+the register, no work-item notion distinct from the index space — there is no lane id either: the
+compiler's own string table carries `v_lane_id_8/16/32` and the call is **rejected**
+(`Archive/by-date/2026-10-12/vector-op-throughput/` §5.4) — and **no occupancy to tune**.
+
+**No lockstep width below the register.** A 256-lane `i8` kernel and a 64-lane `f32` kernel with the
+**same skeleton, the same inner trip count and the same number of index-space points** take the
+**same time** — because one instruction consumes the whole 256-byte register either way (§4.3.1).
+Same kernel family (`dep`, `U = 4`), same shapes, `n = 15`, `warm = 4`, and the three rows below are
+the ones where **both arms get the same `WE`** so the comparison is like for like:
+
+| `P` | `i8` (256 lanes) `dur med` | `f32` (64 lanes) `dur med` | ratio | tids (`i8`/`f32`) | elements/point |
+|---:|---:|---:|---:|---:|---:|
+| 192 | 2.400 µs | 2.480 µs | 0.968 | 24 / 24 | 1024 / 256 |
+| 2048 | 8.091 µs | 8.481 µs | 0.954 | 24 / 24 | 1024 / 256 |
+| **8192** | **26.400 µs** | **28.480 µs** | **0.927** | 24 / 24 | 1024 / 256 |
+
+The `i8` arm moves **4× the elements** per instruction and is the *faster* one at the largest shape.
+If the machine had a narrower lockstep width — 64 lanes, say — the 256-lane op would have to issue
+four times and would take ~4× as long. It does not. **MEASURED.**
+
+**No occupancy.** The direct experiment is four `torch.compile` graphs, each containing **two
+independent TPC nodes** — the compiler's own `blocking_nodes = []` on both, and
+`tpc_working_engines = [24,24,24]` on both — i.e. every configuration in which two TPC work items
+could be co-resident. On **every** TPC the two kernels run **strictly back to back**:
+`cross_name_overlap_pairs = 0` in all four graphs, and a **running-max-end** interval census (a long
+event containing two short ones is caught; adjacent-pair comparison is not enough) over **34,702
+kernel events** finds **zero** overlapping intervals on any `tid`, anywhere. **MEASURED.**
+
+**ROIs are waves, and they serialise too.** The stock `relu_fwd_bf16` node carries
+`num_of_ROIs = 3` with `tpc_working_engines = [24,24,24]`; the trace shows **6 events per TPC per
+iteration** (2 nodes × 3 ROIs) and still **zero** overlap. Every level of the hierarchy — points
+within a TPC, ROIs within a node, nodes within a recipe — executes **one work item at a time**.
+**MEASURED.**
+
+**The consequence, stated once, because it is the whole reason this subsection exists:**
+
+> **Because a TPC has no second context, nothing inside a TPC can hide anything else's latency.**
+> The only overlap available inside a TPC is the **asynchronous memory drain** of §4.1.2 — the load
+> and store slots hand requests to the memory system and the vector pipe keeps issuing while they are
+> *in flight*. That is a throughput overlap between two resources, not co-residency, and it is
+> exactly why §4.1.2's relation is `t = MAX(t_ALU, t_mem)` rather than `t_ALU + t_mem`.
+
+It also explains two results the chapter already carries, both of which were previously described
+only as measurements: §4.2.7's `vliw-td` win and §4.3.5's 1.47× restructuring win are **pure schedule
+edits**, and they are worth exactly what they remove from the schedule — the machine has nothing else
+to issue into the NOP slots. **And it is the reason the index space is the only work-division knob
+there is**: more points per TPC is not parallelism, it is queue depth (§4.2.9).
+
+*Artifact: `Archive/by-date/2026-10-13/tpc-wave/` — `REPORT.md` §1 and §3, `tools/overlapcheck.py`,
+`json/dt_cmp.json`, `json/two_node.json`.*
 
 ---
 
@@ -370,7 +432,11 @@ vector chain should be re-scheduled before it is believed to be at a ceiling.** 
 
 The model in §4.2.1 is **per TPC**, so its last term is the split: how many TPCs the node runs on —
 `WE`, the `tpc_working_engines` field. **It is computed exactly, and it is predictable on the host
-with no device. MEASURED: 1,579 device-measured `WE` values, 0 wrong.**
+with no device. MEASURED: 1,579 device-measured `WE` values, 0 wrong** — and, independently, the
+field equals the trace's own `tid` count in **14 of 14** dumped shapes. **Observed values over ~55
+swept shapes are 4, 16, 22 and 24: "24 TPCs per launch" is shape-dependent, not a machine constant.**
+Read `tpc_working_engines` out of the dump ([§2.10](02-regions.md)) before believing a kernel uses
+all 24.
 
 **The input is the index-space grid, in the graph compiler's own dim order — and the GC's dim 0 is the
 *torch-last*, fastest-varying dim.** For a torch tensor `(d0, d1)` and a glue whose AP is
@@ -425,6 +491,69 @@ control found.
 *Artifact: `Archive/by-date/2026-10-13/we-rule/` — `REPORT.md` §2, and `we_model.py`, which predicts
 `WE` for any shape with no device.*
 
+### 4.2.9 How long does a node take? — the index space is the work-division unit
+
+§4.2.8 says how many TPCs a node gets. This is the other half of the same model: **what a node's time
+is denominated in.** It is the **index-space point** — not the byte, and not the tensor.
+
+The graph compiler builds a 5-D index space for every TPC node (`indexSpaceGeometry`) and hands each
+TPC a *slice* of it. The number of points is
+
+```
+P = ∏_d ceil( size_d / a_d )        a = the TensorAccessPattern's elements per index-space unit
+```
+
+and the per-TPC time is that slice's points times the per-point bundle cost, plus a fixed term:
+
+```
+per-TPC time ≈ (P / WE) × (bundles per point) × 0.556 ns   +   a per-TPC fixed term
+```
+
+**The decisive experiment sweeps `P` at fixed per-point work.** One binary
+(`wave_i8_dep_U4`, whose inner loop is `#pragma unroll 4`, so one point is exactly 4 inner iterations
+= **125 bundles**), shape `(256, 4P)`, `P = 1 … 131072`, only the shape changing. `n = 20`,
+`warm = 5`; linear fit over the four largest `P` (2048, 8192, 32768, 131072):
+
+```
+dur_med (µs) = 1.9799 + 0.002983 · P          R² = 1.000000
+slope × 24   = 71.60 ns per point per TPC     (bundle model 125 × 0.5556 = 69.45 ns → 1.031×)
+```
+
+| `P` | `WE` | `dur med` | ns/point/TPC | per-TPC spread | one point is (`24/P`) |
+|---:|---:|---:|---:|---:|---:|
+| 512 | 24 | 3.5200 µs | 197.5 | 31.8 % | 4.7 % |
+| 8192 | 24 | 26.4800 µs | 80.14 | 4.5 % | 0.29 % |
+| 32768 | 24 | 99.681 µs | 73.68 | — | 0.07 % |
+| 131072 | 24 | 393.041 µs | 72.10 | **0.33 %** | 0.02 % |
+
+**The split is even, and the per-point cost is the bundle cost.** `ev/tid` is exactly `n` at every
+`P` — one kernel event per TPC per launch, even at 5,461 points per TPC — and the spread of per-TPC
+durations collapses from 31.8 % at `P = 512` to **0.33 %** at `P = 131072`, in step with the point's
+shrinking share of the slice. The measured slope sits **3.1 %** above the bundle model's 69.45 ns —
+the same small memory-system residual the co-issue study found (§4.1.2), and the reason the `copy`
+control below does not follow this law at all. **MEASURED.**
+
+**And the access pattern's `a` is a first-class knob, not cosmetics.** Same kernel binary, same 16 MB
+tensor, only the glue's `a[1]` overridden: `a = 2` (`P = 4096`) → **14.24 µs**, `a = 32` (`P = 256`)
+→ **2.72 µs** — **5.235×** from the access pattern alone, at a marginal 71–75 ns per point per TPC
+against the same 69.45 ns model (`dur_med = 1.9667 + 0.002995·P`, R² = 0.999988). **MEASURED.**
+*(Quote `a` with every throughput number — the earlier studies held it fixed and used "identical AP"
+as a control, which is correct practice, but the value is part of the result.)*
+
+**Two caveats, both load-bearing.**
+
+* **This is an *issue-bound* law, and it does not describe a streaming kernel.** The `copy` arm
+  (2 loads + 1 store, 2.75 bundles/iteration) at the same shapes goes `P = 1` → 0.642 µs and
+  `P = 2048` → 1.360 µs, i.e. 28,438 → 23.0 ns per point per TPC against a 6.11 ns prediction: it
+  sits on the memory floor instead. That is §4.1.2's `MAX` structure, not a failure of this one.
+* **At small `P` you are measuring the fixed term, not the kernel.** At `P = 1` the bundle model
+  predicts **0.07 µs** and the measurement is **2.0 µs** — and the fixed term is itself not fixed
+  (§4.2.8's ⚠ note: **1.26–16.4 µs**, tracking the kernel's unrolled code size, cause UNKNOWN). Any
+  small-shape microbenchmark on this machine is measuring that term.
+
+*Artifact: `Archive/by-date/2026-10-13/tpc-wave/` — `REPORT.md` §2 and §5, `json/psweep_dep.json`,
+`json/roi_sweep.json`, `json/confirm.json`, `json/drive.json`.*
+
 ---
 
 ## 4.3 Vector registers and dtype rules
@@ -440,7 +569,9 @@ A TPC **vector register is 256 bytes**, and there is exactly **one** native lane
 | 32-bit | **64** | `f32`, `i32` |
 
 **MEASURED.** There are **no** 128- or 64-lane variants of the 8-bit ops and no 32-lane variants of the
-16-bit ops — `v_i8_*` is always a 256-lane type.
+16-bit ops — `v_i8_*` is always a 256-lane type. **The register is also the machine's SIMD width, and
+there is no narrower lockstep unit below it**: a 256-lane `i8` op and a 64-lane `f32` op with the same
+instruction count cost the same, because each consumes one whole register (§4.1.4).
 
 ### 4.3.2 Cost is per **register**, not per element
 
@@ -683,6 +814,8 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | 7 | **The exact fixed per-launch term** | estimates range **0.8–4.0 µs** across fits, and the cross-arm fit and the per-kernel size fits disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level. **Widened 2026-10-13:** there is no single fixed *per-TPC* term either — §4.2.8 measures **1.26–16.4 µs** at one point per TPC, tracking the kernel's unrolled code size (cause UNKNOWN) | a fit that identifies the second-order term (outer-loop / first-touch), a clock that can be pinned, or a disassembly that names the per-TPC overhead |
 | 8 | **Whether the bundle win generalises in wall time to the other kernel families** | **NOT MEASURED** — bundle ratios exist for 12 more kernels (up to 1.84×); only the fp4 kernel was timed | time the `lutptr` / `lut` arms |
 | 9 | **The TPC ELF encoding** | no `tpc-objdump`/`llvm-objdump` in the image. `.text` bytes per bundle are 21.3–23.1 across seven kernels (~22), consistent with a fixed-width bundle word plus a variable-length immediate extension — but that is **INFERRED** from byte counts | a disassembler |
+| 10 | **Whether the *silicon* can host two TPC contexts** | **INFERRED: no — but only the scheduler was tested directly.** What is MEASURED is that the runtime never co-schedules two independent TPC nodes, both wanting all 24 TPCs (34,702 kernel events, 0 overlapping intervals on any `tid`); whether the hardware could interleave two SPU contexts if a runtime asked it to is not observable from Python, and we found no way to force a second task onto a TPC | a Synapse C++ recipe with two TPC nodes whose `tpc_working_engines` overlap — the archived multi-node recipe harness (`Archive/by-date/2026-10-11/synapse_cpp/`) is the starting point. If it still serialises, "single-context" is a statement about the hardware; if it overlaps, about the GC's scheduler |
+| 11 | **The split pattern — is a TPC's index-space slice contiguous or strided?** | **UNKNOWN** — not observable from the trace, which gives per-TPC durations and not addresses | a kernel that writes its slice's first index-space offset into a per-TPC output element, then reads the 24 values back |
 
 ---
 
@@ -705,6 +838,13 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
    dead one (the 22 = 22 LUT case).
 8. **`shuffle.i8` does not do a cross-lane gather under the tested call structure** — the 16-element
    replication is refuted; whether it is ISA or lowering is open.
+9. **There is no wave, no warp, and no occupancy.** The TPC is single-context: a 256-lane and a
+   64-lane kernel with the same instruction count cost the same, and two independent TPC nodes
+   serialise on every TPC. Nothing inside a TPC hides anything else's latency — which is why the
+   intra-TPC relation is a `MAX` and not a sum.
+10. **Count index-space points, not bytes.** `P = ∏_d ceil(size_d / a_d)` spread over `WE` TPCs at the
+    per-point bundle cost; the access pattern's `a` moved a fixed 16 MB tensor **5.235×** with an
+    unchanged binary.
 
 ---
 
@@ -718,4 +858,5 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | the nine-dtype sweep, widths, folding, ILP, pack/unpack, the operand-aware gate | `Archive/by-date/2026-10-12/vector-op-throughput/` (`tools/isa_gate.py`, `listings2/`) |
 | the `shuffle.i8` refutation, the constant-index rule, the `switches` sweep, the W1 22-instruction case | `Archive/by-date/2026-10-12/lut-build/` (`REPORT.md` §5) and `Archive/by-date/2026-10-12/lut-verify/` |
 | the `+6.08 µs` shuffle/`sel` price over the copy floor | `Archive/by-date/2026-10-12/vector-op-throughput/` (`REPORT.md` §Q4) |
+| no wave / no warp / no occupancy, the index-space point law and the `a` lever, the `WE`-is-not-24 set, the `tpc_working_engines` / `tpc_tpc_cycles` dump census | `Archive/by-date/2026-10-13/tpc-wave/` (`REPORT.md` §1–§5, `tools/overlapcheck.py`, `tools/dumpfields.py`, `json/`) |
 | the build path, the zero-edit route, the 14-kernel bit-exactness, the scheduler set, the `.text`-not-`.o` rule | `Archive/by-date/2026-10-13/vliw-buildpath/` (`REPORT.md`) — archived 2026-10-13, **text only**: the `.o`/`.so`/`.pt` build outputs are excluded as regenerable (12.0 MB with them, 3.8 MB without) |
