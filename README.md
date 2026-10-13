@@ -1,6 +1,6 @@
 # Gaudi 2 HPU Optimization Manual
 
-**Status: DRAFT.** Three chapters are written and filled with measured material. Gaps are
+**Status: DRAFT.** Four chapters are written and filled with measured material. Gaps are
 marked explicitly rather than left blank or guessed — each chapter carries its own
 **UNKNOWN register**, and chapter 3 also carries a **dead-end register**.
 
@@ -46,6 +46,7 @@ those in from general knowledge.**
 | 1 | [Gaudi/HPU Basics](01-basics.md) | ~900 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
 | 3 | [Porting a large language model to HPU](03-porting.md) | ~2,000 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the four had gone stale** — chapter 1 read 944 against an

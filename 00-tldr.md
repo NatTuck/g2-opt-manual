@@ -88,6 +88,10 @@ The stale framing is the single most likely thing to send you optimising the wro
 
 ---
 
+**And when you write your own TPC kernel, the unit of cost is the VLIW *bundle*, not the instruction** — a `{...}` group in a `tpc-clang -S` listing is a 4-slot issue bundle, the device retires one per cycle, and the shipping scheduler leaves 1.2–3.4× of bundle count on the table. → *[Chapter 4](04-execution-model.md)*
+
+---
+
 **Tagging convention** (used throughout): **MEASURED** / **ASSUMED** / **INFERRED** /
 **UNKNOWN**. See `README.md`. The numbers above are from one workload on one box — treat the
 *shape* of each fact as general to Gaudi 2 and the specific figures as that workload's.
