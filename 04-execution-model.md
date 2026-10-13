@@ -649,7 +649,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 |---|---|
 | the 4-slot bundle, the listing identity, the 1-bundle/cycle model, the scheduler lever, the decisive pair | `Archive/by-date/2026-10-12/tpc-coissue/` (`REPORT.md`, `tools/vliw.py`, `tools/bundles.py`) |
 | the emitted-slot rate, the NOP-inclusive count, the *copy* arm's `5.954 µs` floor, the TPC-clock query absence | `Archive/by-date/2026-10-12/tpc-issue-rate-ceiling/` (`tools/slots.py`) |
-| the `MAX(t_ALU, t_mem)` pipe-overlap model (the `t_ALU` fit, `t_mem = 15.334 µs`) | `Archive/by-date/2026-10-09/fp4_arith/` (`README.md` §1.6), re-fit in `Archive/by-date/2026-10-12/arith_review/` (`FINDINGS.md` §3) |
+| the `MAX(t_ALU, t_mem)` pipe-overlap model (the `t_ALU` fit, `t_mem = 15.334 µs`) | `Archive/by-date/2026-10-09/fp4_arith/` (`README.md` §1.6), re-fit in `Archive/by-date/2026-10-12/arith_review/` (`FINDINGS.md` §3); coefficients restated in `Archive/by-date/2026-10-12/tpc-coissue/` (`REPORT.md` §5) |
 | the nine-dtype sweep, widths, folding, ILP, pack/unpack, the operand-aware gate | `Archive/by-date/2026-10-12/vector-op-throughput/` (`tools/isa_gate.py`, `listings2/`) |
 | the `shuffle.i8` refutation, the constant-index rule, the `switches` sweep, the W1 22-instruction case | `Archive/by-date/2026-10-12/lut-build/` (`REPORT.md` §5) and `Archive/by-date/2026-10-12/lut-verify/` |
 | the `+6.08 µs` shuffle/`sel` price over the copy floor | `Archive/by-date/2026-10-12/vector-op-throughput/` (`REPORT.md` §Q4) |
