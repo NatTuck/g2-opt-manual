@@ -1895,8 +1895,9 @@ We got this wrong once by quoting the relation without its limits. Do not repeat
 
 **The column is the family's own UNION — its device *occupancy* — and it is NOT a removal price.**
 That distinction was missing from this table until 2026-10-13, and the header even called the column
-`merged`; it is not `merged` (which is the whole step's union, **66.1349 ms/step**), it is the
-family's own busy-set union.
+`merged`; it is not `merged` (the whole step's device union, **66.1349 ms/step** — measured on the
+**`lad_traceW0`** arm, **rank 0**, 4 decode steps; a different trace of the same model gives a
+different `merged`), it is the family's own busy-set union.
 
 | family | ops/step | union ms/step | **leave-one-out (LOO)** | **LOO / union** |
 |---|---:|---:|---:|---:|
@@ -1936,8 +1937,9 @@ not in the top three by time. **Count and cost are different questions.**
 > *Two controls from the same artifact, because the table alone cannot tell you which regime you are
 > in.* **(a)** For a **handle-complete** span the trace price is essentially exact: the one clean
 > single-variable ablation the archive holds (W1 = W0 with the `fp4_dequant` device body removed, same
-> op, same signature, same launches, same recipes) takes `merged` **66.1349 → 51.5456**, a **−14.5892**
-> fall, of which `Δ own_union(MOE_ROUTED) = −14.5465` is **99.7 %**. **(b)** For a cut **inside a
+> op, same signature, same launches, same recipes) takes `merged` **66.1349 → 51.5456** (the same
+> `W0` arm, rank 0, as above), a **−14.5892** fall, of which
+> `Δ own_union(MOE_ROUTED) = −14.5465` is **99.7 %**. **(b)** For a cut **inside a
 > run** the trace is a **lower bound** and under-prices by a measured **21.1 %**
 > (LSO predicts W1 `merged = 54.0936`, measured 51.5456 — the complement's union *shrinks* by 2.55 ms
 > once 22.6 ms of TPC work vanishes, because the non-fp4 events **inside the same recipes**

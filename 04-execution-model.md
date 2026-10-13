@@ -295,7 +295,7 @@ count:
 | `vecop_i8_sel_K8` | 35.25 | 11.75 | 3.000 | 12.75 → 13.75 |
 | `vecop_i8_sel_K16` | 67.25 | 19.50 | **3.449** | 20.75 → 21.75 |
 | `vecop_i8_decbody` (fp4 `dec()` verbatim) | 75.00 | 63.00 | **1.190** | 66.75 → **71.75** |
-| shipped `fp4_dequant_base` | 76.00 | 65.00 | 1.169 | 70.75 → **77.25** |
+| `fp4_dequant_base`, **pre-guard revision** (today's shipped source compiles to **84.50 → 69.25**, §4.2.4) | 76.00 | 65.00 | 1.169 | 70.75 → **77.25** |
 
 **MEASURED.** Read the last column: the packed build has **more** instructions. It is not winning by
 doing less work.
@@ -408,12 +408,12 @@ structural.**
 
 ### 4.2.7 Headroom — and the 4× that was never there
 
-| | bundles/iter | vs arithmetic floor |
-|---|---:|---:|
-| fp4 `dec()` body, shipped | 75.00 | 1.220× |
-| fp4 `dec()` body, `vliw-td` | 63.00 | **1.024×** |
-| shipped `fp4_dequant_base` | 76.00 | 1.192× |
-| shipped `fp4_dequant_base`, `vliw-td` | 65.00 | **1.028×** |
+| kernel | bundles/iter | **arithmetic floor** | vs floor |
+|---|---:|---:|---:|
+| fp4 `dec()` body, default build | 75.00 | **61.5** | 1.220× |
+| fp4 `dec()` body, `vliw-td` | 63.00 | **61.5** | **1.024×** |
+| `fp4_dequant_base`, **pre-guard revision** | 76.00 | **63.75** | 1.192× |
+| `fp4_dequant_base`, **pre-guard revision**, `vliw-td` | 65.00 | **63.25** | **1.028×** |
 
 **The available headroom on the fp4 stage is ≈1.19×, and `vliw-td` captures essentially all of it.**
 The fp4 body is **VPU-bound** (61.5 vector ops in 63.00 bundles = 1.024× off its own floor), so **no
@@ -478,7 +478,8 @@ those two are exactly the two terms of that formula.)*
 
 **The kernel body does not matter at all** (three kernels at 2.75 / 31.25 / 20.0 bundles per iteration,
 same grid → identical `WE`), and neither does the graph context. **The glue's `preferredSplitDim` is not
-a lever either — a measured negative** (25 device compiles over 7 shapes × `{0,1,2,3}` give an identical
+a lever either — a measured negative** (**22** device compiles — four shapes ×
+`preferredSplitDim ∈ {0,1,2,3}`, plus three more shapes × `{0,2}` — give an identical
 `WE`, including `(256,1024)` → 22 where a dim-0-first split would have given 24; the glue prints the
 value it sets, so this is not a null test), which leaves the declared index space as the only `WE`
 control found.
@@ -530,7 +531,7 @@ dur_med (µs) = 1.9799 + 0.002983 · P          R² = 1.000000
 slope × 24   = 71.60 ns per point per TPC     (bundle model 125 × 0.5556 = 69.45 ns → 1.031×)
 ```
 
-| `P` | `WE` | `dur med` | ns/point/TPC | per-TPC spread | one point is (`24/P`) |
+| `P` | `WE` | `dur med` | `ns/point/TPC` (`span_med × 24 / P`) | per-TPC spread | one point is (`24/P`) |
 |---:|---:|---:|---:|---:|---:|
 | 512 | 24 | 3.5200 µs | 197.5 | 31.8 % | 4.7 % |
 | 8192 | 24 | 26.4800 µs | 80.14 | 4.5 % | 0.29 % |
@@ -555,12 +556,19 @@ as a control, which is correct practice, but the value is part of the result.)*
 
 * **This is an *issue-bound* law, and it does not describe a streaming kernel.** The `copy` arm
   (2 loads + 1 store, 2.75 bundles/iteration) at the same shapes goes `P = 1` → 0.642 µs and
-  `P = 2048` → 1.360 µs, i.e. 28,438 → 23.0 ns per point per TPC against a 6.11 ns prediction: it
-  sits on the memory floor instead. That is §4.1.2's `MAX` structure, not a failure of this one.
-* **At small `P` you are measuring the fixed term, not the kernel.** At `P = 1` the bundle model
-  predicts **0.07 µs** and the measurement is **2.0 µs** — and the fixed term is itself not fixed
-  (§4.2.8's ⚠ note: **1.26–16.4 µs**, tracking the kernel's unrolled code size, cause UNKNOWN). Any
-  small-shape microbenchmark on this machine is measuring that term.
+  `P = 2048` → 1.360 µs, i.e. **28,438 → 23.0 ns per point per TPC** (a `span`-based rate — the two µs
+  figures beside it are `dur_med`) against a 6.11 ns prediction: it sits on the memory floor instead.
+  That is §4.1.2's `MAX` structure, not a failure of this one.
+* **At small `P` you are measuring the fixed term, not the kernel — and the row the sweep labels
+  `P = 1` is not one point.** That row is shape `(256, 4)`, whose real index-space grid is
+  `[ceil(4/256), ceil(256/4)] = [1, 64]`: **64 points over 22 TPCs**, whose work term is **~0.2 µs** on
+  top of a **1.8 µs** residue — measured `dur_med` **2.0 µs**. *(So it is not the 30× model error a
+  literal `1 point × 125 bundles × 0.556 ns = 0.07 µs` would suggest; the same relabelling applies to
+  the sweep's `P = 96` row, which is really 128 points. Artifact: `Archive/by-date/2026-10-13/we-rule/`
+  — `REPORT.md` §3-Q6 and §4 correction 1.)* The fixed term is itself **not constant** — §4.2.10
+  measures it directly as a **sublinear function of the emitted bundle count**, and §4.2.8's ⚠ note
+  records that the four residue figures it used to carry are **bundle-model complements, not
+  measurements**. Any small-shape microbenchmark on this machine is measuring that residue.
 
 *Artifact: `Archive/by-date/2026-10-13/tpc-wave/` — `REPORT.md` §2 and §5, `json/psweep_dep.json`,
 `json/roi_sweep.json`, `json/confirm.json`, `json/drive.json`.*
@@ -589,7 +597,7 @@ a (µs) = 0.6706 + 8.8911 ns × bundles        R² = 0.9766   rms 0.498 µs
 a (µs) = 0.0531 × bundles^0.736              R²(log-log) = 0.9434   ← SUBLINEAR
 ```
 
-`a / bundles` **falls** from **15.7 ns at 64 bundles to 8.7 ns at 2,029** — the cost per bundle
+`a / bundles` **falls** from **15.7 ns at 64 bundles to 8.6 ns at 2,029** — the cost per bundle
 *declines* with code size, which is why the exponent is 0.74 and not 1. **MEASURED.** *(Population
 note: the regression is over **65 arm-level intercepts**, each itself fitted over its own `n = 30`
 sweep. The 425 points are the campaign's size, not the regression's.)*
@@ -651,8 +659,11 @@ it is cheap to test on the archived multi-node path and it gates nothing.)*
 
 **What the law is for.** It converts a **compile output** into a floor. A fused kernel of **six**
 mixed-op stages at `U = 2` compiles to **147** bundles and fits `a = 1.7715 µs` (R² 0.99946); at its
-own geometry (5.8 points/TPC) its measured span is **1.9131 µs**, i.e. a **0.2127 ms/step** floor over
-43 layer-launches — **46.2×** against the port's **9.8171 ms/step** attention span (§3.6.5). The same
+own geometry (5.8 points/TPC) its measured span is **1.9131 µs**, which the plan's floor arithmetic —
+`floor = 0.1260 + 0.043 × i + 0.0044 ms/step`, where `i` is the per-launch term in µs and `0.1260` is
+R1's fp8 weight read — turns into a **0.2127 ms/step** floor over 43 layer-launches: **46.2×** against
+the port's **9.8171 ms/step** attention span (§3.6.5). *(Note it is **not** `43 × 1.9131 µs =
+0.0823 ms`: the 43 launches contribute only the `0.043 × i` term, `0.0823` of the `0.2127`.)* The same
 source under `vliw-td` is **110** bundles at `a = 1.6972 µs`. So a fused body's floor is set by a
 number you can **read off a listing** before you run anything — and it is the number to read, because
 the plan's three candidate floors (0.2155 / 0.3076 / 0.8356 ms/step) are three **bundle counts**:
@@ -799,20 +810,35 @@ could be replicated across 256 lanes in **one instruction**.
 vector (so any `DEST[L] = f(b[L])` semantics must produce a constant output — and it does not):
 
 ```
-out[L] = a[ (L & ~3) | (b[L] & 3) ]     if (b[L] & 0x3C) == 0 and bit 7 of b[L] is set
-       = income                          otherwise
+out[L] = a[ (L & ~3) | (b[L] & 3) ]      if (b[L] & 0x3C) == 0 and bit 7 of b[L] is set
+       = <the `income` operand, passed in>   otherwise   -- see the caveat below
 ```
+
+**One clause of that rule is *not* measured, and it is the one a kernel writer would act on.** The
+probe passes `income = BCAST(0)` — the call is `v_i8_shuffle_b(win, (uchar256)idx, 0, BCAST(0), 1, 0)`
+(`src/custom_ops/lutprobe/kernels/gaudi2/shuffle_repl_gaudi2.c:37`, with
+`#define BCAST(x) v_i8_mov_b((char)(x))` two lines above it at `:34`) — so **"the disabled lanes take
+the `income` operand" and "the instruction writes zero" are indistinguishable in this probe.** What is
+*measured* is that the disabled lanes come out **0**; that the value came from the operand is **not**
+measured. The `= income` reading is the vendor header's *documented* semantics, not a device result.
+*(Both source artifacts say so in as many words. The probe's own report, under "what I could not
+determine": "`income` vs a literal zero: `income = BCAST(0)`, so … are indistinguishable in my probe" —
+`Archive/by-date/2026-10-12/lut-build/` `REPORT.md` §5.6. And the report that first published the rule,
+in its own list of what stays open: "`income` vs a literal zero was not separated (`income` was
+`BCAST(0)` in the probe)" — `Archive/by-date/2026-10-12/tpc-isa-inventory/` `REPORT.md` §3.1.)*
 
 i.e. it **permutes bytes only within each 4-byte-aligned group, and the source group is the
 destination lane's own**. The load-bearing evidence is an **impulse** test: with `a` zero except
 `a[4] = 1` and a **constant** index `b = 0x80`, the output is **nonzero at lanes 4,5,6,7** — which no
 per-lane index map of the documented form can produce. The enabled index bytes are exactly
 **`{0x80..0x83, 0xC0..0xC3}`** — bit 7 set **and** bits 2–5 clear; **bit 6 is ignored**; every other
-byte yields `income`. A constant index of `0x80..0x83` gives **64 distinct values** in a 256-lane
-window — the signature of a group size of **4** (64 = 256/4), not 32 and not 256. **MEASURED.**
+byte yields the **`income` operand** (which this probe passed as `BCAST(0)` — see the caveat above).
+A constant index of `0x80..0x83` gives **64 distinct values** in a 256-lane window — the signature of
+a group size of **4** (64 = 256/4), not 32 and not 256. **MEASURED.**
 
-**There is no escape hatch.** Compiling the identical probe with `-DSWITCHES=n` for
-`n ∈ {0 … 262144}` emits a **byte-identical** `shuffle.i8` — unlike `lookup_1c`, whose `switches` bit 3
+**There is no escape hatch.** Compiling the identical probe with `-DSWITCHES=n` for **20 values of
+`n` from 0 to 262144** (`{0,1,2,4,8,…,262144}`) emits a **byte-identical** `shuffle.i8` — unlike
+`lookup_1c`, whose `switches` bit 3
 (`SW_LUT_PTR`) selects the generic table form, `shuffle` has **no switch that changes its operand
 form**. **MEASURED.**
 
@@ -827,7 +853,14 @@ correctly and only once, so nothing looks mis-lowered, but we did not disassembl
 author's own **bare-kernel control was INCONCLUSIVE**: with the glue's `(256,4)` access pattern it
 wrote only ~4 of 1024 output lanes, so it exercised 4 lanes and cannot separate structure from
 semantics. **The honest statement is: the documented semantics do not hold under the tested call
-structure, and the exact trigger is open.** A purpose-built 1-D access pattern is what would settle it.
+structure, and the exact trigger is open.** **Two further items are open and belong in this list.**
+(i) **`income` vs a literal zero** — the probe cannot separate them (see the caveat above); a probe
+passing a **non-zero** `income` (`BCAST(7)`, or better a per-lane-varying third input tensor) and
+reading the disabled lanes back settles it in **one run**: **7 ⇒** the operand is live and `= income`
+is earned; **0 ⇒** the instruction writes zero and the clause stays weakened. (ii) **The `_vb`
+(vector-predicate) form was never run**; with an all-ones predicate it *should* be identical to the
+`_b` form, but that is an expectation, not a measurement. A purpose-built 1-D access pattern is what
+would settle the *structural* question.
 
 *(For completeness, the instruction is genuinely cheap: one `shuffle.i8` per 256 lanes, priced like one
 ordinary ALU op — 12.034 µs against the 5.954 µs copy floor, the same +6.08 µs as one `sel`. **This
@@ -913,7 +946,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | 2 | **Why `{vliw-td, fast, linearize}` pack and the others do not** | open — `fast` ≡ `linearize` byte-for-byte is unexplained by their descriptions | compiler instrumentation (`-print-after`, a debug build) |
 | 3 | **The TPC clock in Hz** | **unobservable** on this build — no counter of any name. Every figure above is in ns; any cycle figure is **INFERRED**. A cross-check that inverts a measured duration at the assumed rate gives **0.577–0.603 ns/bundle** against §4.2.1's 0.5556 — but **inverting a duration by an assumed rate cannot validate the rate**, so this is **INDETERMINATE** and neither corroborates nor contradicts §4.2.1. **The clock stays UNKNOWN** | a newer/privileged `hl-smi`, or a firmware route |
 | 4 | **Whether `vliw-td` is safe for the whole model** | **NOT RUN** — bit-exact on 14 kernel bodies over the exhaustive domain plus four real shapes, but **no model run** | a model run with output comparison |
-| 5 | **`shuffle.i8`: ISA or lowering?** | **UNRESOLVED** — the bare-kernel control was **INCONCLUSIVE** | a probe with a purpose-built 1-D access pattern |
+| 5 | **`shuffle.i8`: ISA or lowering?** — and does it return the `income` **operand** or a literal zero? | **UNRESOLVED** — the bare-kernel control was **INCONCLUSIVE**, and the probe passed `income = BCAST(0)`, so it cannot separate "returns `income`" from "writes zero" | a probe with a purpose-built 1-D access pattern; **and a probe with a non-zero `income`** (one compile, one launch, read the disabled lanes back); the `_vb` predicate form is **not run** |
 | 6 | **Whether `--pre-RA-sched=vliw-td` survives a compiler/Synapse bump** | **UNKNOWN** — it is an LLVM hidden option with no vendor statement. The failure mode is loud (an unknown `-mllvm` option fails the build), so a stale build cannot pass unnoticed | a vendor statement, or the next compiler release |
 | 7 | **The exact fixed per-launch term** | it is **not a constant**: §4.2.10 measures it as a **sublinear function of the emitted bundle count** — `a = 0.6706 + 8.8911 ns × bundles` over 65 arms, R² 0.9766; `a = 0.0531 × bundles^0.736`. The **1.26–16.4 µs** range this row used to carry, "at one point per TPC", was a **bundle-model complement, not a measurement** (§4.2.8). The cross-arm fit and the per-kernel size fits still disagree on the marginal slot rate (0.580 vs 0.544 ns) at the ~6 % level. **What stays open is the *mechanism*** — item 12 | a fit that identifies the second-order term (outer-loop / first-touch), a clock that can be pinned, or a disassembly that names the per-TPC overhead |
 | 8 | **Whether the bundle win generalises in wall time to the other kernel families** | **NOT MEASURED** — bundle ratios exist for 12 more kernels (up to 1.84×); only the fp4 kernel was timed | time the `lutptr` / `lut` arms |
