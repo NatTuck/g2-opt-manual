@@ -1375,7 +1375,7 @@ instantiation — the error surfaces at the next `synchronize()` rather than at 
 log at the default level names the missing kernel** (a search of `/var/log/habana_logs` after the
 failure found **zero** occurrences of the absent name). A concrete instance of this class is now
 measured: a **late `GC_KERNEL_PATH` write** reports `applied` and then dies `synStatus 26` at the
-first fp4 compile, because the library was never swapped at all — the requested name *is* in the
+first fp4 compile, because the library was never swapped at all — the requested name *is not* in the
 active table, and the table is the wrong one (the ordering bug behind that instance is itself now
 fixed — §3.4.8). The identical string is produced by a missing GUID with a **single** extension
 loaded, and is **absent** when two extensions are loaded and every GUID is present — so it is not
@@ -1574,7 +1574,7 @@ image default**, so the code could not see that a database was already fixed. It
 
 **Both halves are now FIXED — the blind detector, and the ordering, which is now structural rather
 than "usually true".** The install moved off the load path onto `register_utils()`, the
-**`vllm.general_plugins` hook**, which runs at `WorkerBase.init_worker` — **before `init_device` and
+**`vllm.general_plugins` hook**, which runs at `WorkerWrapperBase.init_worker` — **before `init_device` and
 before any `torch.compile`** — so the variable is set before the first HPU op *by construction*. It is
 env-gated on `DSV4_FP4_LUT=1` and non-fatal (imported by path, wrapped so it cannot break plugin
 loading). With the promotion in effect the load path now **writes nothing** — a write there would be
@@ -1594,7 +1594,7 @@ decode. The install itself is **unchanged**: `libfp4_dequant_lut_kernels.so`, md
 source read.**
 
 > **The limit, stated rather than glossed: there was no end-to-end engine decode.** The ordering is
-> argued from the call site — `load_general_plugins()` at `WorkerBase.init_worker`, before
+> argued from the call site — `load_general_plugins()` at `WorkerWrapperBase.init_worker`, before
 > `init_device` — **not measured in an engine run**. What is measured is one process on one module:
 > the plugin hook, the load path, and both ops.
 
@@ -2281,7 +2281,7 @@ envelope; **UNKNOWN** for the envelope below 16 MB.
 > At the real five-lane pool the descriptor floor is **26.04 ms/step = 3.35× the measurement**, and
 > **a floor cannot exceed its measurement**, so the descriptor reading is refuted by its own data. *(That
 > 26.04 is the plan's **52,460 descriptors/step**; this section's own identity below counts
-> **52,245**/step, at which the same floor is **25.93 ms/step = 3.33×** — the two counts differ by 0.4 %
+> **52,245**/step, at which the same floor is **25.93 ms/step = 3.34×** — the two counts differ by 0.4 %
 > and both refute the reading.)*
 > **The only trustworthy S4 quantity is the union, 7.7751 ms/step** — which is exactly the quantity
 > the byte reading uses, and why the *byte* reading is the one the dump supports. *(Artifact:
