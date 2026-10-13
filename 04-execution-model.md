@@ -406,9 +406,9 @@ single-permutation on **167/167** of them.
 tensor shape — because moving `a` moves the grid and hence both the point count *and* `WE`. A glue
 that wants 24 engines can now choose them. *(In the GC's own dim order — the order the `grid` formula
 above is written in — `a[0] = lanes` is the step on dim 0, the fastest-varying dim, i.e. torch `d1`,
-and it is the dtype's native lane count; `a[1] = a1` is the step on dim 1, i.e. torch `d0`. So `a1`
-is the **second**-dimension step and `lanes` the **first**, and those two are exactly the two terms
-of that formula.)*
+and **in every glue and arm measured** it is the dtype's native lane count; `a[1] = a1` is the step
+on dim 1, i.e. torch `d0`. So `a1` is the **second**-dimension step and `lanes` the **first**, and
+those two are exactly the two terms of that formula.)*
 
 **The kernel body does not matter at all** (three kernels at 2.75 / 31.25 / 20.0 bundles per iteration,
 same grid → identical `WE`), and neither does the graph context.
