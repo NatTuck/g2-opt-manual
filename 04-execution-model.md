@@ -665,7 +665,11 @@ own geometry (5.8 points/TPC) its measured span is **1.9131 µs**, which the pla
 `floor = 0.1260 + 0.043 × i + 0.0044 ms/step`, where `i` is the per-launch term in µs and `0.1260` is
 R1's fp8 weight read — turns into a **0.2127 ms/step** floor over 43 layer-launches: **46.2×** against
 the port's **9.8171 ms/step** attention span (§3.6.5). *(Note it is **not** `43 × 1.9131 µs =
-0.0823 ms`: the 43 launches contribute only the `0.043 × i` term, `0.0823` of the `0.2127`.)* The same
+0.0823 ms`: the 43 launches contribute only the `0.043 × i` term, `0.0823` of the `0.2127`.)* *(The
+plan has since revised R's floor to **`0.2324 ms/step` / 42.2×**, a different composition of the
+launch and handoff terms — that is the figure §3.6.5's gate discharged the condition for; this
+paragraph keeps the `tpc-launch-cost-vs-codesize` report's own arithmetic, which is where `0.2127` is
+computed.)* The same
 source under `vliw-td` is **110** bundles at `a = 1.6972 µs`. So a fused body's floor is set by a
 number you can **read off a listing** before you run anything — and it is the number to read, because
 the plan's three candidate floors (0.2155 / 0.3076 / 0.8356 ms/step) are three **bundle counts**:

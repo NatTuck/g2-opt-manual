@@ -2177,11 +2177,47 @@ questions.**
 > `sr11_final.py`, `sr9_ablation.py`; the family unions and `merged` cross-check against the
 > per-family leave-one-out ranking in the same project's `notes/interval-census.md` §5.1.)*
 
-### 3.6.5 The largest single node in the decode step is a KV-slab materialisation — and it is BYTE-bound
+### 3.6.5 The largest single node in the decode step is a KV-slab materialisation — BYTE-bound, and its removal by a span rewrite is MEASURED
 
 *(Added 2026-10-13. A single-node finding from one decode run of the port at **TP=4 across all four
 modules, unpinned**. It is a **compiled-graph** measurement plus trace arithmetic, not a timing run,
-and it is `[DSv4F]`.)*
+and it is `[DSv4F]`. **Extended the same day by the two-arm compile gate that discharged the rewrite's
+conditionality — the verdict box here, the gate itself at the end of this section.**)*
+
+> **VERDICT — the conditionality behind this span's rewrite is DISCHARGED.** The rewrite plan's floor
+> for replacing this span — **`0.2324 ms/step`, 42.2× span-internal / 1.17× model** — rested on an
+> **inference**: that spelling the slab as a **declared tensor operand**, read and written **through
+> its base address**, **removes the staging pass** rather than moving it elsewhere. **That inference is
+> now a measurement**, because the experiment designed to discharge it ran, and **its control
+> succeeded — twice**:
+>
+> | arm | geometry | graph nodes | `memcpy_dma` staging nodes | nodes with non-zero `dma_expected_duration` |
+> |---|---:|---:|---:|---:|
+> | **control 1** — the shipped chain at this geometry, in the treatment's own process | 2,422 blocks × 1,600,000 B | 33 | **1** (`num_of_ROIs` **243**, dur **3719.180392235825**) | 3 |
+> | **control 2** — the **full model at TP=4**, cold recipe cache, 21,769 post-graphs | real | 111 / 210 / 242 | **116** graphs carry it | **≥116** |
+> | **treatment** — the rewrite's spelling, same geometry, same process | same | 2 | **0** | **0** |
+>
+> **Control 1 reproduces this section's own node bit-for-bit** — same `guid`, same `num_of_ROIs`, same
+> `dma_expected_duration` to the last digit, and the same `slice → memcpy → reshape →
+> index_put/scatter_nd → index_select → gather` dataflow. **And the treatment, in the same process, on
+> the same geometry, with the same compiler, produces no DMA node of any kind.** So the staging pass is
+> a property of the **shipped expression**, and it does not exist when the slab is a declared operand
+> accessed through its base address. **The rewrite's floor stands, and the span is worth rewriting.**
+>
+> **Two bounds on that, stated here rather than in a footnote.** **(1) It measures that the staging
+> pass disappears — not what the replacement costs.** The treatment op is a **skeleton** at this
+> geometry (the model itself may not be edited), so the rewrite's per-launch intercept — the plan's
+> **N4**, its own named principal risk — is **still unmeasured**, and the floor's launch term still
+> comes from a **harness kernel**, not from model nodes. **N4 remains UNKNOWN** (§3.9 item 22).
+> **(2) It does not repair the denominator below.** The `1.81 TB/s` discussion bounds the **shipped**
+> pass's byte floor; this gate removes the **pass**. Those are different claims, and the gate settles
+> neither the envelope nor the unmeasured regime the stage lives in.
+>
+> *Artifact: `Archive/by-date/2026-10-13/compile-gate-run/` — `REPORT.md` §0–§3, §5, §7 and the per-arm
+> extracts `evidence/control_SHIP_REAL.json`, `evidence/control_SHIP_REAL_READ.json`,
+> `evidence/control_SHIP_MINI.json`, `evidence/treatment_R3_REAL.json`. The floor composition and the
+> branch table are the rewrite plan's own
+> (`Archive/by-date/2026-10-13/attn-preamble-rewrite-plan/REPORT.md` §0–§0.5).*
 
 **What the node is.** The decode `ATTN_PREAMBLE` recipe compiles to **one** 111-node graph
 (engines: `None` 53 / `TPC` 47 / `DMA` 9 / `MME` 2), and **exactly one** of its nodes is a staging
@@ -2335,6 +2371,43 @@ is written by the graph compiler, and a Synapse **recipe-cache hit loads a compi
 graph** — so a warm cache is *stated* to yield an **empty dump directory and a false negative**, not an
 error. So §2.10's last bullet is **refined**, not upgraded: the cold-cache requirement is measured, and
 the failure mode is the mechanism the precaution is taken against.
+
+**The two-arm compile gate — and why the earlier attempt could not settle it.** *(Added 2026-10-13.)*
+The gate is a **standalone two-arm compile** at this section's own geometry, in **one process** with a
+**cold recipe cache**: a **control** that spells the shipped expression exactly — the typed page view,
+`page[blocks, offs] = kv`, `page.index_select(0, phys).to(bf16)`, `torch.gather(...)` — and a
+**treatment** that spells the rewrite's access forms, with the slab as a **declared tensor operand**,
+read and written **through its base address**, and **no `[32768, 2422]` intermediate anywhere in the
+expression**. Three further arms are controls on the *instrument* rather than on the design:
+
+* **`SHIP_MINI` — the *previous* falsifier's control, reproduced.** At its miniature geometry (8
+  blocks, one contiguous page) it produced **the same two DMA nodes to fourteen significant figures**
+  (`DmaBroadcast` **0.5516913659793814**, `transpose_dma` **0.25169136597938147**) and **no staging
+  node**. **The cause is geometric, and it is the whole story: an 8-block contiguous page has nothing
+  to materialise.** At 2,422 blocks × 1,600,000 B the same expression materialises 158.7 MB. So that
+  attempt's zero was **a zero from a configuration that could not produce the thing being tested
+  for** — which is why it neither confirmed nor refuted the removal.
+* **`SHIP_REAL_READ` — the write removed, the read kept.** The `index_select` + `gather` alone, with no
+  `page[blocks, offs] = kv`: **11 nodes, 2 DMA, and no `memcpy` node of any engine.** **The staging is
+  therefore forced by the WRITE, not by the read** — which is where an implementer should aim: the
+  out-of-place `index_put`/`scatter_nd` on the strided page is what has to materialise its base.
+* **`R3_DENSE` — the treatment with a *contiguous* slab operand**: still **0 DMA nodes**, so the zero
+  is not an artefact of declaring a strided operand.
+
+**The generalisable rule, and it costs less than the experiment.** *A control that cannot fail in the
+way the treatment is supposed to fail cannot license the treatment's result.* That is the same shape as
+this section's own **"a floor cannot exceed its measurement"** — a check that costs nothing, applies
+before the run, and would have caught the earlier attempt immediately.
+
+**One caveat on the fresh full-model arm, and it is a row count, not a discrepancy.** Control 2's slab
+is **2,421** rows — one fewer than the **2,422** this section carries — so its
+`dma_expected_duration` is **3717.6702440399486** rather than **3719.180392235825**. The difference is
+entirely the byte count at one bandwidth:
+`32768 × 2422 × 2 B ÷ 3719.180392235825 µs = 42.678271893281 GB/s` and
+`32768 × 2421 × 2 B ÷ 3717.6702440399486 µs = 42.677979913459 GB/s` — **the same bandwidth to six
+significant figures.** The row count is a KV-cache-sizing outcome of the engine build, not something
+the experiment controls, and **control 1 is the 2,422-row reproduction** — so the two durations are one
+quantity evaluated at two row counts. **Do not read the one-row difference as a contradiction.**
 
 *Artifact: `Archive/by-date/2026-10-13/staging-origin-nodes-dump/` — `REPORT.md` §1–§3, §5–§6,
 `evidence/post_decode_ATTN_PREAMBLE_111node.json`, `evidence/pre_decode_ATTN_PREAMBLE_111node.json`,
@@ -2565,7 +2638,8 @@ subsection in §3.4.1.)*
 
 **Items 17–20 are new, opened 2026-10-12 by the vendor-MXFP4-op conformance probe (§3.4.7) — they are
 additions, not closures.** **Item 21, opened 2026-10-13 by the fp4 LUT promotion (§3.4.8), is now
-CLOSED — the whole-model TP=4 run resolved it (below).**
+CLOSED — the whole-model TP=4 run resolved it (below).** **Item 22 is new, opened 2026-10-13 by the
+two-arm compile gate (§3.6.5), and it is the *bound on that gate's result* rather than a new question.**
 They are registered here rather than left inside §3.4.7 so that a reader who
 consults this register to find out what we do *not* know gets a complete answer.
 
@@ -2603,6 +2677,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **19** | **Multi-expert correctness of the vendor MXFP4 fused op.** The conformance probe used **one** expert. The vendor's own test uses **3 experts with `topk(2)`**, which is a **different contract**, and a naive all-zeros routing table gave garbage — so `experts_min` / `experts_max` with a real routing table is **not established**, and every axis in §3.4.7's table is single-expert. | The vendor test's own configuration (3 experts, `topk(2)`, random weights and biases) driven against a known-good reference. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §7.)* |
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
 | ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
+| **22** | **The rewrite's per-launch cost — the plan's N4 — is unmeasured, and the two-arm compile gate does not measure it.** The gate (§3.6.5) establishes that the KV-slab staging pass **disappears** when the slab is a declared operand read and written through its base address; it does **not** establish what the replacement kernel costs. Its treatment op is a **skeleton** at the model's geometry (the model itself may not be edited), and the rewrite's floor still carries a per-launch term read off a **harness** kernel (§4.2.10's bundle law), not off model nodes. So *"the staging pass is removed"* is **MEASURED** while *"R costs `0.2324 ms/step`"* remains **DERIVED**. | Compile the **real** fused per-layer kernel at the model's own geometry and read its per-launch term off its own launch, the way §4.2.10's arms were read. *(Opened 2026-10-13 by the two-arm compile gate; §3.6.5; `Archive/by-date/2026-10-13/compile-gate-run/`.)* |
 
 ---
 
