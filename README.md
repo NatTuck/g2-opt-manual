@@ -26,6 +26,16 @@ built on.
 size-dependent on this hardware; a figure without its size is not a figure. Where a number
 has a known regime boundary, the boundary is given.
 
+**Every figure names its population and its denominator, inline.** "938 of 1,556" is not a
+statement; "938 of 1,556 rows of the six custom sweeps, with the 23 stock observations scored
+separately" is. The chapters already carry the pattern — [§4.2.8](04-execution-model.md)'s two
+controls, [§4.2.5](04-execution-model.md)'s "22 arm-comparisons", [§2.2](02-regions.md)'s "13 arms".
+
+**A figure carried in from another document is re-derived from that document's data — its table,
+JSON, log or listing — not from its prose.** Where only the prose carries it, the figure is
+**marked as inherited**. A description and the table beneath it can disagree, and the sentence is
+usually the one that is wrong.
+
 **Every citation names its source** — a URL, an upstream file path, or a named artifact from our
 measurement campaign, archived in the source project. **It is not a promise that every source is one
 you can open:** the archived artifacts live in a project that is not published, so they are
