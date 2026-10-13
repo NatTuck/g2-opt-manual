@@ -1376,11 +1376,12 @@ log at the default level names the missing kernel** (a search of `/var/log/haban
 failure found **zero** occurrences of the absent name). A concrete instance of this class is now
 measured: a **late `GC_KERNEL_PATH` write** reports `applied` and then dies `synStatus 26` at the
 first fp4 compile, because the library was never swapped at all — the requested name *is* in the
-active table, and the table is the wrong one (§3.4.8). The identical string is produced by a missing
-GUID with a **single** extension loaded, and is **absent** when two extensions are loaded and every
-GUID is present — so it is not evidence about extension count either, contrary to a rule we had
-recorded in three places in the source project. Never read it as "the shape was wrong", "the dtype was
-wrong" or "the library was wrong": **it says a lookup failed, not what failed.** What would settle the *cause* in
+active table, and the table is the wrong one (the ordering bug behind that instance is itself now
+fixed — §3.4.8). The identical string is produced by a missing GUID with a **single** extension
+loaded, and is **absent** when two extensions are loaded and every GUID is present — so it is not
+evidence about extension count either, contrary to a rule we had recorded in three places in the
+source project. Never read it as "the shape was wrong", "the dtype was wrong" or "the library was
+wrong": **it says a lookup failed, not what failed.** What would settle the *cause* in
 each case is the GC's own log at a raised level (`LOG_LEVEL_GC`) — **not attempted**, so the
 *attributions* in rows 6/7 and trap 2 are **INFERRED**, and only the *rejections* are **MEASURED**.
 *(Source: `Archive/by-date/2026-10-12/fp4-guid-probe/REPORT.md` §4–§5 — five device rows, one process
@@ -1549,36 +1550,67 @@ like-for-like chain benchmark is not yet built.**
 
 *(Added 2026-10-13. This is the fp4 decode's variant-selection question — the fix §3.4.5 specifies for
 the subnormal floor lives in one of the variants — and it **corrects a reading of our own**: the
-wiring's blocker had been recorded as a missing GUID. It is not.)*
+wiring's blocker had been recorded as a missing GUID. It is not — the blocker was the late write, and
+that is fixed below.)*
 
-**The problem.** A variant-selection wiring (`dsv4_fp4_variant.py`) picks a kernel variant from the
-checkpoint's routed-expert scale bounds and then writes the environment:
+**The problem, and its two halves.** A variant-selection wiring (`dsv4_fp4_variant.py`) picks a kernel
+variant from the checkpoint's routed-expert scale bounds and then writes the environment, from the
+**load path**:
 
 ```
-643  prev = os.environ.get("GC_KERNEL_PATH")
-644  os.environ["GC_KERNEL_PATH"] = target          <-- the write
+prev = os.environ.get("GC_KERNEL_PATH")
+os.environ["GC_KERNEL_PATH"] = target          <-- the write
 ```
 
-**That write cannot work.** The worker fixes its kernel database at its **first HPU op**, ~40 s before
-the load path has the scales, so the write lands **too late**. And the failure is not loud: with
-`GC_KERNEL_PATH` at the **image default** (`/usr/lib/habanalabs/libtpc_kernels.so`) the wiring's
-`too_late` detector is **blind** — the image default is deliberately excluded from
-`known_kernel_libs()`, because it is mapped in every process from habana init — so the wiring
-**reports `applied`**, writes a path nothing will read, and the run then dies at the first fp4
-compile with **`synStatus 26`**. **MEASURED.**
+**That write could not work.** The worker fixes its kernel database at its **first HPU op** — when the
+compiler builds its kernel DB and reads the variable — and the load path reaches this write ~40 s
+later, so it landed **too late**. And the failure was not loud: with `GC_KERNEL_PATH` at the **image
+default** (`/usr/lib/habanalabs/libtpc_kernels.so`) the wiring's `too_late` detector was **blind** —
+it filtered `/proc/self/maps` against `known_kernel_libs()`, a list that **deliberately excludes the
+image default**, so the code could not see that a database was already fixed. It **reported
+`applied`**, wrote a path nothing would read, and the run then died at the first fp4 compile with
+**`synStatus 26`**. **MEASURED**, and *reproduced first* on the unmodified tree: `load-path verdict =
+'applied'` → `RuntimeError: Graph compile failed … synStatus 26` → `promoted library LOADED = False`.
 
-> **The correction, stated plainly.** **The blocker is the late write, not the GUID gap.** The GUID
-> gap is a **separate, one-line fix**, and it only matters at **`DSV4_COMPRESSOR_OP=1`**: the
-> single-GUID arm libraries bind one GUID where the shipped library binds two, and the wiring's own
-> warning is conditional on exactly that variable
+**Both halves are now FIXED — the blind detector, and the ordering, which is now structural rather
+than "usually true".** The install moved off the load path onto `register_utils()`, the
+**`vllm.general_plugins` hook**, which runs at `WorkerBase.init_worker` — **before `init_device` and
+before any `torch.compile`** — so the variable is set before the first HPU op *by construction*. It is
+env-gated on `DSV4_FP4_LUT=1` and non-fatal (imported by path, wrapped so it cannot break plugin
+loading). With the promotion in effect the load path now **writes nothing** — a write there would be
+unread *and* would undo the promotion. The detector is closed the same way: `_kernel_libs_in_maps()`
+**includes** the image default, and `kernel_db_fixed()` is the honest "an HPU op has already run" test
+the load path now consults instead of the old blind filter — and an install that *is* late still
+happens (a later-spawned worker inherits it) but is now **loud**, recording `db_already_fixed=True`
+and naming the library actually in use.
+
+**The evidence is the right shape — a reproduction and then a fix, not a fix alone.** In the passing
+run the loaded library path is **read from `/proc/self/maps` rather than inferred**
+(`libfp4_dequant_lut_kernels.so` is mapped after the first HPU op) and **both fp4 ops execute**: the
+arithmetic op, whose GUID is not in the image default, and the promoted LUT op, whose GUID exists only
+in the promoted library — the latter returning `0x00` at the `k = −9` floor cell, i.e. the floor-fixed
+decode. The install itself is **unchanged**: `libfp4_dequant_lut_kernels.so`, md5
+`abf368253d1433c3a79134863850d901`, 87,704 B — only *when* it is installed changed. **MEASURED /
+source read.**
+
+> **The limit, stated rather than glossed: there was no end-to-end engine decode.** The ordering is
+> argued from the call site — `load_general_plugins()` at `WorkerBase.init_worker`, before
+> `init_device` — **not measured in an engine run**. What is measured is one process on one module:
+> the plugin hook, the load path, and both ops.
+
+> **The correction, stated plainly.** **The blocker was the late write, not the GUID gap — and the late
+> write is now fixed (above).** The GUID gap is a **separate, one-line fix**, and it only matters at
+> **`DSV4_COMPRESSOR_OP=1`**: the single-GUID arm libraries bind one GUID where the shipped library
+> binds two, and the wiring's own warning is conditional on exactly that variable
 > (`if os.environ.get("DSV4_COMPRESSOR_OP", "0") == "1":` → *"the arm libraries expose ONE GUID … The
 > E3a node will fail to instantiate"*). At the default `DSV4_COMPRESSOR_OP=0` it is **inert**. The
 > promoted library does not have the gap at all. **MEASURED.**
 
-**The fix that dissolves it: promotion.** Instead of writing a path at run time, put the kernel's
-*name* into the **active** library's `GetKernelGuids` table. Then there is nothing to write — the
-launch names the promoted library and the op is callable from the first compile. The promoted library
-is a **superset** of the shipped one, so it can be `GC_KERNEL_PATH` for a whole run:
+**The fix that dissolves the *variant* half: promotion.** Instead of choosing a library at run time,
+put the kernel's *name* into the **active** library's `GetKernelGuids` table — the *variant* then
+rides the 240-byte table (below) rather than which library is mapped, so the op is callable from the
+first compile. The promoted library is a **superset** of the shipped one, so it can be
+`GC_KERNEL_PATH` for a whole run:
 
 | library | md5 | size | GUIDs for `DEVICE_ID_GAUDI2` |
 |---|---|---:|---|
@@ -1674,19 +1706,46 @@ it moves **all 24 positions** (2746/2746 shared logprob cells, 3/24 token ids,
 one of the 23 tie pairs is in `w1`** — no tie nibble lives in `w3` or `w2`, so the tie enters the model
 only through the `w1` (gate) GEMM. **MEASURED.**
 
-**Two latent defects on this path, both zero-effect on this checkpoint — state them, and do not read
-them as live.** *(a)* `VARIANT_DECODE["guard_floor"] = "guarded"` (`lut_tables.py:107`) **silently
-drops the floor fix** for a variant whose own predicate says the fix is needed, and **no guard+floor
-decode exists at all** — contradicting the design's own rule that the floor fix must be present in
-**both** variants. It is latent because `guard_floor` needs `max_byte > 132`, which the fresh-load
-upper-bound assertion forbids — but the **snapshot-restore path skips that assertion** and feeds the
-selected variant straight to `_install_fp4_lut`, so a restored snapshot with `max_byte > 132` gets a
-table that omits the fix. *(b)* **Structural:** the LUT kernel clamps `k` into `[−9, 5]`
-(`fp4_dequant_lutptr_rc_gaudi2.c:63`), so the promoted LUT **cannot express the upper guard at all**
-(the guard fires at `k ≥ 6`) — a `k = 6` group is decoded with the `k = 5` row. For any checkpoint
-that needs the guard, the LUT path is wrong by construction, not merely unselected. **source read.**
-*Both defects are off-checkpoint and neither affects this checkpoint's bytes; they are recorded
-because they are live on the restore path.*
+**The `guard_floor` mis-mapping — FIXED, with zero effect on this checkpoint.** `VARIANT_DECODE`
+(`lut_tables.py`) used to map `"guard_floor"` onto `guarded`, **silently dropping the floor fix** for
+a variant whose own predicate says the fix is needed — and **no guard+floor decode existed at all**,
+contradicting the design's own rule that the floor fix must be present in **both** `_floor` arms. It
+now maps to a real guard+floor decode (a shared `_floor_fixed()` backs both floor-fixing decodes, so
+the fix cannot be present in one and absent from the other), whose table md5 is `5a1e3296…` with
+**both** `k = −9` cells fixed. **The selected table is unchanged**: this checkpoint still selects
+`noguard_floor`, md5 `5a1e3296fa3a6ecf3379b688a18e1540`, so nothing the engine runs today can move.
+**source read / MEASURED.**
+
+**The structural answer, and it outranks the fix: the `guard`/`noguard` distinction is meaningless in
+the LUT path.** The LUT kernel clamps `k` into `[−9, 5]` (`LUT_K_LO`/`LUT_K_HI` in
+`fp4_dequant_lutptr_rc_gaudi2.c`), so `t = exp + k ≤ 14 < 15` and the guard — which fires at
+`t ≥ 15` (i.e. `k ≥ 6` at the top code) — **can never fire**. `guard` and `noguard` therefore build
+**byte-identical** tables (`c713d706…`). ⇒ For any checkpoint that *needs* the upper guard, the LUT
+path is **wrong by construction**, not merely unselected — a `k ≥ 6` group is decoded with the
+`k = 5` row. The distinction stays meaningful **only for the arithmetic kernel**, which has no such
+clamp and whose decode still carries the guard (`dec_guarded(0x06, 6) = 0x77` vs
+`dec_pre_guard(0x06, 6) = 0x78`). ⇒ `guard_floor` was **both mis-mapped *and* unreachable on
+the sound path**: any `guard*` variant needs `max_byte > 132`, i.e. exactly `not admitted`, and the
+fresh-load upper-bound assertion raises *before* the selection runs. So the defect had **no numerical
+consequence in the LUT path in any reachable case today** — but it is a **live trap if the clamp is
+widened or a `k ≥ 6` checkpoint is admitted**, which is why it was fixed now rather than when it
+bites. **source read.**
+
+**FINDING, not a fix: the range-guard admission check is unsound on the snapshot-restore path.** This
+is a **latent** path, not a demonstrated failure — **no checkpoint with such scales has been run
+here** — and the code already concedes the gap in prose. The upper-bound assertion lives inside
+`_register_v4_routed_packed`, which **returns early when the routed buffers are already filled** —
+exactly the snapshot-restore case — while the **selection still runs on restore** (`_check_v4_routed_all`
+→ `_select_fp4_variant_all(where="snapshot restore")`) and **takes the bounds itself**
+(`_v4_fp4_scale_bounds`, a plain min/max with **no guard**). The lower-bound guard is skipped the same
+way: `_v4_fp4_scale_lower_bound` is called only inside `_register_v4_routed_packed`. ⇒ A **restored**
+checkpoint with `max_byte > 132` or `min_byte < 118` **selects what the fresh-load path refuses** —
+and with `DSV4_FP4_LUT=1` the `[−9, 5]` clamp then yields a **silently wrong finite value** (the
+`k = 5` row) instead of the guard's saturation. The code's own comment on the restore path says a
+snapshot restore never ran the load-time selection *"nor the two range guards — pre-existing,
+deliberately unchanged here"*, so this is a **known-but-unfixed hole, not a discovery**; what is
+recorded here is that it is a finding with a stated precondition — a **restored** checkpoint whose
+routed-expert scale bytes leave `[118, 132]`. **source read.**
 
 **Block-level safety — and it is a BLOCK, not a model.** `_compute_v4_routed` (the model's own MoE
 function) compiled with `torch.compile(fullgraph=True)`, on **real layer-39 checkpoint weights** (all
@@ -1826,6 +1885,17 @@ end-to-end numbers), §4 (routing and influence), §5 (the selection/activity co
 §7 (device hygiene); the reductions are `compare.py`, `tp4_decode_compare.py`, `tie_scan.py`,
 `reduce_routing.py` and the JSONs `shipped.json`, `guarded.json`, `noguard_floor.json`, `zeros.json`,
 `tieprobe.json`, `tie_experts.json`, `routing.json` in the same bundle.***
+
+*The two code fixes and the restore-path finding:
+`Archive/by-date/2026-10-13/fp4-code-fixes/REPORT.md` — §1.1 the late-write reproduction on the
+unmodified tree, §1.2 the restructure onto the `vllm.general_plugins` hook, §1.3 the acceptance run
+(the loaded path read from `/proc/self/maps`, both ops executing), §1.4 the pre-fix-vs-fixed
+blind-spot pair, §1.5 the ordering guard, §2.1–§2.4 the `guard_floor` mapping and the structural
+answer, §2.5 the restore-path finding. Logs: `accept_before_fix.txt`, `accept_after_fix.txt`,
+`blindspot_before_after.txt`, `late_promotion.txt`, `variant_mapping_before.txt`,
+`variant_mapping_after.txt`, `lut_tables_after.txt`, `gate_variant_selection_after.txt`, with
+`MANIFEST.md5` over the bundle's 44 files and the pre-fix module copies in its `backup/`. Every
+pre-fix line number in that report is the archive's own record; the manual cites the symbols.*
 
 ---
 
@@ -2621,6 +2691,12 @@ consults this register to find out what we do *not* know gets a complete answer.
     is why that run's routing measurement exists at all. The failure is the harness's, not the device's:
     the work was done while 52.9 GB per module stayed held. On a harness-level failure, **look for the
     output file** before writing the arm off, and check `hl-smi` for leaked modules before the next launch.
+25. **A detector that filters on a list which excludes the default cannot see the default.**
+    **MEASURED:** the variant wiring's `too_late` detector filtered `/proc/self/maps` against
+    `known_kernel_libs()`, a list that deliberately omitted the image default — so "no promoted library
+    is mapped" stayed true while the kernel database was already fixed, and a late write reported
+    `applied` for as long as it existed. Read your detector's allow-list for what it *leaves out*.
+    *(§3.4.8.)*
 
 ---
 
