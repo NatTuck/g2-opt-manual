@@ -392,10 +392,12 @@ WE = ceil(G / ceil(G/24))    otherwise
 **is** the non-monotonicity: the GCD trial splits a dim by `gcd(24, dim)` and wins whenever its box is
 smaller. The worked pair, `i8`, `grid = [g0, 64]`: **`g0 = 3` → 24** but **`g0 = 4` → 22**.
 
-**Two controls, and they are the evidence.** Take the GC's dim order away — use the torch order — and
-the model is right on only **179/547** of the dense `U=4` sweep instead of **547/547**. Replace the
-single permutation with the *full* permutation search and it matches **483/547** instead of **547/547**
-(the device agrees with single-permutation **64/64** where the two differ).
+**Two controls, and they are the evidence** — both scored over the **1,556 rows of the six custom
+sweeps** (the 23 stock observations are scored separately and are not in that denominator). Take the
+GC's dim order away — use the torch order — and the model is wrong on **938 of 1,556** rows. Replace
+the single permutation with the *full* permutation search and it is wrong on **167 of 1,556** — and
+those 167 are *exactly* the rows where the two modes disagree, with the device agreeing with
+single-permutation on **167/167** of them.
 
 **`WE` is not requestable — but the glue's declared index space is the control.** There is no API:
 `synUserProgrammability` carries only `userExecOrder` and `userBundling`, so
