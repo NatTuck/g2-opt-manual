@@ -272,6 +272,14 @@ the four-condition overlap law (**Chapter 2 §2.2**):**
 
 ### 3.1.4 The traffic-amplification ratio — rank spans by *removable bytes*, not milliseconds
 
+> **CORRECTED 2026-10-14 — the first version of this section (commit `6c94851`) gave the KV-slab term
+> as `13.65 GB` and the port's traffic as `35.083 GB/rank/step = 12.5×`, costed at `19.76 ms → 50.6
+> tok/s`. Those figures omitted a whole *population* of the same staging pass — the `ATTN_CORE`
+> launches, §3.6.5 — and are superseded here; the original values are retained in this marker as the
+> record. The corrected figures are `20.3172 GB`, `44.996 GB/rank/step = 16.0×`, `25.35 ms → 39.4
+> tok/s`. The original was **wrong when written**, and *the way it was wrong* is this section's most
+> transferable lesson — see the warrant warning below.**
+
 §3.1.1 gives the model's **irreducible** byte floor. The porting lesson is the ratio between that floor
 and what the port **actually moves**:
 
@@ -281,7 +289,7 @@ and what the port **actually moves**:
    passes, per rank per step.
 3. **Divide.** `traffic amplification = port bytes ÷ model bytes`.
 
-**The ratio is the finding.** A port that moves **12× the bytes the model requires cannot be rescued by
+**The ratio is the finding.** A port that moves **16× the bytes the model requires cannot be rescued by
 a faster kernel.** Making every pass infinitely fast gets you to the port's own byte count costed at the
 band and no further: kernel efficiency and byte count are *different levers*, and on a real port the
 second is usually the larger. Do this arithmetic *before* optimising a kernel, because a kernel win is
@@ -298,41 +306,105 @@ union*): **a milliseconds-ranked list hides exactly the spans whose cost is traf
 | | GB/step | source |
 |---|---:|---|
 | **model floor** (weights + KV + activations, one pass, batch 1) | **2.8061 /card** — 11.2244 device | §3.1.1's floor, re-derived independently |
-| **what the port moves** | **35.083 /rank** | the port's own recipes and materialisations |
-| **amplification** | **12.5×** | |
+| **what the port moves** | **44.996 /rank** | the port's own recipes and materialisations |
+| **amplification** | **16.0×** | |
 
 The floor re-derives from the HF `config.json` and the 46 safetensors headers and **reproduces §3.1.1's
-own numbers — 11.248 GB device, 2.812 GB per card — to 0.2 %, and each of its nine shares to ≤0.1 pp.**
-Two independent accounts of the same checkpoint agreeing to a fifth of a percent is the reason to trust
-the method: the arithmetic is not the uncertain part. At the TPC stream envelope (2,147 GB/s) the floor
-is **1.307 ms/token**.
+own numbers — 11.248 GB device, 2.812 GB per card — to 0.2 %, and nine of its ten shares to ≤0.1 pp.**
+At the TPC stream envelope (2,147 GB/s) the floor is **1.307 ms/token**.
 
-**The port's own bytes, costed at the measured band, are 19.8 ms/token — a 50 tok/s target is the floor
-of the code as it stands.** 35.083 GB/rank/step at the measured band gives **16.34 ms/token (61.2
-tok/s) at 2,147 GB/s, 17.30 ms (57.8) at 2,028 GB/s and 19.76 ms (50.6) at 1,775 GB/s** — the last being
-the slowest measured point. The port *currently* runs at a measured **56.6355 ms/step device union**,
-i.e. **2.9× above its own byte floor**, so a perfect kernel that moved exactly these bytes would land at
-50 tok/s and the 2.9× above it is scheduling rather than bytes. **That is the number to take away: this
-port's traffic, not its kernels, is what stands between it and the target.**
+> ### ⚠ That cross-check is aimed at the **wrong half of the model** — and that is how the error above survived it
+>
+> §3.1.1 is the **floor**: the model's irreducible requirement. The KV-slab materialisation is **port
+> overhead** and has **no row in §3.1.1 at all**. So the 0.2 % / ≤0.1 pp agreement validates the
+> *floor* side of the arithmetic and **cannot, even in principle, see a defect on the *port* side**.
+> The aggregate check that gave this section its confidence was **structurally incapable of catching
+> the mistake it then made** — the thing that was wrong was not in the thing that was checked.
+>
+> **Two corollaries a port should carry.**
+>
+> - **A number that reproduces against its own generator is not verified.** The port's byte model and
+>   the figures above come from the same script, so comparing them is *self-consistency*. The §3.1.1
+>   cross-check was the one genuinely external test — and it was aimed at the other half of the model.
+> - **When you build a warrant, say which half it covers.** "The floor agrees" is not "the port's byte
+>   account agrees", and only the second would have caught this.
 
-**Two spans are 76 % of that traffic, and neither has time headroom:**
+**The port's own bytes, costed at the measured band, are 25.4 ms/token — the current code is ~21 % *short*
+of a 50 tok/s step.** 44.996 GB/rank/step at the measured band gives **20.96 ms/token (47.7 tok/s) at
+2,147 GB/s, 22.19 ms (45.1) at 2,028 GB/s and 25.35 ms (39.4) at 1,775 GB/s** — the last being the
+slowest measured point. The port *currently* runs at a measured **56.6355 ms/step device union**
+(`Archive/by-date/2026-10-13/dsv4-profile-run/span_table_P1_rank0.txt`), i.e. **2.2× above its own byte
+floor**. **That is the number to take away: the port's traffic, not its kernels, is the first thing
+between it and a 50 tok/s step — and measuring your own byte floor is how you find out how far you
+are.** *(The first version of this section read "the code as it stands has no algorithmic change left
+before it hits the target". The correction moves the code from level with a 50 tok/s step to **21 %
+short of it** — the more useful reading, because it tells you the gap is real and where it is.)*
+
+**How 44.996 is built, term by term, so it is reproducible rather than asserted:**
+
+| term | GB/rank/step | note |
+|---|---:|---|
+| KV-slab staging, `ATTN_PREAMBLE` | 13.6506 | 43 launches × 158.7 MB × 2 (round trip) |
+| KV-slab staging, `ATTN_CORE` | **+6.6666** | 21 launches × 158.7 MB × 2 — **the population the first version omitted** |
+| kexp read by the dequant | **+3.2464** | the dequant reads the 3.2464 GB int8 `kexp` tensor it was handed (§3.4.6) |
+| the rest (routed fp4, fp8 write, fp8 GEMM read, attention projections, shared / lm_head / compressor / indexer / HC / router / KV) | 21.4321 | the floor-side terms, unchanged |
+| **TOTAL** | **44.996** | **16.0× the 2.8061 GB/card floor** |
+
+The **`+6.6666` and the `+3.2464` are different terms** and both are real: the `ATTN_CORE` population
+costed at §3.6.5's own per-descriptor size is `25,515 × 130,640 B = 3.333 GB`, which is **close to but
+not the same as** the 3.2464 GB the dequant spends re-reading the `kexp` tensor — a coincidence of
+magnitude, not an identity.
+
+**Two population facts, one of which names *which* `43` the byte model means.** §3.6.5's own
+per-descriptor arithmetic gives `158,728,192 ÷ 1,215 = 130,640 B`, so `43 × 1,215 = 52,245` and
+`21 × 1,215 = 25,515` descriptors/step, summing to **`77,760 = 64 × 1,215`** — **the `64` is real**. But
+the **`43` is *staging launches*, not `ATTN_PREAMBLE`'s own run count**: the span table reports
+`ATTN_PREAMBLE` at **63.0 runs/step (42 handles)** and `ATTN_CORE` at **43.0 runs/step**, so a reader
+comparing 64 against the span table's 63 is comparing two different things. What the trace settles is
+the **descriptor population**, and on populations it is **exact** — the byte size per descriptor is not
+in the trace at all.
+
+**The byte/time pairing, because without it the total looks impossible.** `20.3172 GB ÷ 7.7751 ms` would
+be **2.61 TB/s** — above every measured bandwidth in §1.6, and this manual's own rule (*a floor cannot
+exceed its measurement*) says that cannot be right. The resolution is that the two populations have
+**two separate unions**, and they are additive because they are disjoint in time:
+
+| population | bytes (round trip) | its own measured union | implied rate | % of the 1,775.1 GB/s point |
+|---|---:|---:|---:|---:|
+| `ATTN_PREAMBLE` staging | 13.6506 GB | 7.7125 ms | **1.770 TB/s** | **99.7 %** |
+| `ATTN_CORE` staging | 6.6666 GB | 3.8588 ms | **1.728 TB/s** | **97.3 %** |
+| **both** (overlap **0.0000 ms**) | **20.3172 GB** | **11.5713 ms** | **1.756 TB/s** | **98.9 %** |
+
+*(All three unions are measured on the `merged = 56.6355 ms/step` trace, `Archive/by-date/2026-10-13/
+dsv4-profile-run/`.)* **Every rate is at or just under the band, which is what makes the correction
+credible**: the pass is not inefficient, it is doing **1.49× the work the model credited it with**.
+
+**Two spans are 74 % of that traffic, and one of them has no time headroom at all:**
 
 | span | traffic | measured union | implied rate | share of the port | headroom |
 |---|---:|---:|---:|---:|---|
-| `ATTN_PREAMBLE` KV-slab staging (strided → dense, **round trip**) | **13.65 GB** | **7.7751 ms/step** | **1.756 TB/s** = **98.9 %** of the 1,775.1 GB/s DMA point | **38.9 %** | traffic only |
-| fp4 dequant (packed read + fp8 write) | **12.99 GB** | **6.8411 ms/step** | **1.90 TB/s** | **37.0 %** | traffic only |
+| KV-slab staging, `ATTN_PREAMBLE` + `ATTN_CORE` (strided → dense, **round trip**) | **20.3172 GB** | **11.5713 ms/step** | **1.756 TB/s** = **98.9 %** of the 1,775.1 GB/s DMA point | **45.2 %** | **traffic only** |
+| fp4 dequant (fp8 write + GEMM read) | **12.986 GB** | **6.8411 ms/step** | **1.90 TB/s** = **88.4 %** of the 2,147 GB/s TPC envelope | **28.9 %** | **not established** |
 
-- **The KV slab is the largest single removable item in the step, and a milliseconds-ranked list puts
-  it second.** It is a 13.65 GB round trip serving **~2.8 MB of useful fp8 KV** — one row per page out of
-  a dense `[32768, 2422]` bf16 tensor built per layer-launch (§3.6.5) — and it already runs at 98.9 % of
-  the DMA engine's measured envelope, so **no kernel work can buy anything here; only moving less can.**
-- **The fp4 dequant runs at 1.90 TB/s — above the dequant kernel's own best single-shape figure
-  (1,885.7 GB/s, §3.4.8).** Its kernel is done; only its traffic is left.
+- **The KV slab is the largest single removable item in the step, and a milliseconds-ranked list puts it
+  second.** It is a 20.3172 GB round trip serving **~2.8 MB of useful fp8 KV** — **~7,200× the payload**,
+  one row per page out of a dense `[32768, 2422]` bf16 tensor built per layer-launch (§3.6.5) — and it
+  already runs at 98.9 % of the DMA engine's measured envelope, so **no kernel work can buy anything
+  here; only moving less can.**
+- **The fp4 dequant's headroom is *not* established, and the earlier "the kernel is done; only its
+  traffic is left" is withdrawn.** It is a **TPC** kernel (`fp4_dequant_lutptr_rc_gaudi2`, engine
+  `kernel`), so its envelope is the **TPC stream** figure (2,147 GB/s) and not the DMA peak — and its
+  implied 1.90 TB/s is **88.4 %** of that, against the dequant's own best single-shape kernel figure of
+  **1,885.7 GB/s** (§3.4.8), which the model's implied rate *exceeds*. **So this section has not shown
+  that the kernel is at its bandwidth limit rather than its issue limit.** An archived decomposition of
+  the **pre-LUT** kernel put **72.7 % of its time in ALU** at 0.95× its own memory bound, and the LUT
+  promotion has since changed that kernel — so treat the fp4 row as **traffic worth removing, with a
+  kernel cost this section does not measure.**
 
 **Check compute too, so you know traffic is the binding resource.** The step needs **29.14 GFLOP/token**
 — an arithmetic intensity of **2.60 FLOP/B** against the floor — so the FLOPs term binds only below
 **~5.6 TFLOP/s**; against the **430 TFLOP/s** MME rate (§3.1.3) that is a **~77× margin**, and the 2×
-unit ambiguity §3.1.3 flags does not change it (halving the rate still leaves ~38×). **A 12.5× traffic
+unit ambiguity §3.1.3 flags does not change it (halving the rate still leaves ~38×). **A 16.0× traffic
 amplification against a 77× compute margin is the shape of this port's problem: it is bytes, not FLOPs.**
 
 > **A surprise in the *other* direction: a novel architecture is not automatically a porting
@@ -343,14 +415,56 @@ amplification against a 77× compute margin is the shape of this port's problem:
 > (`Archive/by-date/2026-10-14/dsv4-perf-ab/REPORT.md` §3.3). **So build the floor for the architecture
 > you have** — a structure that looks expensive (a second compressor, an indexer, a `topk`) can be the
 > reason the floor does not grow with context.
+>
+> **But the chapter now carries two different KV numbers, and they are different quantities — read
+> this before quoting either.** §3.1.1's KV term is **7.19 MB/step**, and **6.88 MB of it is exactly
+> `640 × 512 × 21`** — the window + top-k read counted on the **21 layers that have an indexer** — with
+> the remaining 0.31 MB the indexer's own state. The **14.1 MB** here is that same per-layer read
+> (`640 × 512 B`) applied to **all 43 layers** (`640 × 512 × 43`). **The two differ by the layer base,
+> not by a measurement**, and **neither is the full mandatory read**: the 22 layers without an indexer
+> read the window (`128 × 512 B`) rather than a top-k of 512, which §3.1.1 does not carry and the
+> 43-layer count over-applies the top-k to. A layer-aware count therefore sits **between** them. **Both
+> are ≤0.1 % of the floor — which is exactly why the ≤0.1 pp share test that validates the floor cannot
+> see a 1.96× difference between them**, and why the 32× above should be read as a floor on the
+> advantage rather than a precise figure.
 
-**Two bounds on what this method can claim.**
+**What removing the traffic buys, so the target is legible.** Take the three materialisations out of the
+44.996 — the KV slab (**−20.3172**), the fp4→fp8 round trip (**−12.986**) and the `kexp`
+re-materialisation (**−6.4928**) — and the port lands at **5.20 GB/rank/step → 2.422 ms/token (413
+tok/s) at 2,147 GB/s to 2.930 ms (341) at 1,775**, against the model's own irreducible 1.307–1.581 ms.
+**And if the routed-expert over-read is fixed too** (the port gathers a **static 6 experts/rank** where
+~1.5 are routed there, worth ~2.4 GB/step), it lands at **2.765 GB/rank/step — the model's own 2.8061
+GB/card to within 1.5 %** — **1.288 ms → 776 tok/s.** That is what "rank by removable bytes" is worth on
+this port: 16.0× down to 1.0×.
 
-- **The port's 35.083 GB is a byte *model*, not a byte counter.** The profiler trace carries no byte
-  counts (§3.4.6), so the port's traffic is shapes × call counts, and the KV slab's 13.65 GB is a count
-  read out of a compiled-graph dump (§3.6.5). The two rates above therefore pair *modelled* bytes with
-  *measured* union time: reproducible from those artifacts, the right order, but not a counter.
-- **Both sides are per rank against per card**, so the 12.5× is like-for-like — but it is `[DSv4F]`, one
+> ### The instrument note that would have caught this: **count populations, not nodes**
+>
+> A compiled-graph dump can hold **more than one node of the same kind**, so a census of "*the*"
+> materialisation must count **populations across recipes**, not one node in one graph. The `ATTN_CORE`
+> node is **bit-identical** to the `ATTN_PREAMBLE` node — same `guid` (`memcpy_dma`), same `num_of_ROIs`
+> (**243**), same `dma_expected_duration` (**3719.180392235825**), same 158,728,192 B payload — and it
+> lives in a **different recipe's** dump
+> (`Archive/by-date/2026-10-13/staging-origin-nodes-dump/evidence/post_decode_ATTN_CORE_210node.json`,
+> node `46_memcpy_124917_internal`, against `…post_decode_ATTN_PREAMBLE_111node.json`'s
+> `24_memcpy_116119_internal`). A reader who found one node and stopped had **2/3 of the population**.
+> The trace settles it in one pass, because the two populations carry **different event names**
+> (`24_memcpy_*_internal` vs `46_memcpy_*_internal`).
+
+**Bounds on all of this, because the section should not read as more precise than it is.**
+
+- **44.996 GB is a *lower* bound.** It uses only the roofline's own per-event byte sources plus the two
+  terms the trace shows exist and the model omitted. **If §3.4.6's six-stage MoE model is right about
+  the code path**, the MoE path alone is 31.65 GB/step (44.64 without the uncorroborated 12.99 GB
+  `cat`) and the port total is **53.92 GB/rank/step = 19.2×**. **⇒ the port's traffic is not determined
+  to better than a factor of ~1.2 (44.996 vs 53.92) by the accounting that exists** — quote the range,
+  not a point.
+- **The port's 44.996 GB is a byte *model*, not a byte counter.** The profiler trace carries **no byte
+  field at all**: a device event's arguments are `Device / EventName / HW event name / dataType /
+  eventHandle / hidden / recipeHandle / recipeId / recipeName / streamHandle`, and the only place bytes
+  appear is on the HCCL collectives (`count (elements) × dtype`). So the port's traffic is
+  **populations (exact, from the trace) × per-event sizes (from a compiled-graph dump or the
+  checkpoint's shapes)**. The unions above are measurements; the bytes are not.
+- **Both sides are per rank against per card**, so the 16.0× is like-for-like — but it is `[DSv4F]`, one
   model on one box. The *shapes* of the argument are the general part: build the floor, measure the
   port, divide, and rank by removable bytes.
 
@@ -1352,9 +1466,9 @@ than reading **all 64 local** experts (**36.8 GB/step ÷ 3.449 GB/step**; `64 / 
 the fused read of **all 64 local** experts collapses to **1.21×** (`44.64 / 36.8 = 1.21`). **I** —
 *this is the single check that decides whether a fused-expert optimisation is worth anything.*
 
-> **CORRECTED 2026-10-14 — the sentence above read *"Reading the 6 routed experts of 64 local gives a
-> 12.9× traffic win"*, and that ratio does not reproduce for the comparison its wording states; the
-> original is kept here as the record.** Reading 6 of 64 local against all 64 local is
+> **CORRECTED 2026-10-14 — the sentence this replaces read *"Reading the 6 routed experts of 64 local
+> gives a 12.9× traffic win"*, and that ratio does not reproduce for the comparison its wording states;
+> the original is kept here as the record.** Reading 6 of 64 local against all 64 local is
 > **36.8 ÷ 3.449 = 10.67×** (and `64 / 6 = 10.67`). The `12.9×` is real but belongs to a *different*
 > pair: the routed-only read (**3.45 GB**) against §3.4.6's **44.64 GB** materialised BEFORE total
 > (`44.64 / 3.45 = 12.94×`) — which is also the baseline of the `1.21×` beside it
@@ -2393,6 +2507,17 @@ byte floor  13.65 GB / 1.81 TB/s  (ASSUMED: midpoint of a RETRACTED range)  =  7
 measured S4 union (this span's own stage)                   =      7.7751 ms/step
   -> 1.011× / 1.012× / 1.151× / 1.155× those floors        = 98.9 / 98.8 / 86.9 / 86.6 % of envelope
 ```
+
+> **CORRECTED 2026-10-14 — the launch count in the block above is `43`; the step issues `64`.** The same
+> staging node runs in **two** recipes — **43 `ATTN_PREAMBLE` launches and 21 `ATTN_CORE` launches**,
+> **disjoint in time** — so **every byte figure here scales by `64/43`**: `158.7 MB × 64 = 10.1586 GB`
+> one way, **`20.3172 GB` round trip**, and the four byte floors become **`11.446 / 11.436 / 10.052 /
+> 10.016 ms/step`**. **The `98.9 / 98.8 / 86.9 / 86.6 %` band is unchanged**, because both the bytes and
+> the measured union scale together — so this section's *verdict* (the pass sits at ~99 % of the
+> envelope, and the lever is **traffic**) stands; only its denominators were **1.49×** too small. The
+> `43`-launch arithmetic is kept above as the record. **Population evidence, the second node's identity,
+> and the reconciled rate: §3.1.4** — the `ATTN_CORE` node is `46_memcpy_124917_internal` in
+> `Archive/by-date/2026-10-13/staging-origin-nodes-dump/evidence/post_decode_ATTN_CORE_210node.json`.
 
 **The pass runs at 87–99 % of the DMA envelope — and the `~97 %` that used to stand here rests on a
 denominator that is ASSUMED, not measured.** It is **not inefficient — it is efficiently doing work
