@@ -14,9 +14,10 @@ are workload-specific are labelled **[DSv4F]** every time. The *shapes* of the a
 the *values* are not.
 
 **And "the port" is one specific thing.** Throughout this chapter, **"the port"** means this project's
-DeepSeek V4 Flash port — `src/vllm-gaudi` with the `src/vllm` engine, served by `vllm serve`. It is not
-any other DeepSeek V4 implementation: a `vllm_gaudi` tree from a **different repository** is a **different
-port**, and its runs are not evidence about this one.
+DeepSeek V4 Flash port — `src/vllm-gaudi` with the `src/vllm` engine — driven **offline** by the harness
+in `src/load_and_decode/` and served by the `vllm serve` CLI. It is not any other DeepSeek V4
+implementation: a `vllm_gaudi` tree from a **different repository** is a **different port**, and its runs
+are not evidence about this one.
 
 **And the engine-run figures measure a configuration, not the defaults.** Every offline run behind them
 **on the current harness** went through a harness that exports `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and
