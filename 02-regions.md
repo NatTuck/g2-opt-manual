@@ -642,6 +642,11 @@ remove the specialization either.** After the break was gone, the single remaini
 needed **87 compile ids, 43 of them per-layer** — the specialization survives the break's removal.
 **MEASURED** — `[DSv4F]`.
 
+**A third trap sits in the same place, and it is about what a *write* costs rather than what a region
+costs.** A view-level in-place write is free; the *same* write hidden inside an opaque op that declares
+`Tensor(a!)` materialises whole copies of the mutated buffer. If you are moving work into a region,
+check which spelling of the write you are moving with it — [Chapter 3](03-porting.md) §3.6.6.
+
 ### 2.5.3 The specialization count is a first-class metric
 
 **Track it on every change to regions, kernels or graphs**, alongside launches, syncs and wall time.
@@ -1057,7 +1062,7 @@ gate and a number that fails it must never appear in the same column.
 
 ---
 
-## 2.9 Measurement discipline — eight rules, each with the instance that produced it
+## 2.9 Measurement discipline — ten rules, each with the instance that produced it
 
 These are stated as rules because each one cost us a wrong number.
 
@@ -1243,6 +1248,46 @@ The two buckets are the instrument's own split at 50 µs — the population is a
 contradiction, divide them. If the ratio is the step count, the run count, the rank count or the layer
 count, you are almost certainly looking at a **normalisation** — and the moments (median, mean, total,
 max) agreeing is the evidence that it is one object. Compare the **moments**, not just the counts.
+
+### Rule 9 — Two views of the same quantity are not two instruments
+
+**"Two instruments agree" is a claim about independence, and it is false whenever both readings are
+computed from the same measurement.** The test is not whether the numbers match — matching is exactly
+what a shared definition produces. The test is: *would a change in the quantity being measured move one
+reading and not the other?*
+
+**The instance.** An investigation into what a compiled in-place write costs reported that a graph-dump
+node census and an allocator peak "agree exactly", both giving 23.25 GB. They did not agree: the two
+numbers are **23,251,200,000** and **23,251,465,216**. Both are computed from the same allocation, so
+neither could have contradicted the other, and the dump side additionally **double-counted** — summing
+four per-operation dumps of *one* buffer as four clones. The dump carries **no byte field at all**, so
+it could not have been a byte instrument in the first place. The genuinely independent instrument in
+that dataset was **wall time**, which is what actually licensed the conclusion that the copies execute.
+**MEASURED.**
+
+**The habit.** Name what each instrument is a *view of*, and say which one is independent. If two
+readings are two views of one quantity, report them as one number plus one cross-check — not as two
+instruments agreeing. And when a dump is involved, check that the field you are summing is a size at
+all.
+
+### Rule 10 — An instrument that overwrites its own evidence is not an instrument
+
+**If a re-run can destroy the previous run's record, then any one-off observation is unrecoverable and
+any claimed replication is unverifiable.** Artifact paths must carry the run's identity — arm, mode,
+device, timestamp, attempt — so a repeat shows up as a repeat instead of being averaged away or
+silently replacing the thing it was meant to check.
+
+**The instance, and it cost two claims in one investigation.** A probe harness wrote every run of an arm
+to the same output path and the same dump directory, so re-running an arm deleted the earlier record.
+The consequence was concrete: a single sighting of a compiled write **silently not landing** could be
+neither confirmed nor refuted, because no file anywhere recorded it — and a claimed replication of a
+second arm survived only in a prose journal, not as an artifact. The honest status of the first was
+**"the observation was never recorded"**, which is a *different statement* from "it did not reproduce":
+conflating the two would have upgraded an unrecorded sighting into either a defect report or a clean
+negative, and both are stronger than the evidence. **MEASURED.**
+
+**The habit.** Before running an arm a second time, check that the second run cannot overwrite the
+first. Then a non-reproduction is evidence rather than an absence of it.
 
 ---
 
