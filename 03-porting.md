@@ -1346,9 +1346,20 @@ the authority.
 (0.5 → 1 B/value), taking the routed buffers from **36.8 → 71.4 GB/rank** (+34.6 GB), on a 96 GB card
 with **12.3 GB free** ⇒ **HBM-blocked**. **NOTE-CLAIM [DSv4F]**
 
-**Read only the routed experts.** Reading the 6 routed experts of 64 local gives a **12.9×** traffic
-win; reading **all 64 local** experts gives **36.8 GB/step** and the win collapses to **1.21×**. **I**
-— *this is the single check that decides whether a fused-expert optimisation is worth anything.*
+**Read only the routed experts.** Reading the 6 routed experts of 64 local is **10.7×** less traffic
+than reading **all 64 local** experts (**36.8 GB/step ÷ 3.449 GB/step**; `64 / 6 = 10.7`), and against
+**§3.4.6's 44.64 GB** materialised path the fused read of the 6 routed experts is **12.9×** less while
+the fused read of **all 64 local** experts collapses to **1.21×** (`44.64 / 36.8 = 1.21`). **I** —
+*this is the single check that decides whether a fused-expert optimisation is worth anything.*
+
+> **CORRECTED 2026-10-14 — the sentence above read *"Reading the 6 routed experts of 64 local gives a
+> 12.9× traffic win"*, and that ratio does not reproduce for the comparison its wording states; the
+> original is kept here as the record.** Reading 6 of 64 local against all 64 local is
+> **36.8 ÷ 3.449 = 10.67×** (and `64 / 6 = 10.67`). The `12.9×` is real but belongs to a *different*
+> pair: the routed-only read (**3.45 GB**) against §3.4.6's **44.64 GB** materialised BEFORE total
+> (`44.64 / 3.45 = 12.94×`) — which is also the baseline of the `1.21×` beside it
+> (`44.64 / 36.8 = 1.21×`). **Both comparisons are now stated, and the conclusion is unchanged: read
+> only the routed experts.**
 
 ### 3.4.6 The materialised-traffic model — and why you must not trust its biggest number
 
@@ -2844,7 +2855,9 @@ consults this register to find out what we do *not* know gets a complete answer.
 18. Quote the wall relation **with its run set and its caveats** (§3.6.2).
 19. Check the dead-end register (§3.8) before starting anything on the list.
 20. For a fused-expert idea, **first check whether the op reads the routed experts or all local
-    experts** — 12.9× vs 1.21×.
+    experts** — the read-set ratio is **10.7×** (6 of 64 vs all 64); against §3.4.6's 44.64 GB
+    materialised path, routed-only is **12.9×** and all-local collapses to **1.21×**. *(Corrected
+    2026-10-14 — this line read `12.9× vs 1.21×`; §3.4.5.)*
 21. **When you fix a defect, sweep every place that *prescribes* the pattern you changed** — the
     loader, the tests, your own notes, and the docs. In §3.4.5 each of the three defects was found by
     reading **a different file from the one that was wrong**, and one of them was a document telling a
