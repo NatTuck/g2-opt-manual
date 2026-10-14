@@ -270,6 +270,90 @@ the four-condition overlap law (**Chapter 2 §2.2**):**
 3. **Keep ops clusterable** or you fragment recipes and lose the `MAX`. **MEASURED** (synthetic C-API
    recipes; the percentages do **not** transfer to a real model).
 
+### 3.1.4 The traffic-amplification ratio — rank spans by *removable bytes*, not milliseconds
+
+§3.1.1 gives the model's **irreducible** byte floor. The porting lesson is the ratio between that floor
+and what the port **actually moves**:
+
+1. **Build the model's irreducible per-step requirement** — the weights actually read per token (every
+   weight element once at M = 1), the KV read per token, the activations. That is §3.1.1.
+2. **Measure what the port moves** — a byte account of the port's own recipes and materialisation
+   passes, per rank per step.
+3. **Divide.** `traffic amplification = port bytes ÷ model bytes`.
+
+**The ratio is the finding.** A port that moves **12× the bytes the model requires cannot be rescued by
+a faster kernel.** Making every pass infinitely fast gets you to the port's own byte count costed at the
+band and no further: kernel efficiency and byte count are *different levers*, and on a real port the
+second is usually the larger. Do this arithmetic *before* optimising a kernel, because a kernel win is
+capped by the traffic the kernel is asked to move.
+
+**And it changes the order you attack spans in.** A span already running at ~99 % of the measured band
+has **no time headroom** — all of its headroom is in the traffic it moves. Rank a span table by
+**milliseconds** and that span sits mid-list; rank it by **removable bytes** and it is the largest item
+on it. This is the byte-side companion of §3.6.4's rule (*price a removal by its leave-one-out, not its
+union*): **a milliseconds-ranked list hides exactly the spans whose cost is traffic rather than time.**
+
+**The worked example — one decode step of the DSv4F port [DSv4F].**
+
+| | GB/step | source |
+|---|---:|---|
+| **model floor** (weights + KV + activations, one pass, batch 1) | **2.8061 /card** — 11.2244 device | §3.1.1's floor, re-derived independently |
+| **what the port moves** | **35.083 /rank** | the port's own recipes and materialisations |
+| **amplification** | **12.5×** | |
+
+The floor re-derives from the HF `config.json` and the 46 safetensors headers and **reproduces §3.1.1's
+own numbers — 11.248 GB device, 2.812 GB per card — to 0.2 %, and each of its nine shares to ≤0.1 pp.**
+Two independent accounts of the same checkpoint agreeing to a fifth of a percent is the reason to trust
+the method: the arithmetic is not the uncertain part. At the TPC stream envelope (2,147 GB/s) the floor
+is **1.307 ms/token**.
+
+**The port's own bytes, costed at the measured band, are 19.8 ms/token — a 50 tok/s target is the floor
+of the code as it stands.** 35.083 GB/rank/step at the measured band gives **16.34 ms/token (61.2
+tok/s) at 2,147 GB/s, 17.30 ms (57.8) at 2,028 GB/s and 19.76 ms (50.6) at 1,775 GB/s** — the last being
+the slowest measured point. The port *currently* runs at a measured **56.6355 ms/step device union**,
+i.e. **2.9× above its own byte floor**, so a perfect kernel that moved exactly these bytes would land at
+50 tok/s and the 2.9× above it is scheduling rather than bytes. **That is the number to take away: this
+port's traffic, not its kernels, is what stands between it and the target.**
+
+**Two spans are 76 % of that traffic, and neither has time headroom:**
+
+| span | traffic | measured union | implied rate | share of the port | headroom |
+|---|---:|---:|---:|---:|---|
+| `ATTN_PREAMBLE` KV-slab staging (strided → dense, **round trip**) | **13.65 GB** | **7.7751 ms/step** | **1.756 TB/s** = **98.9 %** of the 1,775.1 GB/s DMA point | **38.9 %** | traffic only |
+| fp4 dequant (packed read + fp8 write) | **12.99 GB** | **6.8411 ms/step** | **1.90 TB/s** | **37.0 %** | traffic only |
+
+- **The KV slab is the largest single removable item in the step, and a milliseconds-ranked list puts
+  it second.** It is a 13.65 GB round trip serving **~2.8 MB of useful fp8 KV** — one row per page out of
+  a dense `[32768, 2422]` bf16 tensor built per layer-launch (§3.6.5) — and it already runs at 98.9 % of
+  the DMA engine's measured envelope, so **no kernel work can buy anything here; only moving less can.**
+- **The fp4 dequant runs at 1.90 TB/s — above the dequant kernel's own best single-shape figure
+  (1,885.7 GB/s, §3.4.8).** Its kernel is done; only its traffic is left.
+
+**Check compute too, so you know traffic is the binding resource.** The step needs **29.14 GFLOP/token**
+— an arithmetic intensity of **2.60 FLOP/B** against the floor — so the FLOPs term binds only below
+**~5.6 TFLOP/s**; against the **430 TFLOP/s** MME rate (§3.1.3) that is a **~77× margin**, and the 2×
+unit ambiguity §3.1.3 flags does not change it (halving the rate still leaves ~38×). **A 12.5× traffic
+amplification against a 77× compute margin is the shape of this port's problem: it is bytes, not FLOPs.**
+
+> **A surprise in the *other* direction: a novel architecture is not automatically a porting
+> liability.** DSv4's compressed-KV plus learned sparse indexer makes the mandatory per-token KV read
+> **14.1 MB/step and independent of context** — 32× less than a dense MLA cache at 20 k positions —
+> because both the sliding window (128) and the indexer's `topk` (512) are fixed. **That is measured,
+> not argued: the decode step is flat in context, 78.468 → 78.154 ms from 35 to ~20,000 tokens**
+> (`Archive/by-date/2026-10-14/dsv4-perf-ab/REPORT.md` §3.3). **So build the floor for the architecture
+> you have** — a structure that looks expensive (a second compressor, an indexer, a `topk`) can be the
+> reason the floor does not grow with context.
+
+**Two bounds on what this method can claim.**
+
+- **The port's 35.083 GB is a byte *model*, not a byte counter.** The profiler trace carries no byte
+  counts (§3.4.6), so the port's traffic is shapes × call counts, and the KV slab's 13.65 GB is a count
+  read out of a compiled-graph dump (§3.6.5). The two rates above therefore pair *modelled* bytes with
+  *measured* union time: reproducible from those artifacts, the right order, but not a counter.
+- **Both sides are per rank against per card**, so the 12.5× is like-for-like — but it is `[DSv4F]`, one
+  model on one box. The *shapes* of the argument are the general part: build the floor, measure the
+  port, divide, and rank by removable bytes.
+
 ---
 
 ## 3.2 The M = 1 GEMV ceiling is HBM — and it has a cliff
