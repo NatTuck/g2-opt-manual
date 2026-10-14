@@ -1090,6 +1090,19 @@ the recipe still occupies that time. **MEASURED** *(artifact: `Archive/by-date/2
 — the event-subset table, `sr8_spans.py`, `sr11_final.py`; the family unions and `merged` cross-check
 against the project's own per-family LOO ranking.)*
 
+**"A union is an occupancy, not a saving" — two instances, both on the same model, both with the
+prediction right about the *removed* work and wrong about the *saving*.** Deleting work from a
+multi-engine union frees the **work**, not the **time**; the time freed is only the part that was on
+the **critical path**. **(i)** The MoE dequant's `repeat_interleave` expand: its four nodes carry
+**74.2973 µs/call** of `dma_expected_duration` and a same-kernel ablation measures **68.1 / 83.8 µs
+(mean ≈ 76)** — so the *removal* is confirmed to ~3 % — but a replacement kernel that needs no expand
+nets only **27.4 µs/call**, because the other ~49 µs was **already overlapped with the TPC kernel**.
+**(ii)** An fp4 kernel change that removed **18.22 ms** of device busy yielded **11.32 ms** of
+`merged` (**62.1 %**): the shorter kernel **exposed** 6.91 ms of its own recipe's GEMM/DMA work that
+it had been covering. *Artifacts: `notes/fp4-cm-major-route.md` §4–§5 and
+`Archive/by-date/2026-10-14/fp4-layout-probe-cm/` (i); `Archive/by-date/2026-10-13/dsv4-profile-run/`
+(ii).* **MEASURED**
+
 **A span table should also report, per span, how many recipe LAUNCHES it contains** — a span's
 headline cost can be dominated by **one staging node that its boundary happens to enclose**
 (Chapter 3 §3.6.5).
