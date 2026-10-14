@@ -1601,12 +1601,22 @@ source read.**
 > **The limit, stated rather than glossed: there was no end-to-end engine decode.** The ordering is
 > argued from the call site — `load_general_plugins()` at `WorkerWrapperBase.init_worker`, before
 > `init_device` — **not measured in an engine run**. What is measured is one process on one module:
-> the plugin hook, the load path, and both ops.
+> the plugin hook, the load path, and both ops. **SUPERSEDED 2026-10-14 — a retry of the same launch
+> completed the end-to-end engine decode; this paragraph is retained as the record of what was true
+> before it ran (the retry note is below).**
 >
 > **Narrowed — the ordering is now measured in a real serving process.** In the first `vllm serve`
 > launch of the port the hook fired pre-device in **all six** processes, before any HPU op — but still
 > **without an end-to-end engine decode**: that run died at boot (§3.10 item 26;
-> `Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §2).
+> `Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §2). **SUPERSEDED 2026-10-14 — a retry of the
+> same launch completed the end-to-end engine decode.** *The clause above is retained as the record of
+> what was true before the retry ran.* On the retry the server **booted**, ran all **90 prompt + 9
+> decode** warm-up buckets, and **answered HTTP coherently** — so an end-to-end engine decode is now
+> **MEASURED** in the **`VLLM_T_COMPILE_DYNAMIC_SHAPES=0`** configuration: the measured offline
+> configuration, and a **configuration choice, not a fix**, so what is established is that a decode
+> completes **in that configuration**, not that the product defaults work. The retry's other serving
+> facts, and the serving path's own non-reproducibility, are §3.10 items 26 and 27
+> (`Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §1–§4).
 
 > **The correction, stated plainly.** **The blocker was the late write, not the GUID gap — and the late
 > write is now fixed (above).** The GUID gap is a **separate, one-line fix**, and it only matters at
