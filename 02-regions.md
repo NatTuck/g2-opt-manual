@@ -642,10 +642,13 @@ remove the specialization either.** After the break was gone, the single remaini
 needed **87 compile ids, 43 of them per-layer** — the specialization survives the break's removal.
 **MEASURED** — `[DSv4F]`.
 
-**A third trap sits in the same place, and it is about what a *write* costs rather than what a region
-costs.** A view-level in-place write is free; the *same* write hidden inside an opaque op that declares
-`Tensor(a!)` materialises whole copies of the mutated buffer. If you are moving work into a region,
-check which spelling of the write you are moving with it — [Chapter 3](03-porting.md) §3.6.6.
+**Another trap sits in the same place, and it is about what a *write* costs rather than what a region
+costs.** A view-level in-place write forces no second whole-buffer allocation; the *same* write hidden
+inside an opaque op that declares `Tensor(a!)` materialises whole copies of the mutated buffer. (It does
+not follow that the view-level spelling is cheap overall — [Chapter 3](03-porting.md) §3.6.5 measures it
+paying a 158.7 MB-per-launch page staging, which is a *different* cost of the same write.) If you are
+moving work into a region, check which spelling of the write you are moving with it —
+[Chapter 3](03-porting.md) §3.6.6.
 
 ### 2.5.3 The specialization count is a first-class metric
 
@@ -1258,12 +1261,14 @@ reading and not the other?*
 
 **The instance.** An investigation into what a compiled in-place write costs reported that a graph-dump
 node census and an allocator peak "agree exactly", both giving 23.25 GB. They did not agree: the two
-numbers are **23,251,200,000** and **23,251,465,216**. Both are computed from the same allocation, so
-neither could have contradicted the other, and the dump side additionally **double-counted** — summing
-four per-operation dumps of *one* buffer as four clones. The dump carries **no byte field at all**, so
-it could not have been a byte instrument in the first place. The genuinely independent instrument in
-that dataset was **wall time**, which is what actually licensed the conclusion that the copies execute.
-**MEASURED.**
+numbers are **23,251,200,000** and **23,251,465,216**. The dump carries **no byte field on a node or in
+its `tensors` table**, so it could not have been an instrument for *data movement* in the first place —
+the one byte field it does carry, the graph object's `workspace_size`, is a workspace *allocation* rather
+than bytes moved. And the dump side additionally **double-counted**, summing four per-operation dumps of
+*one* buffer as four clones; its total is also **run-dependent** (two runs of the same arm report 6
+declared entries / 23.25 GB and 9 / 34.88 GB). The
+genuinely independent instrument in that dataset was **wall time**, which is what actually licensed the
+conclusion that the copies execute. **MEASURED.**
 
 **The habit.** Name what each instrument is a *view of*, and say which one is independent. If two
 readings are two views of one quantity, report them as one number plus one cross-check — not as two
