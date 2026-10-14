@@ -588,10 +588,15 @@ looks like a detail and it is one of the largest op-count items in the whole ste
 > `int(w.max()) != 0xFF` — a host sync and a branch, which `torch.compile(fullgraph=True)` cannot trace.
 > **This port is safe today only because it stores the scales as `float32`** (decoded from the e8m0 byte
 > at load time), for which the guard returns before that line. **Any future change that keeps scales as
-> `uint8` into the dequant path introduces a graph break in the hottest region of the step** — and it
-> will present as a `UserError: Could not guard on data-dependent expression` from dynamo, not as a
-> correctness failure. **MEASURED** (a standalone compiled probe died exactly there; the same probe with
-> fp32 scales runs).
+> `uint8` — or as the checkpoint's own `F8_E8M0`, whose branch tests `torch.isnan(...)` +
+> `bool(bad_mask.any())`, also a `.item()` — into the dequant path introduces a graph break in the
+> hottest region of the step**, and it will present as a `UserError: Could not guard on data-dependent
+> expression` from dynamo, not as a correctness failure. **source read** — the guard's own comment names
+> `isnan` + `bool(bad.any())` as the graph break and cites the port's own rule against it
+> (`ops.py:1118-1125`). *(A standalone compiled probe did hit it: the port's pre-flight feeds fp32 scales
+> for exactly this reason — `Archive/by-date/2026-10-14/fp4-layout-probe-cm/test_cm_equiv.py`. **The
+> failure itself is not logged anywhere a reader can open** — treat that half as inherited, not as a
+> measurement.)*
 
 ### 3.3.2 The measured cost, per stage [DSv4F]
 
@@ -675,7 +680,9 @@ relying on it.
 > `c_cm = blk + ell(c) + 32·s_sh`.* **MEASURED**
 >
 > **And the route this describes was then built and priced end-to-end — it is MEASURED, and it is
-> BANKED, NOT WIRED: `notes/fp4-cm-major-route.md`.** Store the packed experts **C-major with N
+> BANKED, NOT WIRED: `notes/fp4-cm-major-route.md`; the numbers behind it:
+> `Archive/by-date/2026-10-14/fp4-layout-probe-cm/` — `REPORT-CM.md` §4 and
+> `REPORT-CM-MEASURED.md`.** Store the packed experts **C-major with N
 > innermost** and the four expand nodes go to **zero** (`DmaBroadcast` 0, `DmaMemcpy` 0, one
 > 3,146-byte activation permutation left), with the operand's K order becoming the packed
 > activation's natural (byte, nibble) order. Traffic **−16.840 GB/step**, confirmed on two independent
