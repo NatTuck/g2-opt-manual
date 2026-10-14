@@ -2755,14 +2755,14 @@ share are the rewrite plan's own §0.3/§1.3/§0.7 arithmetic, restated here.*
 
 ---
 
-### 3.6.6 An in-place write costs what the functionaliser can SEE — a view-level write forces no whole-buffer copy, an opaque one is copied
+### 3.6.6 An in-place write costs what the functionaliser can SEE — a view-level write forces no second whole-buffer *allocation*, an opaque one is copied
 
 *(Added 2026-10-15. Microbenchmarks at the model's own slab geometry — **no model, no vLLM, no server**,
 so this is not a `[DSv4F]` workload measurement. One process per arm, cold recipe cache. The write is
-verified to land in every arm **where a write is expected** — and verified *not* to land in the negative
-control: `nonmut_unused` fails both its checks by construction, `neg_readonly` writes nothing, and
-`internal_alloc`'s landing is read off its returned window because its own `args[0]` check is void by
-construction.)*
+verified to land in every arm **where a write is expected**, and verified *not* to land in the negative
+control (`nonmut_unused`, which fails both its checks by construction). Two arms carry no such verdict:
+`neg_readonly` writes nothing, and `internal_alloc`'s own `args[0]` check is void by construction — its
+landing is read off the returned window instead.)*
 
 > **VERDICT — in the currency of *peak allocation*, the cost of an in-place write is decided by whether
 > the functionaliser can see it, not by whether it mutates.** On a **3.8752 GB** int8 slab:
@@ -2789,14 +2789,14 @@ construction.)*
 page construction and SWA write of `_dsv4_page` / `_write_paged_swa_cache`:
 
 ```
-page = slab.view(torch.bfloat16)[:, off:off + pe].view(-1, bs, hd)  # STRIDED 3-D view; off = 0 below
+page = slab.view(torch.bfloat16)[:, off:off + pe].view(-1, bs, hd)  # STRIDED 3-D view; the probe runs off = 0
 page[blocks, offs] = kv                                             # view-level, in-place, ATen-visible
 ```
 
 The expensive form is the *same write* performed inside a custom op that **declares its operand
 mutated** — a `Tensor(a!)` argument, or a Python op registered with `mutates_args=`. That is the route
-§3.6.5's rewrite would have taken, which is why this section sits here. *(The snippet is the `off = 0`
-form; the shipped page offset is per-layer and wide — see the scope paragraph below.)*
+§3.6.5's rewrite would have taken, which is why this section sits here. *(The shipped page offset is
+per-layer and wide; the probe below runs with `off = 0` — see the scope paragraph.)*
 
 **The mechanism is torch's, and it needs no HPU to observe.** When a mutation is **opaque** — hidden
 inside an op the functionaliser cannot decompose into view updates — AOTAutograd wraps the call in
@@ -2835,11 +2835,11 @@ but not geometrically equivalent — different dtype, shape and page size — so
 (`max_memory_allocated()`) in one run. It is **not** a traffic byte count: the dump carries **no byte
 field on a node or in its `tensors` table**, so every byte figure for *data movement* read from a dump is
 a declared shape × dtype size. (The graph object does carry a byte-valued `workspace_size`, but that is a
-workspace *allocation*, not bytes moved — and it is absent from most of this dump family: 224 of 21,763
-files.) And the dump's own total is **run-dependent** (6 declared entries / 23.25 GB in one keep run, 9 /
+workspace *allocation*, not bytes moved — and in our own local census of this dump family it appears
+in only 224 of 21,763 files.) And the dump's own total is **run-dependent** (6 declared entries / 23.25 GB in one keep run, 9 /
 34.88 GB in another). By **distinct storage** the dump declares **at most 3** slab-sized storages (11.63 GB), and
-"at most" is load-bearing: two of the three share a memory section at identical byte size, so they may be
-one memory re-typed, and the dump cannot say which. The reconciliation between the two readings is
+"at most" is load-bearing: in the two keep-flag-`0` runs, two of the three entries share a memory section
+at identical byte size, so they may be one memory re-typed, and the dump cannot say which. The reconciliation between the two readings is
 **UNKNOWN**. The one genuinely independent instrument is **wall time**: the opaque arm costs **+11.77
 ms/call** over the read-only control at the same geometry (11.988 vs 0.222 ms), which is **20.9–23.9 GB**
 at the measured DMA band (§1.6) and **26–28 GB** at the TPC band
@@ -2864,7 +2864,7 @@ op eliminated and **the write does not land at all**. A false declaration that h
 answer on one compiler version is undefined behaviour with a lucky sample, not a design. **Do not use
 it.** **MEASURED.**
 
-**Scope: the shipped port is in the class that forces no whole-buffer copy.** The model's own compiled
+**Scope: the shipped port is in the class that forces no second whole-buffer allocation.** The model's own compiled
 dumps carry the `memcpy_dma` staging node §3.6.5 documents — `num_of_ROIs` **243**,
 `dma_expected_duration` **3719.180392235825**, fed by a bf16 `[32768, 2422]` view of the slab — and both
 this probe's view-level arm and §3.6.5's own compile-gate **control 1** reproduce that node exactly, the
@@ -2874,10 +2874,11 @@ the model's decode dumps share one duration, one ROI count and one in-tensor des
 distinct `user_mem_offset` values**, `0` on only **three** of them. **MEASURED** *(the node
 identification)*. `src/vllm-gaudi` and `src/custom_ops` declare **zero** mutating custom ops — not only
 zero `Tensor(a!)`, but zero `Tensor!`, zero `Tensor(x!)` and zero `mutates_args=`, and every op in
-`src/custom_ops` is pure-functional (`(Tensor, Tensor) -> (Tensor, Tensor)`). In vLLM itself the
+`src/custom_ops` is declared non-mutating. In vLLM itself the
 `Tensor(a!)` declarations are confined to the CPU and CUDA bindings (`csrc/cpu/torch_bindings.cpp`,
 `csrc/libtorch_stable/torch_bindings.cpp`, `csrc/flashkda_registration.cpp`). **The hazard is latent, not
-live.** **source read.**
+live.** **source read** (`grep -rn 'Tensor(a!)' src/vllm-gaudi src/custom_ops` → 0, and likewise for
+`Tensor!`, `Tensor(x!)` and `mutates_args=`).
 
 **The porting rule.** *Do not hide a mutation from the functionaliser.* Prefer a **view-level ATen
 in-place write** — the compiler has a cheap path for it. Treat a custom op that declares `Tensor(a!)` on
@@ -2890,10 +2891,11 @@ peak per call, not 262 KB.
    3.00440×.** That residual has **no mechanism**, and the 3.00440 row must be read as *the
    `torch.compile` pipeline up to and including the HPU per-op lowering* — it emits HPU Synapse graphs
    including whole-slab copies — **not** as an isolation of AOTAutograd. Do not decompose the step.
-2. **Any size dependence.** Graph structure is size-independent in **both halves** — HPU 4 MB–3.8752 GB,
+2. **Any size dependence.** Graph structure is size-independent in **both halves** — HPU 4 KB–3.8752 GB,
    CPU 4 KB–1 GB — and only peak *residency* moves, with a cause that is **UNKNOWN**. Quote no threshold.
 3. **What `inductor` pays.** Its runtime trace is inert and its wall time is ~6× lower on the same
-   graph, so whether it materialises the whole base is **UNRESOLVED**.
+   graph, so whether it materialises the whole base is **UNRESOLVED** — stated here deliberately, because
+   a reader who knows `inductor` would otherwise infer the opposite claim from the rows above.
 4. One sighting of a compiled **silent write-drop** on a strided view is recorded only as
    **UNRESOLVED — the observation was never recorded**. Four clean re-runs with preserved artifacts land
    the write every time, so neither "it is a defect" nor "it did not reproduce" is supported.
