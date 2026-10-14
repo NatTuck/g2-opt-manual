@@ -13,6 +13,12 @@ Gaudi 2.
 are workload-specific are labelled **[DSv4F]** every time. The *shapes* of the arguments are general;
 the *values* are not.
 
+**And the engine-run figures measure a configuration, not the defaults.** Every offline run behind them
+went through a harness that exports `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1` — dynamic
+shapes **off**, warm-up **skipped** — while the product default is `dynamic_shapes_compilation = True`
+with warm-up **on**. **Quote these figures with that configuration**: the default path is a latent defect,
+not a measured alternative (§3.10 item 26).
+
 **The one-line thesis.** **Prefill and decode bind on different resources, and the doctrine inverts
 between them.** A port that is tuned for one will be mistuned for the other. Get the binding resource
 right for each phase before optimising anything inside it.
@@ -1596,6 +1602,11 @@ source read.**
 > argued from the call site — `load_general_plugins()` at `WorkerWrapperBase.init_worker`, before
 > `init_device` — **not measured in an engine run**. What is measured is one process on one module:
 > the plugin hook, the load path, and both ops.
+>
+> **Narrowed — the ordering is now measured in a real serving process.** In the first `vllm serve`
+> launch of the port the hook fired pre-device in **all six** processes, before any HPU op — but still
+> **without an end-to-end engine decode**: that run died at boot (§3.10 item 26;
+> `Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §2).
 
 > **The correction, stated plainly.** **The blocker was the late write, not the GUID gap — and the late
 > write is now fixed (above).** The GUID gap is a **separate, one-line fix**, and it only matters at
@@ -2772,6 +2783,29 @@ consults this register to find out what we do *not* know gets a complete answer.
     is mapped" stayed true while the kernel database was already fixed, and a late write reported
     `applied` for as long as it existed. Read your detector's allow-list for what it *leaves out*.
     *(§3.4.8.)*
+26. **A harness that sets environment flags measures a configuration, not the product.** **MEASURED:**
+    the first `vllm serve` (HTTP) boot of the port **failed on all four ranks**, in the framework's
+    bucketed prompt warm-up — bucket **11 of 90**, the first `(bs=1, query=256)` prefill bucket — with
+    `RuntimeError: Not Implemented` from the graph compiler's **symbolic-shape execution**
+    (`habana_frameworks/torch/dynamo/compile_backend/symbolic_execution.py`'s
+    `int(sym_expr.subs(sym_value_dict))`, via symengine `Basic.evalf`). **The defect is not
+    server-specific — the harness had been masking it.** The offline harness's own env
+    applier sets `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1`, while
+    `dynamic_shapes_compilation` **defaults to `True`**: so **every offline figure this manual reports was
+    measured with dynamic shapes OFF and warm-up SKIPPED**, and the server run was the first thing on this
+    stack to use the defaults. **Read a harness's env before you quote its numbers, and say which
+    configuration they belong to.** `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` aligns a server run with the measured
+    offline configuration — a **configuration choice, not a fix**; the default dynamic-shape path stays an
+    **open defect**. And **do not reach for `VLLM_SKIP_WARMUP=1`**: it does not avoid the compile, it moves
+    it to the first request that lands in that bucket — **a failed boot becomes a server that dies on its
+    first use**. **What the same run did establish, in a real serving process:** the **KV budget check
+    passed** at `--max-model-len 20480` (`GPU KV cache size: 27,364 tokens`, 1.34×) while `262144` cannot
+    boot; the **plugin hook fired pre-device in all six processes**, so the fp4 promotion installs **before
+    the first HPU op** — the ordering it depends on (the *rewrite* branch was not exercised: the script
+    already exported `GC_KERNEL_PATH`); and the **LUT was active on 4 of 4 ranks** (`variant=noguard_floor`,
+    md5 `5a1e3296fa3a6ecf3379b688a18e1540`, **96** `LUT` / **0** `OURS` handshakes). **The HTTP layer was
+    never reached** — no listener came up, so no response exists and none is claimed.
+    *(`Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §3–§4 and §7.)*
 
 ---
 
