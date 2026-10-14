@@ -2808,8 +2808,8 @@ consults this register to find out what we do *not* know gets a complete answer.
     server-specific — the harness had been masking it.** The offline harness's own env
     applier sets `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1`, while
     `dynamic_shapes_compilation` **defaults to `True`**: so **every offline figure this manual reports was
-    measured with dynamic shapes OFF and warm-up SKIPPED**, and the server run was the first thing on this
-    stack to use the defaults. **CORRECTED 2026-10-14 — that universal is false as written; the sentence
+    measured with dynamic shapes OFF and warm-up SKIPPED**, and the server run used the product defaults.
+    **CORRECTED 2026-10-14 — that universal is false as written; the sentence
     above is kept as the record, and the scope is narrower than it says.** **(a) The manual's offline
     *microbenchmark and analysis* campaigns never run the engine at all, so neither variable is theirs to
     set.** Their own headers say so: `engine-overlap`'s harness reads *"No vLLM, no model weights, no
