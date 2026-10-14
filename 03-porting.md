@@ -13,6 +13,11 @@ Gaudi 2.
 are workload-specific are labelled **[DSv4F]** every time. The *shapes* of the arguments are general;
 the *values* are not.
 
+**And "the port" is one specific thing.** Throughout this chapter, **"the port"** means this project's
+DeepSeek V4 Flash port — `src/vllm-gaudi` with the `src/vllm` engine, served by `vllm serve`. It is not
+any other DeepSeek V4 implementation: a `vllm_gaudi` tree from a **different repository** is a **different
+port**, and its runs are not evidence about this one.
+
 **And the engine-run figures measure a configuration, not the defaults.** Every offline run behind them
 **on the current harness** went through a harness that exports `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and
 `VLLM_SKIP_WARMUP=1` — dynamic shapes **off**, warm-up **skipped** — while the product default is
@@ -1609,8 +1614,8 @@ source read.**
 > completed the end-to-end engine decode; this paragraph is retained as the record of what was true
 > before it ran (the retry note is below).**
 >
-> **Narrowed — the ordering is now measured in a real serving process.** In the first `vllm serve`
-> launch of the port the hook fired pre-device in **all six** processes, before any HPU op — but still
+> **Narrowed — the ordering is now measured in a real serving process.** In the `vllm serve` launch
+> item 26 records, the hook fired pre-device in **all six** processes, before any HPU op — but still
 > **without an end-to-end engine decode**: that run died at boot (§3.10 item 26;
 > `Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §2). **SUPERSEDED 2026-10-14 — a retry of the
 > same launch completed the end-to-end engine decode.** *The clause above is retained as the record of
@@ -2798,7 +2803,7 @@ consults this register to find out what we do *not* know gets a complete answer.
     `applied` for as long as it existed. Read your detector's allow-list for what it *leaves out*.
     *(§3.4.8.)*
 26. **A harness that sets environment flags measures a configuration, not the product.** **MEASURED:**
-    the first `vllm serve` (HTTP) boot of the port **failed on all four ranks**, in the framework's
+    a `vllm serve` (HTTP) boot of the port **failed on all four ranks**, in the framework's
     bucketed prompt warm-up — bucket **11 of 90** (**INFERRED** from the progress bar; a **lower bound** on
     progress, not rank-exact, because the per-rank lines interleave across four processes), the first
     `(bs=1, query=256)` prefill bucket — with
@@ -2809,7 +2814,7 @@ consults this register to find out what we do *not* know gets a complete answer.
     applier sets `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1`, while
     `dynamic_shapes_compilation` **defaults to `True`**: so **every offline figure this manual reports was
     measured with dynamic shapes OFF and warm-up SKIPPED**, and the server run used the product defaults.
-    **CORRECTED 2026-10-14 — that universal is false as written; the sentence
+    **CORRECTED 2026-10-14 — that universal is false as written; the *universal*
     above is kept as the record, and the scope is narrower than it says.** **(a) The manual's offline
     *microbenchmark and analysis* campaigns never run the engine at all, so neither variable is theirs to
     set.** Their own headers say so: `engine-overlap`'s harness reads *"No vLLM, no model weights, no
