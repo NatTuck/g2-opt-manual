@@ -2804,8 +2804,59 @@ consults this register to find out what we do *not* know gets a complete answer.
     the first HPU op** — the ordering it depends on (the *rewrite* branch was not exercised: the script
     already exported `GC_KERNEL_PATH`); and the **LUT was active on 4 of 4 ranks** (`variant=noguard_floor`,
     md5 `5a1e3296fa3a6ecf3379b688a18e1540`, **96** `LUT` / **0** `OURS` handshakes). **The HTTP layer was
-    never reached** — no listener came up, so no response exists and none is claimed.
-    *(`Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §3–§4 and §7.)*
+    never reached** — no listener came up, so no response exists and none is claimed. **SUPERSEDED
+    2026-10-14 — a retry of the same launch reached it.** *This sentence is retained as the record of what
+    was true before the retry ran.* **MEASURED, on the retry:** the server **booted** and **answered HTTP
+    coherently** — the reference request returned a grammatical, on-topic completion naming **Rayleigh
+    scattering** as the mechanism, so the **2026-08-27 echo failure mode is ruled out**. It needed the
+    `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` configuration of the paragraph above — the offline path's own setting,
+    a **configuration choice, not a fix** — and **still not** `VLLM_SKIP_WARMUP=1`. **It also needed a long
+    engine-ready timeout:** ready at **2,118 s** against the stock **600 s** default, so the default would
+    have aborted a correct boot as an engine-ready timeout ~1,500 s early — **a cold-recipe-cache DSv4
+    `vllm serve` must raise the readiness budget, or it reports a timeout that is not one.** All **90 prompt
+    + 9 decode warm-up buckets completed**, and the `Not Implemented` count is **0** (it was **8** here).
+    The retry also re-confirmed, and counted, the serving facts above: the **KV budget** identical
+    (`27,364 tokens`, 1.34×), the **plugin hook pre-device in 6 of 6 processes**, and the **LUT active on
+    4 of 4 ranks** (`variant=noguard_floor`, same md5) with **960** `LUT` / **0** `OURS` handshakes — the
+    same ~9.7 instantiations per warmed bucket as this run's 96 over its 10 completed buckets.
+    *(`Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §3–§4 and §7; the retry:
+    `Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §1–§4 and §9.)*
+27. **A serving path that is not a function of its request is not an instrument.** **MEASURED:** ten
+    identical **seeded** greedy requests to the same running server gave **two distinct results**, and the
+    split is **not random** — for one prompt class it is a deterministic function of the **request's ordinal
+    within that class** (even → A, odd → B, **26 of 26** of the requests after the first, p ≈ 1e-8; the very
+    first request after readiness is a third form, and for the other prompt class there is **no rule found**
+    — which is not the same as "random"). A merely *racy* mechanism would not hold a perfect parity over 26
+    requests; a *stateful, toggling* one fits better — **hypothesis, not measurement**. Four obvious
+    explanations are **excluded by the records**: it is **not a seed effect** (6 seeded vs 6 unseeded, 4
+    distinct results each), **not prefix caching** (**0.0 %** hit rate on every stats line), **not text
+    post-processing** (the divergence is in the API's own `logprobs.tokens` / `top_logprobs`, not only
+    `text`), and **not batch composition** (all **19** engine-stat lines in the serving window read
+    `Running: ≤1`, `Waiting: 0`, and the probe client is synchronous). It is **not the fp4 LUT** — same
+    `variant` and same table md5 on both sides. **The mechanism is UNKNOWN, and none is asserted.** The
+    **strongest surviving structural candidate is KV-cache block allocation** — the one quantity in the
+    serving configuration that differs from the offline one *and* is stateful, cyclic and per-request. The
+    remaining not-excluded candidates, in the report's own order: the post-warm-up graph set (weakened —
+    the offline path instantiates the same per-request kernel profile and is reproducible), a different
+    compiled graph selected under the *same* shapes (not logged today), a heuristic kernel choice
+    (`KernelConfig(enable_flashinfer_autotune=True, …)`), a non-deterministic reduction or atomics
+    (weakened by the offline control), `enable_chunked_prefill`, and the HTTP layer's own logprob assembly
+    (a serving-time-compiled `logsoftmax_fwd_f32` — a **different code path** from the offline arm's).
+    **What it does NOT invalidate — the over-claim risk, stated explicitly:** the **performance** figures
+    (a difference of order 1e-5 … 0.5 in a returned logprob cannot move a step wall), and this chapter's
+    **bit-exactness** claims, which are scoped to the **offline** path (§3.4.8). **What it DOES
+    invalidate:** any **HTTP-vs-offline numeric comparison** — the server is not a function of its request,
+    so such a comparison cannot attribute a difference to anything, including to the LUT.
+    **The offline control, with its own caveat.** The offline engine path **is** reproducible in-process —
+    `meas1 == meas2` exactly, on both token ids and logprobs, in every arm — and the harness calls that arm
+    its determinism control. **But that control is n = 2 per process**, which is weak on its own: at the
+    server's ~30 % A-rate, five independent n = 2 arms would all read "identical" about 6.6 % of the time.
+    **Do not overstate the offline path's determinism from it either.**
+    **On magnitude, do not repeat the "1–4 bf16 ULP" story.** Recomputed as exact rationals, **51 of 51**
+    residuals are **not** multiples of `0.125`, the coarsest grid any residual needs is **2⁻¹⁵**, and both
+    sides' logprobs are **float32-exact** — so these are ordinary float32 differences, spanning
+    **3e-5 … 0.53**. *(§3.4.8; `Archive/by-date/2026-10-13/serve-nondeterminism/REPORT.md` §1.1, §3–§5;
+    the measurement: `Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §5–§7 and §11 item 2.)*
 
 ---
 
