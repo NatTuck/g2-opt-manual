@@ -638,6 +638,16 @@ Per expert, per weight, `fp8_gemm_v2` needs:
    already folded into the fp8 exponent. The op has **no 2-D block-scale input**;
 4. **one tensor per expert** (2-D only).
 
+> **The four clauses above are NECESSARY, NOT SUFFICIENT — the runtime's acceptance criteria are
+> narrower.** A 2-D call that satisfies every clause — `A` `float8_e4m3fn` `[1, 4096]`, `B` `[2048,
+> 4096]` with `trans_B=True`, `out_dtype=bfloat16`, `A_scale_inv` a **0-dim** float32,
+> `B_scale_inv=None` — raised **`fp8_gemm_v2 is not yet supported on HPU`** inside a
+> `torch.compile(fullgraph=True)` region, while the model's own path calls the same op successfully.
+> **Which argument it objects to was NOT isolated** (candidates: the `M = 1` extent, the 0-dim
+> `A_scale_inv`, the operand alignment), so **do not read the four clauses as a guarantee** — if you
+> restructure a call site, budget for bisecting the arguments. **MEASURED-as-inconclusive** *Artifact:
+> `Archive/by-date/2026-10-14/fp4-layout-probe-cm/test_cm_equiv.py`.*
+
 **The K-axis order is FREE**, and this is the single most useful layout fact in the MoE path: because
 the contraction is a sum over `K`, **any permutation of `K` applied to *both* operands leaves the
 result unchanged.** The reference implementation exploits exactly this — it lets the dequant kernel
@@ -647,6 +657,38 @@ rather than un-permuting the large weight. **MEASURED**
 **⇒ A producer can emit the operand in whatever chunk order its kernel naturally writes, provided the
 consumer permutes the activation identically.** Verify the identity holds for your shapes before
 relying on it.
+
+> **BUT the K-permutation freedom has a precondition that is easy to lose: the layout change must not
+> move the axis the split runs along.** The reference dequant's `[o0‖o1]` interleave is emitted by an
+> intra-vector unpack, so **it runs along the kernel's VECTOR axis.** With the vector on the packed-byte
+> axis the interleave is entirely inside `K` (a K permutation, absorbable as above). **Move the vector
+> axis to `N` and the interleave folds the K-parity into `N`: the output stops being an `[N,K]` tensor
+> at all, and no activation permutation can undo it.** The fix is an **emission** change — emit the lo
+> and hi decodes as *separate outputs at the same `(n,c)`* rather than as one interleaved stream. Done
+> that way the operand's K order becomes the packed activation's **natural (byte, nibble)** order, so
+> the activation needs no scatter at all, and the operand is row-major `[K,N]` — which the MME consumes
+> with **0** layout DMA nodes. **Any layout change on such an op must re-derive the emission, not just
+> the strides.** *Check: a ~30-line probe (identity LUT, a known nibble pattern, `kexp ≡ 0`) reads the
+> emission straight off the output bytes — `Archive/by-date/2026-10-14/fp4-layout-probe-cm/`. Verified:
+> both kernels match their analytic models at **100.0000 %** over 25,165,824 positions, and the two
+> operands are **byte-identical** under the K permutation `s_cm = par(c)`,
+> `c_cm = blk + ell(c) + 32·s_sh`.* **MEASURED**
+>
+> **And the route this describes was then built and priced end-to-end — it is MEASURED, and it is
+> BANKED, NOT WIRED: `notes/fp4-cm-major-route.md`.** Store the packed experts **C-major with N
+> innermost** and the four expand nodes go to **zero** (`DmaBroadcast` 0, `DmaMemcpy` 0, one
+> 3,146-byte activation permutation left), with the operand's K order becoming the packed
+> activation's natural (byte, nibble) order. Traffic **−16.840 GB/step**, confirmed on two independent
+> instruments; **3.53–3.58 ms/step** measured at the dequant call — **not** a step time. **Read it
+> before re-deriving any of this**, and note the two numbers it says must never be quoted: the expand
+> frees only **27.4 of the ~76 µs/call it removes** (the rest was already overlapped with the TPC
+> kernel), and the **−9.584 ms/step** figure is a superseded `dma_expected_duration` **prediction**.
+> Its residual ~1.2× per-byte cost is **structural** (three candidate mechanisms tested and refuted).
+>
+> **A zero-copy `expand` spelling does NOT avoid the broadcast.** Writing the exponent as a stride-0
+> view of size > 1 instead of `repeat_interleave` still makes the GC **materialise** the stride-0 dim
+> into a `DmaBroadcast` node; only a **size-1** exponent dim compiles to **0** DMA. **MEASURED**
+> *(same artifact.)*
 
 ### 3.3.5 DEAD END: "remove the `cat`"
 
