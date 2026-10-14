@@ -612,6 +612,19 @@ The direction is **fewer, larger regions**. Two reasons, and they are worth keep
 * **Structural:** a region is the *unit inside which* one submission is possible. You cannot get
   independent cross-engine ops into one submission if they are in different regions to begin with.
 
+**"Fewer, larger regions" is two different changes, and only one of them is the one the argument above
+covers.** Merging **across independent instances** — N same-shaped bodies, independent of each other,
+folded into one recipe — is what the *structural* reason is about: they were independent, so they can
+now share a submission, and that overlap is new. Merging **across sequential stages** — several stages
+of one dataflow chained into one recipe — is a different change: those stages were already dependent,
+so nothing new can overlap, and all the merge buys is the host-side charge of §2.5.1b, which §2.5.5
+shows is a fraction of the tail rather than the lever — while a larger recipe still pays its own compile
+and memory cost. **So "we merged" is not one result: say which kind of merging you did before reading a
+coalescing change as a win.** **INFERRED** — this follows from §2.1's submission argument and is not
+itself a measurement; we have not run the two kinds against each other. *(An outside port reports the
+same asymmetry — horizontal batching ahead, vertical fusion behind — but without a figure we would
+quote; §3.9 item 23 names the source and its evidence problem.)*
+
 **But "fewer regions" is necessary, not sufficient.** §2.4 showed that a single region can compile to
 several recipes — and therefore several submissions — whenever a node inside it is not clusterable. So
 coalescing regions removes the *region-level* overhead; it does not by itself produce the submission
@@ -1315,6 +1328,28 @@ Set `DUMP_POST_GRAPHS=<dir>` and the GC writes **one JSON per compiled graph** i
    `max_shape`, `strides`, `alias_of`, `offset`, `allocation` and `persistent`. **MEASURED**
    *(Chapter 3 §3.6.5; `Archive/by-date/2026-10-13/staging-origin-nodes-dump/`.)*
 
+### The cold-cache rule has a dual: warm the cache before any **fixed-time-budget** comparison
+
+The last bullet of "what the dump does not give you" is a rule about **dumps**: a recipe-cache **hit**
+builds no graph, so a warm cache yields an **empty dump** — a **false negative**. Its dual is a rule
+about **timing**, and it points the other way. A **cold** cache puts **compilation inside the
+measurement window**, so a comparison whose metric is *work completed in a fixed wall-clock budget* —
+steps per budget, tokens per budget, any throughput figure taken over a fixed window — is **inflated by
+the compile**, not deflated, and the charge falls on each arm in proportion to what it has to compile,
+so two arms on a cold cache are **not penalised equally**. The error has nothing to do with the change
+under test.
+
+**The rule: before any fixed-time-budget comparison, run each arm once to compile, discard that run,
+and take the real measurement on the second.** One throwaway run, and the compile term sits outside the
+budget the metric is computed over.
+
+**Tier: INFERRED.** The mechanism is the one the dump rule already rests on — a warm hit loads a
+prebuilt recipe blob and builds nothing — and the direction of the error follows from it by reasoning,
+so the rule is sound. What we have **not** done is run the A/B ourselves: we hold no arm that measures
+one change against a cold and a warm cache. **So do not attach a size to the inflation from this
+manual** — its magnitude is a property of the workload's compile time against its budget, and it is not
+a number we have taken.
+
 ### A note on the MME cost model
 
 *(Chapter 1 §1.6 has both cost models in full, including the TPC side. What matters for this
@@ -1338,6 +1373,23 @@ immediate in the disassembly; it is derived from geometry). *(Artifact for both:
 * **No per-rank uniqueness by default.** With TP > 1 the workers share one dump directory unless you
   rewrite `DUMP_POST_GRAPHS` per rank *before any compile happens*; a shared directory reproduces the
   `synStatus 26` race above. **MEASURED.**
+* **No byte field at all — and therefore no byte count.** A dump node carries `engine`, `guid`, `type`,
+  `exec_order_idx`, `blocking_nodes`, `input_tensors`/`output_tensors`, `params` and the MME/DMA cost
+  fields; the graph's `tensors` table carries `dtype`, `dtype_bit_size`, `max_shape`, `strides`,
+  `offset`, `allocation` and the rest. **Nothing in either is a byte count.** So **every byte figure
+  derived from a dump is a shape × call-count model, not a counter** — a dump-based byte total can never
+  be *"measured bytes moved"*. **MEASURED** (the field list, read off the model's own decode dump). *(The
+  profiler's device events are no better: they carry `Device`, `EventName`, `HW event name`, `dataType`,
+  `eventHandle`, `hidden`, `recipeHandle`, `recipeId`, `recipeName`, `streamHandle` — and no byte
+  count.)*
+* **No live-memory count — and a sum over dump entries double-counts.** A tensor's `offset` in the dump
+  is just `section_index × 2^40`, not a byte address, and one buffer appears once in every per-op dump
+  that touches it — so **a sum over dump entries is not a live-memory count**. The instance: a census
+  that summed per-op dumps nearly published **6 whole-buffer clones / 23.25 GB**, where the same dumps
+  counted by **distinct storage** say **3** — the census was the view that over-counted. **Count by
+  distinct storage** (a new section, not aliased to an input), **never by dump entry**; and the 23.25 GB
+  there is a **shape-derived total, not a measured "bytes copied"**. **MEASURED.** *(The general form —
+  two views of the same quantity are not two instruments — is §2.9 rule 9.)*
 * **Not every graph — and a warm recipe cache gives an EMPTY dump.** Recipes deserialised from the
   recipe cache are never re-dumped, so a dump directory can under-represent what actually executed.
   **The cold-cache requirement and the run are MEASURED (2026-10-13):** the dump run pointed
