@@ -703,6 +703,24 @@ This one is worth recording in full because it looks like an easy win and it is 
   the graph compiler inserts `concat_logical` + `memcpy_dma` itself to stage a GEMM's operands. **A
   recipe containing a GEMM contains DMA layout ops whether or not the user's `cat` is there.**
   **MEASURED**
+- **~~A recipe containing a GEMM contains DMA layout ops whether or not the user's `cat` is there.~~**
+  **CORRECTED 2026-10-14 — that generalisation is FALSE as stated.** The GC **absorbs** a GEMM
+  operand's layout into the GEMM *descriptor* whenever the operand's memory order is
+  descriptor-expressible, so a GEMM-containing recipe can compile to **ZERO** layout DMA nodes.
+  Measured on the DSv4F dequant path: the *same* recipe, the *same* GEMM, the *same* `cat`, gives
+  **4** DMA layout nodes when the `repeat_interleave` expand is inside and **0** when the exponent is
+  passed in as an input — and those 4 nodes' own names say `expand/broadcast/33/…`, i.e. they are the
+  **broadcast's** staging, **not the GEMM's operand staging**. The `concat_logical` node is present in
+  both arms (engine `None`, in place), which is the part of the bullet above that *does* hold.
+  Separately measured: an operand whose memory is K-contiguous and one whose memory is N-contiguous
+  both give **0** layout DMA nodes, with `trans_B=True` and `False` alike, and a pure GEMM on the same
+  logical matrix in either memory gives a **0.0** diff — so the MME genuinely consumes either
+  descriptor. **⇒ Whether layout DMA appears is a property of the operand's memory order, not of the
+  presence of a GEMM.** *Artifact: `Archive/by-date/2026-10-14/fp4-layout-probe/` (arms B/G/H/J) and
+  `Archive/by-date/2026-10-14/fp4-layout-probe-cm/` — `A_CTL` 45 nodes / 2 `DmaTranspose` +
+  1 `DmaBroadcast` + 1 `DmaMemcpy` at 1.5101481958762886 / 24.462371134020618 / 24.162371134020617 /
+  24.162371134020617 µs (the model's own four expand nodes, to 16 s.f., so the census can fail) vs
+  `B_CTL_PRE` 28 nodes / **0** DMA / 2 `Concatenate`.*
 - **And the `cat` does not lower to what you would guess.** It lowers to **`concat_logical` with
   engine `None`** plus **2× `memcpy_dma`** — the concat itself carries no engine; the DMA nodes do.
   **MEASURED**
@@ -715,10 +733,15 @@ This one is worth recording in full because it looks like an easy win and it is 
   costing roughly its own work, i.e. no material extra serialisation — but that is a hint, not a
   result. **MEASURED-as-inconclusive**
 
-> **⇒ Verdict: "remove the cat" is NOT an actionable lever.** Not because the cat is free — because
-  the graph compiler re-inserts the equivalent layout work for the GEMM's operand staging, so removing
-> the user-level `cat` cannot remove the DMA layout ops from a GEMM-containing recipe. **Do not spend
-> a run on it.** Recorded here so nobody re-walks it. **MEASURED**
+> **⇒ Verdict: "remove the cat" is NOT an actionable lever — but NOT for the reason given here until
+> 2026-10-14.** That reason ("the GC re-inserts the equivalent layout work for the GEMM's operand
+> staging, so removing the user-level `cat` cannot remove the DMA layout ops") is the generalisation
+> the bullet above **corrects as FALSE**. The ground is narrower, and it is enough: the `cat` lowers
+> to `concat_logical` with engine `None` plus `memcpy_dma`; on this path the layout DMA is the
+> **expand's** staging, not the cat's — the no-expand control, with the cat present, compiles to
+> **0** layout DMA nodes — and the one synthetic measurement of the delta is **inconclusive** (it did
+> not assert its precondition and it changed the engine mix). **Do not spend a run on it.** Recorded
+> here so nobody re-walks it. **MEASURED**
 
 ### 3.3.6 What the MoE path is *already* doing right (so you don't "fix" it)
 
