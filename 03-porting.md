@@ -2820,13 +2820,16 @@ consults this register to find out what we do *not* know gets a complete answer.
     2026-09-21 predate the line.** The `VLLM_T_COMPILE_DYNAMIC_SHAPES` `setdefault` lives in `_apply_env` in
     `src/load_and_decode/engine.py` and arrived with the **2026-09-21** harness commit (`VLLM_SKIP_WARMUP`
     has been there since 2026-09-03); the archived **09-15…09-18** engine logs carry `VLLM_SKIP_WARMUP` and
-    **no** `VLLM_T_COMPILE_DYNAMIC_SHAPES` — i.e. the product default. **That leg is UNLICENSED, not
-    disproved** — those runs' own logs are not in the workspace (the earliest archived log carrying the
-    variable is **2026-09-26**), so the operator could in principle have exported it by hand — but the
+    **no** `VLLM_T_COMPILE_DYNAMIC_SHAPES` — i.e. the product default. **That leg is UNKNOWN, not
+    disproved** — the 09-19/09-20 runs behind this chapter's pre-09-21 engine figures kept no engine log
+    (there is no `Archive/by-date/2026-09-20/`, and the sequence jumps 09-19 → 09-26; 09-26 is the earliest
+    archived log that carries the variable), while the 09-15…09-18 logs above license only their own window
+    — so the operator could in principle have exported the variable by hand on those runs — but the
     **2026-09-21** record measures the setting *changing* the decode wall (**0.324 s → 0.318 s**), which is
     only possible if the pre-09-21 runs were not in it. **What still stands, and it is the point of this
-    item:** the **default dynamic-shape path is a latent defect**, and **every offline *engine* figure
-    since 2026-09-21 belongs to the harness configuration** — quote it with that configuration. The
+    item:** the **default dynamic-shape path is a latent defect**, and **every archived offline *engine*
+    run since 2026-09-21 went through that harness**, so its figures belong to that configuration — quote
+    them with that configuration. The
     correction **narrows the scope; it does not retire the claim.** *(Leg (a):
     `Archive/by-date/2026-10-12/engine-overlap/eo_harness.py` header;
     `Archive/by-date/2026-10-13/{dependency-semantics,eocensus-t2-rereduce,variant-decision-semantics}/REPORT.md`;
