@@ -583,6 +583,16 @@ compute_routed(flat, topk_ids, topk_weights)
 expand** (stage 4). The expand in particular is a *broadcast of an exponent across 16 bytes* — it
 looks like a detail and it is one of the largest op-count items in the whole step.
 
+> **TRAP — the e8m0 guard is a `Tensor.item()`, so it is a dynamo GRAPH BREAK inside a compiled region.**
+> `decode_e8m0_exponent` / `decode_e8m0_scale` run `_e8m0_guard`, which for **`uint8`** input evaluates
+> `int(w.max()) != 0xFF` — a host sync and a branch, which `torch.compile(fullgraph=True)` cannot trace.
+> **This port is safe today only because it stores the scales as `float32`** (decoded from the e8m0 byte
+> at load time), for which the guard returns before that line. **Any future change that keeps scales as
+> `uint8` into the dequant path introduces a graph break in the hottest region of the step** — and it
+> will present as a `UserError: Could not guard on data-dependent expression` from dynamo, not as a
+> correctness failure. **MEASURED** (a standalone compiled probe died exactly there; the same probe with
+> fp32 scales runs).
+
 ### 3.3.2 The measured cost, per stage [DSv4F]
 
 Two frames: **F2** = whole-trace ÷ 4 steps; **F1** = the decode window. **MEASURED [DSv4F]**
