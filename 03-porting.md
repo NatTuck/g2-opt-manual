@@ -330,7 +330,7 @@ At the TPC stream envelope (2,147 GB/s) the floor is **1.307 ms/token**.
 >   account agrees", and only the second would have caught this.
 
 **The port's own bytes, costed at the measured band, are 25.4 ms/token — the current code is ~21 % *short*
-of a 50 tok/s step.** 44.996 GB/rank/step at the measured band gives **20.96 ms/token (47.7 tok/s) at
+of the port's 50 tok/s goal.** 44.996 GB/rank/step at the measured band gives **20.96 ms/token (47.7 tok/s) at
 2,147 GB/s, 22.19 ms (45.1) at 2,028 GB/s and 25.35 ms (39.4) at 1,775 GB/s** — the last being the
 slowest measured point. The port *currently* runs at a measured **56.6355 ms/step device union**
 (`Archive/by-date/2026-10-13/dsv4-profile-run/span_table_P1_rank0.txt`), i.e. **2.2× above its own byte
@@ -375,9 +375,13 @@ exceed its measurement*) says that cannot be right. The resolution is that the t
 | `ATTN_CORE` staging | 6.6666 GB | 3.8588 ms | **1.728 TB/s** | **97.3 %** |
 | **both** (overlap **0.0000 ms**) | **20.3172 GB** | **11.5713 ms** | **1.756 TB/s** | **98.9 %** |
 
-*(All three unions are measured on the `merged = 56.6355 ms/step` trace, `Archive/by-date/2026-10-13/
-dsv4-profile-run/`.)* **Every rate is at or just under the band, which is what makes the correction
-credible**: the pass is not inefficient, it is doing **1.49× the work the model credited it with**.
+*(The `7.7125` and `3.8588` unions are the **DMA-staging subsets** of the two span rows; those rows'
+own **whole-span** unions are `ATTN_PREAMBLE` **9.8063** and `ATTN_CORE` **8.1241** ms in the span
+table `Archive/by-date/2026-10-13/dsv4-profile-run/span_table_P1_rank0.txt` — all measured on the same
+`merged = 56.6355 ms/step` trace. The staging-subset derivation is
+`Archive/by-date/2026-10-14/traffic-ledger/`.)* **Every rate is at or just under the band, which is
+what makes the correction credible**: the pass is not inefficient, it is doing **1.49× the work the
+model credited it with**.
 
 **Two spans are 74 % of that traffic, and one of them has no time headroom at all:**
 
@@ -419,13 +423,14 @@ amplification against a 77× compute margin is the shape of this port's problem:
 > **But the chapter now carries two different KV numbers, and they are different quantities — read
 > this before quoting either.** §3.1.1's KV term is **7.19 MB/step**, and **6.88 MB of it is exactly
 > `640 × 512 × 21`** — the window + top-k read counted on the **21 layers that have an indexer** — with
-> the remaining 0.31 MB the indexer's own state. The **14.1 MB** here is that same per-layer read
+> the remaining 0.31 MB the indexer's own state *(**INFERRED** — the split is arithmetic; §3.1.1 does
+> not carry the composition)*. The **14.1 MB** here is that same per-layer read
 > (`640 × 512 B`) applied to **all 43 layers** (`640 × 512 × 43`). **The two differ by the layer base,
 > not by a measurement**, and **neither is the full mandatory read**: the 22 layers without an indexer
 > read the window (`128 × 512 B`) rather than a top-k of 512, which §3.1.1 does not carry and the
 > 43-layer count over-applies the top-k to. A layer-aware count therefore sits **between** them. **Both
-> are ≤0.1 % of the floor — which is exactly why the ≤0.1 pp share test that validates the floor cannot
-> see a 1.96× difference between them**, and why the 32× above should be read as a floor on the
+> tabulate to 0.1 % of the floor — which is exactly why the ≤0.1 pp share test that validates the floor
+> cannot see a 1.96× difference between them**, and why the 32× above should be read as a floor on the
 > advantage rather than a precise figure.
 
 **What removing the traffic buys, so the target is legible.** Take the three materialisations out of the
@@ -454,8 +459,9 @@ this port: 16.0× down to 1.0×.
 
 - **44.996 GB is a *lower* bound.** It uses only the roofline's own per-event byte sources plus the two
   terms the trace shows exist and the model omitted. **If §3.4.6's six-stage MoE model is right about
-  the code path**, the MoE path alone is 31.65 GB/step (44.64 without the uncorroborated 12.99 GB
-  `cat`) and the port total is **53.92 GB/rank/step = 19.2×**. **⇒ the port's traffic is not determined
+  the code path**, the port total is **53.92 GB/rank/step = 19.2×** — **22.27** (the non-MoE side; the
+  port's routed-expert terms total 22.72) **+ 31.65** (§3.4.6's MoE path: its 44.64 less the
+  uncorroborated 12.99 GB `cat`). **⇒ the port's traffic is not determined
   to better than a factor of ~1.2 (44.996 vs 53.92) by the accounting that exists** — quote the range,
   not a point.
 - **The port's 44.996 GB is a byte *model*, not a byte counter.** The profiler trace carries **no byte
