@@ -14,10 +14,14 @@ are workload-specific are labelled **[DSv4F]** every time. The *shapes* of the a
 the *values* are not.
 
 **And the engine-run figures measure a configuration, not the defaults.** Every offline run behind them
-went through a harness that exports `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1` — dynamic
-shapes **off**, warm-up **skipped** — while the product default is `dynamic_shapes_compilation = True`
-with warm-up **on**. **Quote these figures with that configuration**: the default path is a latent defect,
-not a measured alternative (§3.10 item 26).
+**on the current harness** went through a harness that exports `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and
+`VLLM_SKIP_WARMUP=1` — dynamic shapes **off**, warm-up **skipped** — while the product default is
+`dynamic_shapes_compilation = True` with warm-up **on**. The applier is `_apply_env` in
+`src/load_and_decode/engine.py`, and its two lines do **not** share a date — `VLLM_SKIP_WARMUP` has been
+there since 2026-09-03, `VLLM_T_COMPILE_DYNAMIC_SHAPES` only since the **2026-09-21** harness commit — so
+the qualifier is a **date**: engine figures older than **2026-09-21** are **not** covered by the
+dynamic-shapes half (§3.10 item 26). **Quote these figures with that configuration**: the default path is a
+latent defect, not a measured alternative.
 
 **The one-line thesis.** **Prefill and decode bind on different resources, and the doctrine inverts
 between them.** A port that is tuned for one will be mistuned for the other. Get the binding resource
@@ -2795,7 +2799,9 @@ consults this register to find out what we do *not* know gets a complete answer.
     *(§3.4.8.)*
 26. **A harness that sets environment flags measures a configuration, not the product.** **MEASURED:**
     the first `vllm serve` (HTTP) boot of the port **failed on all four ranks**, in the framework's
-    bucketed prompt warm-up — bucket **11 of 90**, the first `(bs=1, query=256)` prefill bucket — with
+    bucketed prompt warm-up — bucket **11 of 90** (**INFERRED** from the progress bar; a **lower bound** on
+    progress, not rank-exact, because the per-rank lines interleave across four processes), the first
+    `(bs=1, query=256)` prefill bucket — with
     `RuntimeError: Not Implemented` from the graph compiler's **symbolic-shape execution**
     (`habana_frameworks/torch/dynamo/compile_backend/symbolic_execution.py`'s
     `int(sym_expr.subs(sym_value_dict))`, via symengine `Basic.evalf`). **The defect is not
@@ -2803,7 +2809,30 @@ consults this register to find out what we do *not* know gets a complete answer.
     applier sets `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` and `VLLM_SKIP_WARMUP=1`, while
     `dynamic_shapes_compilation` **defaults to `True`**: so **every offline figure this manual reports was
     measured with dynamic shapes OFF and warm-up SKIPPED**, and the server run was the first thing on this
-    stack to use the defaults. **Read a harness's env before you quote its numbers, and say which
+    stack to use the defaults. **CORRECTED 2026-10-14 — that universal is false as written; the sentence
+    above is kept as the record, and the scope is narrower than it says.** **(a) The manual's offline
+    *microbenchmark and analysis* campaigns never run the engine at all, so neither variable is theirs to
+    set.** Their own headers say so: `engine-overlap`'s harness reads *"No vLLM, no model weights, no
+    engine run"*, and `dependency-semantics` (*"Microbenchmarks and hand-built Synapse C-API graphs only.
+    No `vllm serve`, no model weights, no engine run"*), `eocensus-t2-rereduce` (*"pure data reduction. No
+    device, no HPU, no ports, no vllm"*), `span-ranking` (*"CPU-only"*) and `variant-decision-semantics`
+    (*"CPU-only, code-reading"*) say the same of themselves. **(b) The offline *engine* figures older than
+    2026-09-21 predate the line.** The `VLLM_T_COMPILE_DYNAMIC_SHAPES` `setdefault` lives in `_apply_env` in
+    `src/load_and_decode/engine.py` and arrived with the **2026-09-21** harness commit (`VLLM_SKIP_WARMUP`
+    has been there since 2026-09-03); the archived **09-15…09-18** engine logs carry `VLLM_SKIP_WARMUP` and
+    **no** `VLLM_T_COMPILE_DYNAMIC_SHAPES` — i.e. the product default. **That leg is UNLICENSED, not
+    disproved** — those runs' own logs are not in the workspace (the earliest archived log carrying the
+    variable is **2026-09-26**), so the operator could in principle have exported it by hand — but the
+    **2026-09-21** record measures the setting *changing* the decode wall (**0.324 s → 0.318 s**), which is
+    only possible if the pre-09-21 runs were not in it. **What still stands, and it is the point of this
+    item:** the **default dynamic-shape path is a latent defect**, and **every offline *engine* figure
+    since 2026-09-21 belongs to the harness configuration** — quote it with that configuration. The
+    correction **narrows the scope; it does not retire the claim.** *(Leg (a):
+    `Archive/by-date/2026-10-12/engine-overlap/eo_harness.py` header;
+    `Archive/by-date/2026-10-13/{dependency-semantics,eocensus-t2-rereduce,variant-decision-semantics}/REPORT.md`;
+    `Archive/by-date/2026-10-12/span-ranking/REPORT.md`. Leg (b): the 09-15…09-18 engine logs under
+    `Archive/by-date/`; `notes/wall-bound.md`, the L6 de-guard row.)* **Read a harness's env before you
+    quote its numbers, and say which
     configuration they belong to.** `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` aligns a server run with the measured
     offline configuration — a **configuration choice, not a fix**; the default dynamic-shape path stays an
     **open defect**. And **do not reach for `VLLM_SKIP_WARMUP=1`**: it does not avoid the compile, it moves
@@ -2813,7 +2842,8 @@ consults this register to find out what we do *not* know gets a complete answer.
     boot; the **plugin hook fired pre-device in all six processes**, so the fp4 promotion installs **before
     the first HPU op** — the ordering it depends on (the *rewrite* branch was not exercised: the script
     already exported `GC_KERNEL_PATH`); and the **LUT was active on 4 of 4 ranks** (`variant=noguard_floor`,
-    md5 `5a1e3296fa3a6ecf3379b688a18e1540`, **96** `LUT` / **0** `OURS` handshakes). **The HTTP layer was
+    md5 `5a1e3296fa3a6ecf3379b688a18e1540`, **96** `LUT` / **0** `OURS` handshakes **over that run's whole
+    log**). **The HTTP layer was
     never reached** — no listener came up, so no response exists and none is claimed. **SUPERSEDED
     2026-10-14 — a retry of the same launch reached it.** *This sentence is retained as the record of what
     was true before the retry ran.* **MEASURED, on the retry:** the server **booted** and **answered HTTP
@@ -2827,8 +2857,9 @@ consults this register to find out what we do *not* know gets a complete answer.
     + 9 decode warm-up buckets completed**, and the `Not Implemented` count is **0** (it was **8** here).
     The retry also re-confirmed, and counted, the serving facts above: the **KV budget** identical
     (`27,364 tokens`, 1.34×), the **plugin hook pre-device in 6 of 6 processes**, and the **LUT active on
-    4 of 4 ranks** (`variant=noguard_floor`, same md5) with **960** `LUT` / **0** `OURS` handshakes — the
-    same ~9.7 instantiations per warmed bucket as this run's 96 over its 10 completed buckets.
+    4 of 4 ranks** (`variant=noguard_floor`, same md5) with **960** `LUT` / **0** `OURS` handshakes **over
+    that run's whole log** — the same rate as this run's 96 over its 10 completed buckets (96 / 10 =
+    **9.6**; the retry's 960 over its 99 warmed buckets = **9.7**).
     *(`Archive/by-date/2026-10-13/vllm-serve-smoke/REPORT.md` §3–§4 and §7; the retry:
     `Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §1–§4 and §9.)*
 27. **A serving path that is not a function of its request is not an instrument.** **MEASURED:** ten
@@ -2836,8 +2867,11 @@ consults this register to find out what we do *not* know gets a complete answer.
     split is **not random** — for one prompt class it is a deterministic function of the **request's ordinal
     within that class** (even → A, odd → B, **26 of 26** of the requests after the first, p ≈ 1e-8; the very
     first request after readiness is a third form, and for the other prompt class there is **no rule found**
-    — which is not the same as "random"). A merely *racy* mechanism would not hold a perfect parity over 26
-    requests; a *stateful, toggling* one fits better — **hypothesis, not measurement**. Four obvious
+    — which is not the same as "random"). **Those 26 are not one fixed request**: the no-`logprobs`, the
+    `logprobs=20` and the `logprobs=20, seed=0` variants are mixed among them, so this is a regularity of
+    the **observed sequence**, not yet of a single request. A merely *racy* mechanism would not hold a
+    perfect parity over 26 requests; a *stateful, toggling* one fits better — **hypothesis, not
+    measurement**. Four obvious
     explanations are **excluded by the records**: it is **not a seed effect** (6 seeded vs 6 unseeded, 4
     distinct results each), **not prefix caching** (**0.0 %** hit rate on every stats line), **not text
     post-processing** (the divergence is in the API's own `logprobs.tokens` / `top_logprobs`, not only
