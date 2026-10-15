@@ -2133,7 +2133,8 @@ the 3.853× must never be read as "the model got 3.853× faster".
 > diff counts are identical for both schedules).
 
 **Whole-model decode at TP=4 — the run that closes §3.9 item 21, and it is bit-exact.** *Five arms,
-one engine process each, **four modules held simultaneously** (`HABANA_VISIBLE_MODULES = 0,3,6,7`), the
+one engine process each, **four modules held simultaneously** (`HABANA_VISIBLE_MODULES = 0,3,6,7` —
+**not** one of the vendor's supported 4-Gaudi sets; §3.7.2), the
 W0-anchor config (TP=4, EP, `max_model_len` 2048, fp8 quant, bf16 KV), a **cold per-arm recipe cache**,
 and `hl-smi` confirmed at the **768 MiB baseline with no compute processes** immediately before every
 launch.* One fixed prompt of 35 real tokens padded to the model runner's `('prompt', 1, 128, 0)`
@@ -2915,12 +2916,17 @@ record, and the control that identifies the shipped expression, are §3.6.5's
 
 ## 3.7 Multi-device, pinning, and concurrent processes
 
-### 3.7.1 There are two distinct notions of device identity — and confusing them is the classic failure
+### 3.7.1 There are three numberings of one card — and the **module id** is the one to reason and pin in
 
+- **Physical module id / AIP** — what `hl-smi -L` shows as each AIP's Module ID. **The card's
+  identity, fixed per card** — and the numbering that the pin (`HLS_MODULE_ID`) and the
+  device-acquire path both speak, so **it is the one to reason and pin in**.
 - **Local device index** — a **dense `0..N-1`** numbering over the devices visible to your process;
-  what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes. **This is NOT
-  the vendor tool's index order** — see the table below.
-- **Physical module id / AIP** — what `hl-smi -L` shows as each AIP's Module ID. **Fixed per card.**
+  what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes. It is a
+  **position**, not an identity: it is an index *into* `HABANA_VISIBLE_MODULES`, so it moves when the
+  allocation moves. **This is NOT the vendor tool's index order** — see the table below.
+- **`hl-smi` card index** — the vendor tool's own numbering, and a **third** one. It is
+  **position-dependent** as well: it is a host index, and it is not the local index.
 
 `HABANA_VISIBLE_DEVICES` is a **container-runtime input**, consumed **outside** the container.
 Nothing in the image reads it, so setting it *inside* a container is **inert** — the container's
@@ -2931,22 +2937,72 @@ through to the by-type acquire. **INFERRED** *(grep + disassembly; `hpu_isolatio
 effect is the **local-index → module-id table** that `torch.hpu.set_device(i)` indexes. **MEASURED**
 *(`hls_module_id` §4.7 — the mapping was verified physically for all four indices.)*
 
-⚠ **Three numberings disagree, and "card N == module N" fails for two of the four `hl-smi` indices
-and three of the four local torch indices.** The arithmetic, from the map below: `hl-smi` index →
-module is `0→0, 1→6, 2→7, 3→3`, so the identity holds only for indices **0 and 3** (2 of 4 fail);
-local torch index → module is `0→0, 1→3, 2→6, 3→7`, so it holds only for index **0** (3 of 4 fail).
-On this box:
+**`HABANA_VISIBLE_DEVICES` and `HABANA_VISIBLE_MODULES` are not two knobs and not alternatives: they
+are ONE allocation written in two numberings.** The module set is the identity; the index list is its
+**position-dependent image**. Measured on this box, 2026-10-15:
+
+```
+HABANA_VISIBLE_MODULES=0,1,2,3          <- the allocation, named in module ids
+HABANA_VISIBLE_DEVICES=2,6,0,3          <- the SAME four cards, named by host index
+hl-smi -Q index,module_id -f csv   ->   index 0 -> module 2
+                                        index 2 -> module 0
+                                        index 3 -> module 3
+                                        index 6 -> module 1
+```
+
+The indices `2,6,0,3` are **exactly** the host indices of modules `0,1,2,3`, so the two variables are
+consistent views of one four-card allocation — and the index list is **derived, not given**: note that
+it is *not* `0,1,2,3` in order, because the allocation is dense in **module** space, not in index
+space. **⇒ reason and pin in module ids; treat any index list as a derived, position-dependent
+rendering of the module set.** **MEASURED** *(`Archive/by-date/2026-10-15/ordpost2/` — the
+index→module→PCI map is `REPORT.md`'s "Device, before and after" table.)*
+
+⚠ **The three numberings disagree, and "card N == module N" is not a rule — it is a coincidence when
+it holds.** On this box (`CORRECTED 2026-10-15` — the values below moved; the rule did not):
 
 | what | order |
 |---|---|
-| `hl-smi` card index → module | **`0→0, 1→6, 2→7, 3→3`** |
-| local torch index → module | **`0→0, 1→3, 2→6, 3→7`** |
-| modules **visible to this container** | **`0, 3, 6, 7`** |
+| `hl-smi` card index → module | **`0→2, 2→0, 3→3, 6→1`** |
+| local torch index → module | **`0→0, 1→1, 2→2, 3→3`** |
+| modules **visible to this container** | **`0, 1, 2, 3`** |
+
+Read the arithmetic, because the *shape* of the failure has changed: the identity holds for **1 of the
+4** `hl-smi` indices (only `3→3` coincides; `0→2`, `2→0` and `6→1` all fail), and for **all 4** local
+torch indices — but that last row is an **accident of this allocation**: the visible module set
+happens to be the contiguous `0,1,2,3`, so the table *is* the identity. On the previous allocation
+(`0,3,6,7`) the same row read `0→0, 1→3, 2→6, 3→7` and failed for **3 of 4**. **Do not read the
+current row as a law; read `HABANA_VISIBLE_MODULES`.** **MEASURED** *(`Archive/by-date/2026-10-15/ordpost2/`
+— the index→module→PCI map is `REPORT.md`'s "Device, before and after" table.)*
 
 Derive a local index from `HABANA_VISIBLE_MODULES`, **never** from `hl-smi -L`'s accel order (which
-here is `0, 6, 7, 3` — the *same* sequence as the table's first row read left to right, i.e. the
-module ids listed in `hl-smi` index order, and neither of the other two rows). **MEASURED** *(verbatim
-`hl-smi -Q index,module_id,memory.used -f csv,nounits`: `0,0,768 / 1,6,768 / 2,7,768 / 3,3,768`.)*
+here is `2, 0, 3, 1` — the module ids listed in `hl-smi` index order, and neither of the other two
+rows). Note also that `hl-smi`'s **default per-AIP row number is not** the `index` field that `-Q`
+reports: on this box the default view numbers its four rows `0..3` while `-Q index` reads `0, 2, 3,
+6` — a fourth way to be wrong. **MEASURED** *(the default view verbatim:
+`Archive/by-date/2026-10-15/ordpost2/hl-smi-pre-ordpost2b.txt`; the mapping: `REPORT.md` as above.)*
+
+**The index numbering is not stable across a reboot; the module ids are — and we have now measured
+that, on the card rather than on the numbering.** The vendor's public multi-container page (under
+`docs.habana.ai`) states it: *"The device index set with `HABANA_VISIBLE_DEVICES` may change after a
+system reboot or driver reinstallation, while module ID set with `HABANA_VISIBLE_MODULES` remains the
+same."* Across this box's 2026-10-15 reboot (with a driver reinstall, 1.24.1 → 1.24.2), **four of the
+four cards visible both before and after kept their module ids exactly** — while the index map moved:
+host index `0` was module `0` before and is module `2` now, and the host map now reads
+`0→2, 1→6, 2→0, 3→3, 4→7, 5→4, 6→1, 7→5`. **MEASURED, and scoped: our container is handed 4 of the
+host's 8 cards, so the comparison covers the four cards visible in both dumps, not all eight.**
+
+**Reconcile two `hl-smi` dumps by SERIAL — not by index, and not by module id.** `hl-smi -Q` exposes a
+per-card **serial** (and **UUID**), and those are the only fields that say whether two dumps describe
+*the same card*:
+
+```
+hl-smi -Q index,module_id,serial,uuid -f csv,nounits
+```
+
+A card present in both dumps can then be checked for **which of the two numberings moved** — its
+module id (identity) or its index (position). Reading the module *set* or the index instead is how
+"the same card, renumbered" gets mistaken for "a different card": in a dump that does not carry the
+serial, the two look identical. **MEASURED**
 
 > **A module is acquired EXCLUSIVELY — one module, one process.** When two processes request the
 > same physical module, the second **hard-fails at device-acquire** with
@@ -2967,19 +3023,37 @@ the cards). Do not rely on it, and do not try to pick global devices. Use relati
 **INFERRED** *(whole-image grep + disassembly of the one device-acquire site:
 `Archive/by-date/2026-10-11/hpu_isolation/REPORT.md` §2.3.)*
 
-On this 4-AIP box the container shows **`HABANA_VISIBLE_DEVICES=0,1,2,3` AND
-`HABANA_VISIBLE_MODULES=0,3,6,7`** — a clean dense local view over a physical subset. **The module
-set is box-specific: read it, do not assume it** (an earlier version of this section said
-`4,5,6,7`; that is wrong here — it also contradicts §3.7.1's own table, whose mapping `0→0, 1→3,
-2→6, 3→7` *requires* `0,3,6,7`). That is why 4-device runs "just work" there. **MEASURED**
-*(verbatim `hl-smi -Q index,module_id,memory.used -f csv,nounits`: `0,0,768 / 1,6,768 / 2,7,768 /
-3,3,768`.)*
+On this 4-AIP box the container's allocation is **`HABANA_VISIBLE_MODULES=0,1,2,3`** — the host
+indices `2,6,0,3`, i.e. the same four cards (§3.7.1) — a clean dense local view over a physical
+subset. **The module set is box-specific: read it, do not assume it.** That sentence is the durable
+one; the *value* moves. **CORRECTED 2026-10-15** — and it moved three times in one day: `0,3,6,7`
+(what this section published for the whole project) → `0,2,3,6` (after the driver bump) → `0,1,2,3`
+(now, after the container reshuffle); an even earlier version of this section said `4,5,6,7`. Every
+one of those was read off a real box, and three of the four were wrong for the box in front of the
+next reader. That is why 4-device runs "just work" there — and why the check below is not optional.
+**MEASURED** *(`Archive/by-date/2026-10-15/ordpost2/` — `REPORT.md`'s "Device, before and after"
+table and the `hl-smi` snapshots.)*
+
+⚠ **Then check the set against what the vendor supports — because a set that is merely unusual is a
+set you will end up debugging.** The vendor's public multi-container page (under `docs.habana.ai`)
+gives the supported combinations explicitly: **2-Gaudi = `0,1`, `2,3`, `4,5` or `6,7`; 4-Gaudi =
+`0,1,2,3` or `4,5,6,7`** — and *"avoid mounting the same index on multiple containers."*
+
+**Our own container ran on `0,3,6,7` for the entire project, and on `0,2,3,6` after the 2026-10-15
+driver bump — neither is a supported 4-Gaudi set — and every measurement this manual reports was
+taken on one of them.** `0,1,2,3` (the current allocation) is the **first supported group this
+project has had**. So a reader who copies the allocation published in this section builds a TP4 run on
+a topology the vendor documents as **unsupported**, and — because the symptom is a collective that is
+slow or subtly wrong rather than an error — has no way to know why. **Treat the fabric topology of
+every number in this manual as non-recommended, and check the set before you attribute anything to
+the model.** *Vendor-documented; our own sets are MEASURED (`Archive/by-date/2026-10-15/ordpost2/`.)*
 
 **Check before you assume:**
 
 ```
 hl-smi -L                                   # 8 AIPs on a host, 4 in a limited container
 hl-smi -Q index,module_id,memory.used -f csv,nounits   # the only honest placement read-out
+hl-smi -Q index,module_id,serial,uuid -f csv,nounits   # ... and the serial: "same card" vs "different card"
 env | grep -iE "HABANA_VISIBLE"
 python -c "import torch, torch_hpu; print(torch.hpu.device_count())"
 ```
@@ -3000,9 +3074,9 @@ python -c "import torch, torch_hpu; print(torch.hpu.device_count())"
   torch_hpu`, as long as it precedes the first HPU tensor. A non-numeric value fails with
   **`ValueError: stoul` at allocation**, not at import. **MEASURED**
 - **`torch.hpu.set_device(i)` as the FIRST HPU call** is the in-process wrapper: it writes
-  `HLS_MODULE_ID = HABANA_VISIBLE_MODULES[i]`. In one 4-AIP container the observed mapping was
-  **0→0, 1→3, 2→6, 3→7**. Called after a device is already selected it is **silently ignored**.
-  **MEASURED**
+  `HLS_MODULE_ID = HABANA_VISIBLE_MODULES[i]`. In one 4-AIP container — **the `0,3,6,7` allocation of
+  §3.7.1, not the current one** — the observed mapping was **0→0, 1→3, 2→6, 3→7**. Called after a
+  device is already selected it is **silently ignored**. **MEASURED**
 - **It does not override an existing pin — *except* when that pin is `0`.** An existing
   `HLS_MODULE_ID` wins, so keep the environment pin and any `set_device(i)` **consistent**
   (**INFERRED** — code analysis of `hpu/__init__.py:352-367`, `:381`; not executed). The exception is
@@ -3184,8 +3258,12 @@ consults this register to find out what we do *not* know gets a complete answer.
 
 **A. Get a trustworthy baseline.**
 1. `hl-smi -L`; count AIPs, and read the module set with
-   `hl-smi -Q index,module_id,memory.used -f csv,nounits`. **Decide the pinning story from what you
-   see**, not from what you expect — the module set is box-specific.
+   `hl-smi -Q index,module_id,serial,uuid -f csv,nounits`. **Decide the pinning story from what you
+   see**, not from what you expect — the module set is box-specific, and the **module id** is the
+   numbering to pin in (§3.7.1). **Check the set against the vendor's supported combinations before
+   you build a TP group on it: 2-Gaudi = `0,1` / `2,3` / `4,5` / `6,7`; 4-Gaudi = `0,1,2,3` or
+   `4,5,6,7`.** A non-adjacent set is not a supported topology, and its symptom is a collective that
+   is slow or subtly wrong rather than an error (§3.7.2).
 2. If a container already limited you, **do not set `HABANA_VISIBLE_DEVICES`** — inside the container
    it is **inert** (nothing in the image reads it), so it neither helps nor isolates.
 3. **Pin by module id, and make the pin set a partition.** Export `HLS_MODULE_ID=<module>` per job.
