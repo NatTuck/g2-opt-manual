@@ -2937,25 +2937,43 @@ through to the by-type acquire. **INFERRED** *(grep + disassembly; `hpu_isolatio
 effect is the **local-index → module-id table** that `torch.hpu.set_device(i)` indexes. **MEASURED**
 *(`hls_module_id` §4.7 — the mapping was verified physically for all four indices.)*
 
+> **"Not a filter" is scoped to the *image*, and the vendor's page is the other half of the same
+> sentence — read them together, or they look like a contradiction.** The container runtime accepts
+> **either** variable to select the mount — *"you can select a Gaudi device to mount on Docker by
+> setting `HABANA_VISIBLE_DEVICES` or `HABANA_VISIBLE_MODULES` when the Docker container is started"*
+> — and recommends the module-id form (same page and fetch as below). So **the runtime** is where the
+> module-id spelling is preferred, and **the image** is where the variable is a table rather than a
+> filter; the INFERRED finding above is scoped to `/usr/lib/habanalabs/` and says nothing about the
+> runtime. Both halves are needed: the runtime is why the module-id form is the one to set, the image
+> is why the module *set* is what you read back.
+
 **`HABANA_VISIBLE_DEVICES` and `HABANA_VISIBLE_MODULES` are not two knobs and not alternatives: they
 are ONE allocation written in two numberings.** The module set is the identity; the index list is its
-**position-dependent image**. Measured on this box, 2026-10-15:
+**position-dependent image**. On this box, 2026-10-15:
 
 ```
 HABANA_VISIBLE_MODULES=0,1,2,3          <- the allocation, named in module ids
-HABANA_VISIBLE_DEVICES=2,6,0,3          <- the SAME four cards, named by host index
+HABANA_VISIBLE_DEVICES=2,6,0,3          <- the SAME four cards, as its equivalent index rendering
 hl-smi -Q index,module_id -f csv   ->   index 0 -> module 2
                                         index 2 -> module 0
                                         index 3 -> module 3
                                         index 6 -> module 1
 ```
 
-The indices `2,6,0,3` are **exactly** the host indices of modules `0,1,2,3`, so the two variables are
-consistent views of one four-card allocation — and the index list is **derived, not given**: note that
-it is *not* `0,1,2,3` in order, because the allocation is dense in **module** space, not in index
-space. **⇒ reason and pin in module ids; treat any index list as a derived, position-dependent
-rendering of the module set.** **MEASURED** *(`Archive/by-date/2026-10-15/ordpost2/` — the
-index→module→PCI map is `REPORT.md`'s "Device, before and after" table.)*
+The indices `2,6,0,3` are **exactly** the host indices of modules `0,1,2,3`, so the two name the same
+four cards — and the index list is **derived, not given**: note that it is *not* `0,1,2,3` in order,
+because the allocation is dense in **module** space, not in index space.
+
+**Which of the two is actually *set* is a separate question, and the honest answer is narrower than
+"both".** The container launcher here sets **only** `HABANA_VISIBLE_MODULES`; the index list `2,6,0,3`
+is its **equivalent rendering**, carried in the launcher's own comment and **observed set alongside the
+module variable in an earlier launch**, where the two agreed. So do not read this as "the container
+sets both" — read it as: *the module variable is the one to set and to read; the index form is a
+rendering of the same allocation.* **⇒ reason and pin in module ids; treat any index list as a
+derived, position-dependent rendering of the module set.** **MEASURED** *(`Archive/by-date/2026-10-15/`
+— the index→module→PCI map and both `hl-smi` snapshots: `ordpost2/REPORT.md`'s "Device, before and
+after" table; the serial-carrying capture and the by-serial comparison:
+`device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md`.)*
 
 ⚠ **The three numberings disagree, and "card N == module N" is not a rule — it is a coincidence when
 it holds.** On this box (`CORRECTED 2026-10-15` — the values below moved; the rule did not):
@@ -2982,14 +3000,21 @@ reports: on this box the default view numbers its four rows `0..3` while `-Q ind
 `Archive/by-date/2026-10-15/ordpost2/hl-smi-pre-ordpost2b.txt`; the mapping: `REPORT.md` as above.)*
 
 **The index numbering is not stable across a reboot; the module ids are — and we have now measured
-that, on the card rather than on the numbering.** The vendor's public multi-container page (under
-`docs.habana.ai`) states it: *"The device index set with `HABANA_VISIBLE_DEVICES` may change after a
-system reboot or driver reinstallation, while module ID set with `HABANA_VISIBLE_MODULES` remains the
-same."* Across this box's 2026-10-15 reboot (with a driver reinstall, 1.24.1 → 1.24.2), **four of the
-four cards visible both before and after kept their module ids exactly** — while the index map moved:
-host index `0` was module `0` before and is module `2` now, and the host map now reads
-`0→2, 1→6, 2→0, 3→3, 4→7, 5→4, 6→1, 7→5`. **MEASURED, and scoped: our container is handed 4 of the
-host's 8 cards, so the comparison covers the four cards visible in both dumps, not all eight.**
+that, on the card rather than on the numbering.** The vendor's public multi-container page states it:
+*"…`HABANA_VISIBLE_MODULES` when the Docker container is started. The device index set with
+`HABANA_VISIBLE_DEVICES` may change after a system reboot or driver reinstallation, while module ID set
+with `HABANA_VISIBLE_MODULES` remains the same."* *(the vendor's
+`Multiple_Dockers_each_with_Single_Workload` page:
+`https://docs.habana.ai/en/latest/Orchestration/Multiple_Tenants_on_HPU/Multiple_Dockers_each_with_Single_Workload.html`
+— fetched 2026-10-15, HTTP 200, 81,909 bytes, sha256
+`294b68dc8596f654a76b8151233b72c7dee55d9e583dbcc675261b8fca6dd344`.)* Across this box's 2026-10-15
+reboot (with a driver reinstall, 1.24.1 → 1.24.2), **four of the four cards visible both before and
+after kept their module ids exactly** — while the index map moved: host index `0` was module `0` before
+and is module `2` now, and the host map now reads `0→2, 1→6, 2→0, 3→3, 4→7, 5→4, 6→1, 7→5`.
+**MEASURED, and scoped: our container is handed 4 of the host's 8 cards, so the comparison covers the
+four cards visible in both dumps, not all eight** — the host's 8-card dump, the pre-reboot container
+block with its serials, the post-reboot map and the by-serial comparison are all in
+`Archive/by-date/2026-10-15/device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md`.
 
 **Reconcile two `hl-smi` dumps by SERIAL — not by index, and not by module id.** `hl-smi -Q` exposes a
 per-card **serial** (and **UUID**), and those are the only fields that say whether two dumps describe
@@ -3035,9 +3060,12 @@ next reader. That is why 4-device runs "just work" there — and why the check b
 table and the `hl-smi` snapshots.)*
 
 ⚠ **Then check the set against what the vendor supports — because a set that is merely unusual is a
-set you will end up debugging.** The vendor's public multi-container page (under `docs.habana.ai`)
-gives the supported combinations explicitly: **2-Gaudi = `0,1`, `2,3`, `4,5` or `6,7`; 4-Gaudi =
-`0,1,2,3` or `4,5,6,7`** — and *"avoid mounting the same index on multiple containers."*
+set you will end up debugging.** The vendor's public multi-container page gives the supported
+combinations explicitly: *"…only 2-Gaudi and 4-Gaudi scenarios are supported. It is highly recommended
+to set module ID in `HABANA_VISIBLE_MODULES` using the combinations listed below: 2-Gaudi: `0,1`,
+`2,3`, `4,5` or `6,7` — 4-Gaudi: `0,1,2,3` or `4,5,6,7`"* — and *"Avoid mounting the same index on
+multiple containers."* ⇒ **2-Gaudi = `0,1`, `2,3`, `4,5` or `6,7`; 4-Gaudi = `0,1,2,3` or
+`4,5,6,7`.** *(Same vendor page and fetch as §3.7.1.)*
 
 **Our own container ran on `0,3,6,7` for the entire project, and on `0,2,3,6` after the 2026-10-15
 driver bump — neither is a supported 4-Gaudi set — and every measurement this manual reports was
