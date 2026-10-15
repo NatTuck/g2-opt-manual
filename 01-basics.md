@@ -829,7 +829,7 @@ looks like a hardware fault:
 | notion | what it is | how you see it |
 |---|---|---|
 | **local device index** | a **dense** `0..N-1` numbering over the devices *visible to your process* | what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes — **not** the vendor tool's index order |
-| **physical module id / AIP** | the **fixed** per-card identity, stable across processes | the vendor tool's per-AIP listing (Module ID / PCI bus); its **index order is a third numbering** — neither the module id nor the local index (Chapter 3 §3.7) |
+| **physical module id / AIP** | the **fixed** per-card identity, stable across processes | the vendor tool's per-AIP listing (Module ID / PCI bus); its **index order is a third numbering** — and the row number that listing prints is a **fourth** — neither the module id nor the local index (Chapter 3 §3.7) |
 
 **`*_VISIBLE_DEVICES` is a container-runtime input, consumed *outside* the container.** Setting it
 *inside* a container does nothing — nothing in the image reads it; the container's own device flags
@@ -874,7 +874,7 @@ analysis finds the PT-bridge's by-type function does not consult it (**INFERRED*
 driver/thunk level is not settled (`hpu_isolation` §10.2), and the two-process arm we *have*
 (two unpinned processes, watching which modules they take) used the container's **full** table,
 so it cannot separate the table from the container's `--device` cgroup. A **discriminating** arm
-is still open. The deployment-named treatment, the three numberings, and the per-rank rule are in
+is still open. The deployment-named treatment, the numberings, and the per-rank rule are in
 **Chapter 3 §3.7**.
 
 ---
