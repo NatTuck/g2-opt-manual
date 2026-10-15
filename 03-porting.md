@@ -3090,21 +3090,24 @@ a *recommendation*.** The lists are **module IDs**: **2-Gaudi = `0,1`, `2,3`, `4
 processors with module IDs `5,4,7,6` — so a non-adjacent set is not forbidden by the page; it is
 simply **outside the recommended list**. *(Same vendor page and fetch as §3.7.1.)*
 
-**Our own container's allocation, and it has moved four times:** `4,5,6,7` until **2026-10-07** —
-which **is** one of the two recommended 4-Gaudi combinations — then `0,3,6,7` from 2026-10-07, then
-`0,2,3,6` after the 2026-10-15 driver bump, and now `0,1,2,3`. So the HPU measurements this manual
-reports fall in **both** regimes — a period on a recommended combination, and a much longer one on
-sets outside it — and its CPU-only figures have no topology at all. A reader who copies the allocation
-published in this section builds a TP4 run on a set **outside** the recommended combinations; **this
-manual cannot tell them what that costs, because we have not measured it.** *(The September `4,5,6,7`
-runs are the natural comparison for anyone who wants the number, but they are code-state-confounded.)*
-**⇒ For any collective or interconnect figure, check which regime it came from before attributing
-anything to the model.** **ASSUMED (vendor documentation)** for the recommendation — the quotation
-above is the citation — and **MEASURED** for our own allocations: `Archive/by-date/2026-09-26/runA.env`
-and `runB.env` (the `4,5,6,7` era), `Archive/by-date/2026-10-04/old-notes/picking-hpus.md` (the same
-set, as *"physical set = host modules 4-7"*), `Archive/by-date/2026-10-15/device-host-map/` (the
-`0,3,6,7` → `0,1,2,3` transition) and `Archive/by-date/2026-10-15/ordpost2/REPORT-01-device-blocked.md`
-(the `0,2,3,6` state).
+**Our own container's allocation, and it has moved four times:** `4,5,6,7` — which **is** one of the
+two recommended 4-Gaudi combinations — until **2026-10-07** (archived as `4,5,6,7` on 2026-09-26 and
+2026-10-04; the first `0,3,6,7` record is 2026-10-07); then `0,3,6,7` from 2026-10-07, then `0,2,3,6`
+after the 2026-10-15 driver bump, and now `0,1,2,3`. **So the recommended regime is the LONG one and
+the non-recommended regime is the short one: the switch is at 2026-10-07, ~8 weeks after this project's
+first archived work (2026-08-13), and the non-recommended sets are 8 days old.** The HPU measurements
+this manual reports therefore fall in **both** regimes, and its CPU-only figures have no topology at
+all. A reader who copies the allocation published in this section builds a TP4 run on a set **outside**
+the recommended combinations; **this manual cannot tell them what that costs, because we have not
+measured it.** *(The September `4,5,6,7` runs are the natural comparison for anyone who wants the
+number, but they are code-state-confounded.)* **⇒ For any collective or interconnect figure, check
+which regime it came from before attributing anything to the model.** **ASSUMED (vendor
+documentation)** for the recommendation — the quotation above is the citation — and **MEASURED** for our
+own allocations: `Archive/by-date/2026-09-26/runA.env` and `runB.env` (the `4,5,6,7` era),
+`Archive/by-date/2026-10-04/old-notes/picking-hpus.md` (the same set, as *"physical set = host modules
+4-7"*), `Archive/by-date/2026-10-15/device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md` **§2** (the
+pre-reboot block, which is the `0,3,6,7` record) and **§3** (the post-reboot `0,1,2,3` map), and
+`Archive/by-date/2026-10-15/ordpost2/REPORT-01-device-blocked.md` (the `0,2,3,6` state).
 
 **Check before you assume:**
 
