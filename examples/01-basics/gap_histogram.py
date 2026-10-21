@@ -46,8 +46,9 @@ WHAT A TRACE CANNOT TELL YOU
 USAGE
 -----
     python gap_histogram.py <trace.json.gz>                      # one rank
-    python gap_histogram.py <rank0.gz> <rank1.gz> <rank2.gz> ... # alignment check
+    python gap_histogram.py <rank0.gz> <rank1.gz> <rank2.gz> ... # alignment + null
     python gap_histogram.py <trace-dir>                          # largest .gz in the dir
+    python gap_histogram.py --selftest                           # the control; CPU-only
 
 Step count follows the manual's convention: the number of `python_function` events whose name
 ends in `_execute_model_generic`, or 1 if the trace carries none. That is what makes the
