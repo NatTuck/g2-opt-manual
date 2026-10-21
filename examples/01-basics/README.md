@@ -13,10 +13,11 @@ was hard to get right, the comment says why.
 | [`dump_post_graphs.py`](dump_post_graphs.py) | reading **per-node engine identity** out of the compiler's own graph dump — the answer to "does this recipe use more than one engine?" | yes (to produce a dump) |
 | [`trace_engines.py`](trace_engines.py) | attributing trace events to engines from `args["HW event name"]`; plus the `torch.copy_` trap | yes for `--selftest`, no for parsing a trace |
 | [`devprobe.py`](devprobe.py) | the 20-line **pre-flight** that catches a silently-broken profiler shim | yes |
+| [`gap_histogram.py`](gap_histogram.py) | decomposing the **`wall - merged` gap** by hole width, and testing rank alignment against a null — the instrument that decides whether a gap is communication | **no** — CPU-only, parses an existing trace; `--selftest` is CPU-only too |
 
 ---
 
-## The four things worth taking from these examples
+## The five things worth taking from these examples
 
 ### 1. A guid is not an engine
 
@@ -58,6 +59,20 @@ all**. That reads as "the device did nothing" — a conclusion someone will act 
 is the guard: run a known matmul under the profiler and check that `kernel` and `hpu_op` are
 present in the category histogram.
 
+### 5. The gap between the union and the step is a *shape*, not a residue
+
+`merged` is an occupancy, so it is always below the step period, and the difference is the time no
+engine was executing. The reflex — "that gap is communication" — is testable **without a device**:
+merge the device intervals, take the complement, histogram the holes by width, and check whether the
+wide ones are rank-aligned against a null.
+
+`gap_histogram.py` does that on a trace you already have. On the manual's own W0 decode arm it
+reproduces §3.6.4's `merged` to four decimals and shows that **~42 % of the gap is ~21,000 sub-50 µs
+holes per step** (launch granularity, tracking op count) while the multi-millisecond part is **5
+holes per step** — too few to be one per layer, and not aligned across the four ranks. The lesson
+generalises: **count the holes before you name them.** The `--selftest` is the control that makes a
+0 % alignment reading mean something.
+
 ---
 
 ## Gotchas these examples encode
@@ -69,3 +84,5 @@ present in the category histogram.
 | `LOG_LEVEL_ALL=2` **alone** is enough for a cheap multi-engine confirmation | it prints per-recipe arc jobs by engine name; no dump directory needed |
 | profiling **CPU + HPU** together inflates the host span ~3× | makes a device-bound arm look host-bound; profile HPU-only for device questions |
 | a summed device duration is inflated by the per-TPC replication factor | measured 18–24× for TPC kernels; build durations from **unions**, never sums |
+| an alignment rate with no null hypothesis is not a measurement | ~20,000 holes per step means a ±50 µs tolerance matches almost anything by chance; `gap_histogram.py --selftest` is the control |
+| `DUMP_POST_GRAPHS` and the bridge's `PT_HPU_GRAPH_DUMP*` are **two different instruments** | setting one and reading the other's empty directory as a failure |

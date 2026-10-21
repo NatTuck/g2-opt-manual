@@ -54,9 +54,9 @@ those in from general knowledge.**
 | # | chapter | ~lines | status |
 |---|---|---|---|
 | **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
-| 1 | [Gaudi/HPU Basics](01-basics.md) | ~900 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
+| 1 | [Gaudi/HPU Basics](01-basics.md) | ~1,000 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | ~2,000 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 | 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
@@ -65,11 +65,12 @@ actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked
 is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
 not cite it.**
 
-Example code lives in [`examples/`](examples/), organized by chapter — **13 files**, of which
-one (`examples/02-regions/03_inspect_graph_dumps.py --demo`) runs CPU-only and has been
-verified end to end, and one (`examples/03-porting/fp8_scale_adjustment.py`) is host-only and
-has been run. **The rest are annotated sketches** that need a device; each says so in its
-header.
+Example code lives in [`examples/`](examples/), organized by chapter — **14 files**, of which
+two run CPU-only and have been verified end to end on archived traces
+(`examples/02-regions/03_inspect_graph_dumps.py --demo` and
+`examples/01-basics/gap_histogram.py`, the latter including its `--selftest` control), and one
+(`examples/03-porting/fp8_scale_adjustment.py`) is host-only and has been run. **The rest are
+annotated sketches** that need a device; each says so in its header.
 
 ## What this draft does not yet cover
 

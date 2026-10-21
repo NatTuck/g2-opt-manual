@@ -86,6 +86,13 @@ does not reduce the union.** The two facts are one fact.
 So: if you inherit a "launch-bound" claim, **check it against the union before acting on it.**
 The stale framing is the single most likely thing to send you optimising the wrong quantity.
 
+**And when you find a gap between the union and the wall, do not name it "communication" — count
+the holes.** Merge the device intervals, take the complement, and histogram the holes by width: the
+sub-50 µs ones are launch granularity and track **op count**, and a multi-millisecond hole is only a
+collective if it is **aligned across the ranks that take part** — tested against a null, because at
+~20,000 holes per step anything matches by chance. → *[Chapter 1 §1.8](01-basics.md)*,
+[`examples/01-basics/gap_histogram.py`](examples/01-basics/gap_histogram.py)
+
 ---
 
 **And when you write your own TPC kernel, the unit of cost is the VLIW *bundle*, not the instruction** — a `{...}` group in a `tpc-clang -S` listing is a 4-slot issue bundle, the device retires one per cycle, and the shipping scheduler leaves 1.2–3.4× of bundle count on the table. → *[Chapter 4](04-execution-model.md)*

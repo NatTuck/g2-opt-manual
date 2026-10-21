@@ -474,6 +474,39 @@ this port: 16.0× down to 1.0×.
   model on one box. The *shapes* of the argument are the general part: build the floor, measure the
   port, divide, and rank by removable bytes.
 
+### 3.1.5 Batch size > 1 on a *sparse* model does not amortise the way a dense one does
+
+Everything above is **bs = 1**. The obvious next move — raise the batch, read the same weights once
+and serve N tokens — is right in form and much weaker in degree on a MoE, and the reason is worth
+stating before someone plans around it.
+
+**The mechanism.** On a dense model the weight set is fixed, so at batch N the weight term per token
+falls ~N× until the KV, activation or compute term binds. On a sparse model the weight set is a
+**function of the batch**: each request routes to its own top-k experts, so the bytes you must read
+are the **union of the routed experts over the batch**, and that union **grows with N**. The
+amortisation is therefore not N× but (N ÷ union growth), and union growth is the term a dense-model
+intuition does not have. At bs = 1 this model reads **6 of 256** experts per layer; the union at
+bs = 8 is not 48, and it is also not 6.
+
+**INFERRED** — from the floor table above (which is bs = 1 by construction) plus the routing rule.
+**What is NOT measured here: any batch-scaling curve.** This manual has **no** measured bs = 1 → 8
+step-time curve, for any model — the campaign's own serving arm never ran a concurrency sweep
+(`--max-num-seqs 1`, sweep **NOT RUN**), so the shape of the curve is an open item, not a result.
+Do not fill it in from general knowledge.
+
+**A second implementation of the same model on the same hardware** reports its decode step at
+**10.6 ms at bs = 1, 28.4 ms at bs = 2 and 35.2 ms at bs = 4** — four times the rows for **3.3×** the
+step time. That is neither a launch-count story nor the dense-model weight-amortisation story; it is
+consistent with the step being paced by the number of **distinct experts whose weights must be
+read**. *(Their figures, their port state, not ours: quote them as a second port's, and see §3.1.1's
+independent-corroboration note for the same source's accounting.)*
+
+**⇒ The lever this changes.** If the expert union is the pacing term, then **more rows is the weak
+direction and more *tokens per weight pass* is the strong one** — speculative decoding amortises
+exactly the term batching fails to. Before choosing between them, measure `merged` **per token** at
+the batch sizes you care about (§3.6.1): a batching change that leaves `merged` per token flat has
+bought nothing, however much summed work it moved.
+
 ---
 
 ## 3.2 The M = 1 GEMV ceiling is HBM — and it has a cliff
@@ -1699,6 +1732,88 @@ each case is the GC's own log at a raised level (`LOG_LEVEL_GC`) — **not attem
 *(Source: `Archive/by-date/2026-10-12/fp4-guid-probe/REPORT.md` §4–§5 — five device rows, one process
 each, `HLS_MODULE_ID=3`, shipped `.so` md5 unchanged before and after.)*
 
+#### The other face of `synStatus 26`: the message TEXT is the handle, and it names the node
+
+The GUID-lookup mechanism above is one cause. **`synStatus 26` is `synFail`** — a generic failure in
+the status enum (`synapse/include/synapse_common_types.h`, where `synInvalidArgument = 1`,
+`synUnavailable = 24`, `synInvalidTensorDimensions = 25`, `synFail = 26`) — so the number alone can
+never be diagnostic. What *is* diagnostic is the **message text**, and one form of it carries more
+than the section above suggests.
+
+**MEASURED, on a parallel port of this model:** `synGraphCompile: Invalid Node Params! Node name:
+n_aa`, `synStatus 26`, raised at a `synchronize()` flush point. The cause was **not** a missing
+kernel. It was an in-place copy into an **offset view of a larger buffer with a mixed dtype**:
+
+```python
+packet = torch.empty(b * 10244, dtype=torch.int32, device=dev)
+pre    = packet[b * 10240:].view(torch.float32).view(b, 4)   # offset view, same itemsize
+pre.copy_(values["pre_mix"])                                 # this was rejected
+```
+
+It compiled at `b == 1` and failed at `b == 2`; removing the copy fixed it. **That attribution is
+theirs and rests on one A/B** — no log line isolated the node's params — so read it as a reported
+cause, not a demonstrated mechanism.
+
+**The message has two forms, and the suffix tells you which constructor fired** (source read,
+`synapse/src/infra/types_exception.h`, `InvalidNodeParamsException`):
+
+| text | constructor | what it adds |
+|---|---|---|
+| `Invalid Node Params! Node name: <n>` | one-arg | a node whose *validation or shape inference* failed |
+| `Invalid Node Params! Node name: <n>, param name : <p>` | two-arg | **names the offending user parameter** — far more useful when you get it |
+
+**And the companion line that names the cause does exist — it is just not emitted at the default
+log level.** These four strings are all present in the shipped `libSynapse.so` (sha256
+`6796f09dac786b95970f55541c8c27dd4005e87a5ecd1b95bb11daec6f3b3913`):
+
+```
+Node Validation Failed. Cannot create node {}.
+Failure to update output shape for node: "{}"
+projectDmaRoisToFullSizes No output roi for node {}
+Graph optimization failed pass: {}
+```
+
+So the recipe for this form is **raise the level and re-run**, then grep for those four — not "there
+is no line". **Verified empirically** on that port's failing run: `synapse_runtime.log` carries only
+the top-level re-print (`[SYN_API][critical] exception thrown in function: synGraphCompile, what:
+Invalid Node Params! Node name: n_aa`) while its `graph_compiler.log` is **0 bytes** — the
+node-naming lines are `GC` / `HABANA_NODE` / `ROI_SPLITTER` / `PASS_MANAGER` category `LOG_ERR`s and
+are silent until `LOG_LEVEL_ALL`/`LOG_LEVEL_GC` is set. **A zero count here is a claim about the
+instrument** (§3.10 item 23).
+
+**What `n_aa` is — and why it never resolves in a dump.** It is **not** an op name. It matches the
+**eager** graph's own name generator (source read, `synapse/src/eager/lib/eager_graph.h`,
+`NameBuilder`): prefix `n_`, then **two base-16 letters** (`a`–`p`), starting at `n_aa` for id 0. So
+it is an **insertion index in the eager graph** — `n_aa` is the first auto-named eager node. Two
+consequences: it will never appear in a `DUMP_POST_GRAPHS` post-graph, whose nodes are named
+`<op>/<guid>/<cnt>`, so "the name does not resolve" is expected and not a dead end; and **seeing an
+`n_XX` name at all tells you the failing graph is the eager one**, which is a real discriminator when
+you are deciding whether to look at the compiled-recipe path or the eager path.
+
+**Reconcile this with the paragraph above, which is not retracted.** "Never read `synStatus 26` as
+'the shape was wrong'" is right about the **number** and wrong if applied to the **message**: given
+`Invalid Node Params!` plus a node name, a shape, view or alias cause is exactly what the companion
+lines report. The GUID-lookup story remains the mechanism for the *unnameable* form; this is the
+mechanism for the *named* one. They are different failures sharing a status code.
+
+**Provenance, because it matters here.** The four message strings and the two message forms are
+verified in the **shipped 1.24.2** `libSynapse.so` above. The **throw-site enumeration** — the
+one-arg constructor is thrown from `graph_compiler/habana_nodes/node_factory.cpp` (a failed
+`validateNode()`, and a failed max-dims shape inference) and from
+`graph_compiler/roi_splitter.cpp` (`projectDmaRoisToFullSizes`, a DMA ROI with no output ROI), with
+the two-arg form thrown from many `habana_nodes/*.cpp` sites passing `"userParams"` — is read from a
+vendor Synapse **1.16-era source snapshot**, not from 1.24.2. Treat it as a map of *where the message
+comes from*, not as a line-exact citation for the shipping build; **the count of throw sites in
+1.24.2 is UNKNOWN** here, and the one place the snapshot and the shipped binary disagree is the
+pass-level message text (`Graph optimization failed! Got SynapseException: {}` in the snapshot,
+`Graph optimization failed pass: {}` in the binary) — which is why the binary is quoted above and
+the snapshot is not. **The `n_aa` decode is INFERRED, not source-read:** it matches that snapshot's
+generator format exactly (and the name is identical on all four ranks and across repeats, as a
+per-graph counter starting at zero would be), but `NameBuilder` is a header-only class, so there is
+no symbol in the shipped binary to confirm it against. *(The Gaudi Grimoire would settle the 1.24.2
+enumeration; it returned HTTP 503 during this work, so that is "could not consult", not "no
+evidence".)*
+
 **And do not over-generalise this caveat.** The dump-directory `synStatus 26` failures elsewhere in
 this manual — Chapter 2 §2.10 trap 1 and Chapter 1 §1.11 — are **not** in this class: they rest on
 their own controlled A/B evidence and carry **distinct corroborating symptoms** of their own
@@ -2445,6 +2560,18 @@ We got this wrong once by quoting the relation without its limits. Do not repeat
   inverted against its own conclusion**. Re-derive it on your traces. **MEASURED / OPEN**
 
 ### 3.6.4 The device-time decomposition, for orientation [DSv4F]
+
+> **⚠ This table is a PRE-OPTIMISATION BASELINE, not a current profile.** It is one decode arm —
+> **`lad_traceW0`, rank 0, 4 decode steps, `merged` = 66.1349 ms/step** — taken at a code state
+> **before** the staging work of §3.6.5 and §3.6.6 landed. Its own step is **66.13 ms** against
+> **10.6 ms** at bucket 1 on a later state of a parallel port of the same model, so it describes
+> what was left to fix, not where a tuned step spends its time. **Re-take it before you steer by
+> it.** The two families it ranks first by *union* (`DmaMemcpy`, `DmaTranspose`) are also the ones
+> whose op counts fall fastest when staging is fused away — **treat the `Dma*` counts as the
+> symptom to watch while fusing staging, not as a budget to optimise within.** *(A later
+> decomposition of the same model — TPC 88.6 % of the union at bucket 8 — is a different arm on a
+> different port state and does not supersede this table's rows; it only shows how far the mix can
+> move.)*
 
 **The column is the family's own UNION — its device *occupancy* — and it is NOT a removal price.**
 That distinction was missing from this table until 2026-10-13, and the header even called the column
@@ -3310,6 +3437,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
 | ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
 | **22** | **The rewrite's per-launch cost — the plan's N4 — is unmeasured, and the two-arm compile gate does not measure it.** The gate (§3.6.5) establishes that the KV-slab staging pass **disappears** when the slab is a declared operand read and written through its base address; it does **not** establish what the replacement kernel costs. Its treatment op is a **skeleton** at the model's geometry (the model itself may not be edited), and the rewrite's floor still carries a per-launch term read off a **harness** kernel (§4.2.10's bundle law), not off model nodes. So *"the staging pass is removed"* is **MEASURED** while *"R costs `0.2324 ms/step`"* remains **DERIVED**. | Compile the **real** fused per-layer kernel at the model's own geometry and read its per-launch term off its own launch, the way §4.2.10's arms were read. *(Opened 2026-10-13 by the two-arm compile gate; §3.6.5; `Archive/by-date/2026-10-13/compile-gate-run/`.)* |
+| **23** | **No measured batch-scaling curve — `merged` *per token* as a function of batch size is unknown, for this model and for any other.** §3.1.5 states the mechanism (on a sparse model the weight set is the **union of the routed experts**, which grows with the batch, so the amortisation is not ~N×) and marks it **INFERRED**; the manual carries **no** measured bs = 1 → 8 step-time or `merged`-per-token curve, and the campaign's own serving arm never ran a concurrency sweep (`--max-num-seqs 1`, sweep **NOT RUN**). A parallel port reports **10.6 / 28.4 / 35.2 ms/step** at bs **1 / 2 / 4** — a data point on their code state, not a curve, and not ours. | One arm at bs = **1, 2, 4, 8**, same code state, reading **`merged` per token** (§3.6.1) — plus the **routed-expert union per step** from the same traces, because that is the quantity that separates "the weights amortised" from "the expert set grew". *(Opened 2026-10-21 from a parallel port's batched-decode notes; §3.1.5.)* |
 
 ---
 
@@ -3518,6 +3646,37 @@ consults this register to find out what we do *not* know gets a complete answer.
     sides' logprobs are **float32-exact** — so these are ordinary float32 differences, spanning
     **3e-5 … 0.53**. *(§3.4.8; `Archive/by-date/2026-10-13/serve-nondeterminism/REPORT.md` §1.1, §3–§5;
     the measurement: `Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §5–§7 and §11 item 2.)*
+
+28. **An env knob that "does not exist" usually lives in the plugin, not in vLLM.** **MEASURED:** a
+    parallel port of this model concluded that `VLLM_T_COMPILE_DYNAMIC_SHAPES` "appears **zero**
+    times in the vLLM tree we actually run" and that setting it "is a no-op" — from a grep of
+    **upstream vLLM core** (`vllm/`). The knob is defined in the **plugin**, as a feature flag:
+    `vllm_gaudi/extension/features.py` carries
+    `Value('dynamic_shapes_compilation', True, env_var='VLLM_T_COMPILE_DYNAMIC_SHAPES',
+    env_var_type=boolean)`, and it works — it is the same variable item 26 above is about. Upstream
+    vLLM core cannot contain a plugin's knob, so **the zero count is a property of where the grep
+    ran, not of the build.** Grep the plugin tree (`vllm_gaudi/`) for `env_var=`, and check the
+    **product default** rather than the absence of the name. This is item 23 in a new costume, and it
+    is worth its own item because the wrong conclusion here is *reassuring* — "the switch does
+    nothing, so dynamic shapes are not the problem" — and it retires a live hypothesis without
+    testing it. *(The knob's definition site: `vllm_gaudi/extension/features.py`; the consumer:
+    `vllm_gaudi/utils.py`'s `HPUCompileConfig`, which reads `get_config().dynamic_shapes_compilation`.
+    **Source read.**)*
+
+29. **A compile failure surfaces at a FLUSH POINT, not at the culprit — bisect with `synchronize()`
+    markers, and two rounds is usually enough.** **MEASURED:** a graph-compile failure presented at a
+    **D2H copy** (`token_host.copy_(token, non_blocking=True)`) — which is simply where the lazy graph
+    was flushed, and therefore *not* the location of the defect (§3.4.7's `synStatus 26` shows the
+    same pattern from the other side). Inserting `torch.hpu.synchronize()` at successive statement
+    boundaries, behind an env flag, took it down in **two runs and no theory**: round 1 bracketed the
+    model forward and **proved the forward was fine**, collapsing the search to four statements;
+    round 2 split those four and collapsed it to two. The theory being pursued in parallel (a
+    collective inside the sampler) was **wrong**, and the markers did not care — which is the point:
+    this instrument does not depend on being right about the cause. **Rules that make it safe:** the
+    flag **defaults off** and warns once when enabled; every marker costs a **device
+    synchronisation**, so an arm carrying markers measures a different thing and must not be used for
+    timing; and the markers are removed by their `PROBE EDIT` marker before commit, not left behind a
+    flag.
 
 ---
 
