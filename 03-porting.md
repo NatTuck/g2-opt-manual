@@ -3399,6 +3399,9 @@ subsection in §3.4.1.)*
 additions, not closures.** **Item 21, opened 2026-10-13 by the fp4 LUT promotion (§3.4.8), is now
 CLOSED — the whole-model TP=4 run resolved it (below).** **Item 22 is new, opened 2026-10-13 by the
 two-arm compile gate (§3.6.5), and it is the *bound on that gate's result* rather than a new question.**
+**Item 23 is new, opened 2026-10-21 from a parallel port's batched-decode notes (§3.1.5) — the
+batch-scaling curve has never been measured here, and the mechanism argument is therefore
+**INFERRED** rather than priced.**
 They are registered here rather than left inside §3.4.7 so that a reader who
 consults this register to find out what we do *not* know gets a complete answer.
 
