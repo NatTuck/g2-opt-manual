@@ -128,14 +128,10 @@ def main(iterations: int = 20, warmup: int = 5) -> int:
     prof.stop()
 
     raw = os.path.join(PROF, "trace.json")
-    # TWO workarounds, both required on this build (torch 2.13 / Habana 1.24.2):
-    #  1. torch's own export passes a metadata argument the Habana shim does not accept, so call
-    #     the wrapped profiler's method directly;
-    #  2. the HPU side appends into the file and fails with `output_json.cpp: Failed to open`
-    #     when it does not exist, so pre-create a VALID (empty) chrome trace first. Without this
-    #     you get a trace with cpu_op events and NO device events at all.
-    with open(raw, "w") as fh:
-        fh.write('{"traceEvents": []}')
+    # ONE workaround, required on this build (torch 2.13 / Habana 1.24.2): torch's own export
+    # passes a metadata argument the Habana shim does not accept, so call the wrapped profiler's
+    # method directly. (A second suspected defect -- needing the output file to pre-exist -- was
+    # tested four times and did NOT reproduce; see 05-profiling.md §5.7.1.)
     prof.profiler.export_chrome_trace(raw)
     with open(raw, "rb") as src, gzip.open(raw + ".gz", "wb") as dst_gz:
         shutil.copyfileobj(src, dst_gz)

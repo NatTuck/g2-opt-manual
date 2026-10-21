@@ -26,8 +26,7 @@ The three programs that produced chapter 5's measurements. Unlike most examples 
 
 | trap | where it bites |
 |---|---|
-| `tensorboard_trace_handler` raises `TypeError` on this build | torch passes `(path, metadata)`, the Habana shim takes `(self, path)` — call `prof.profiler.export_chrome_trace(path)` |
-| the HPU exporter needs the output file to **pre-exist** | otherwise you get a trace with `cpu_op` events and **no device events at all** — pre-write `{"traceEvents": []}` |
+| `tensorboard_trace_handler` raises `TypeError` on this build | torch passes `(path, metadata)`, the Habana shim takes `(self, path)` — call `prof.profiler.export_chrome_trace(path)`. Reported upstream as issue 23 |
 | `torch.compile` needs `backend="hpu_backend"` | the default backend is inductor, which dies with `KeyError: 'hpu'` |
 | the dumps land in `<dir>/.graph_dumps/` | a non-recursive `listdir` reports 0; `glob("**")` skips hidden dirs — use `os.walk` |
 | a missing dump directory is treated as a **file** | the GC writes one JSON to that path, and the next run's `makedirs` fails |

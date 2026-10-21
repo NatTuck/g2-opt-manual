@@ -158,7 +158,6 @@ and then every per-step figure is `total / steps` over an explicitly named windo
 
 ```python
 from torch.profiler import ProfilerActivity, profile
-import gzip, os
 
 acts = [ProfilerActivity.HPU, ProfilerActivity.CPU]      # CPU included => compile ids survive
 prof = profile(activities=acts, record_shapes=False)
@@ -167,9 +166,7 @@ prof.start()
 torch.hpu.synchronize()
 prof.stop()
 
-# TWO workarounds, both required on torch 2.13 / Habana 1.24.2 (see §5.7.1)
-with open(path, "w") as fh:
-    fh.write('{"traceEvents": []}')                       # the HPU side needs the file to exist
+# ONE workaround, required on torch 2.13 / Habana 1.24.2 (see §5.7.1):
 prof.profiler.export_chrome_trace(path)                   # torch's own export passes 3 args; the shim takes 2
 ```
 
@@ -183,13 +180,26 @@ has device events and no region spans is unattributable; say so and stop.
 
 ## 5.7 Three traps that cost runs
 
-**5.7.1 Two export bugs on this build, both silent.** (a) `tensorboard_trace_handler` raises
-`TypeError: takes 2 positional arguments but 3 were given` — torch 2.13 calls
-`export_chrome_trace(path, metadata)`, the Habana shim defines `(self, path)`; call the wrapped
-profiler's method directly. (b) With CPU+HPU and no file at the path, the HPU side fails
-`output_json.cpp: Failed to open … No such file or directory` and the trace comes out with `cpu_op`
-events and **no device events at all** — a trace that looks like "the device did nothing". Pre-write
-`{"traceEvents": []}`.
+**5.7.1 An export bug on this build, and a second one that we suspected and then RETRACTED.**
+(a) **MEASURED, reproducible, reported upstream** (`HabanaAI/gaudi-pytorch-bridge` issue 23):
+`tensorboard_trace_handler` raises `TypeError: takes 2 positional arguments but 3 were given` —
+torch 2.13 calls `export_chrome_trace(path, metadata)` while the Habana shim at
+`activity_profiler.py:63` and `:195` defines `(self, path)`. It fires **at profiler exit**, after the
+window has completed, so the run is lost. Call the wrapped profiler's method directly:
+`prof.profiler.export_chrome_trace(path)`.
+
+(b) **RETRACTED.** An earlier version of this section claimed a second defect: that the exporter
+needs the output file to pre-exist, and otherwise emits a trace with `cpu_op` events and no device
+events. **We could not reproduce it** — four attempts, three plain and one with `TORCH_TRACE` and
+`DUMP_POST_GRAPHS` set, all exported correctly to a path that did not exist. The single observation
+that prompted the claim is best explained by the output directory being removed by an external
+cleaner *during* the run, which this sandbox does. **Do not add a pre-create-the-file step on the
+strength of it.** *The claim is kept here, marked, rather than deleted: a retracted incantation is
+worse than no incantation, because the next reader cannot tell whether it is load-bearing.*
+
+If you *do* see `output_json.cpp: Failed to open … No such file or directory` followed by a
+`json.exception.parse_error … empty input`, check first that the output **directory** still exists —
+that is the cause we could reproduce, and it is a property of the environment, not the library.
 
 **5.7.2 The dumps land in a dot-directory.** `DUMP_POST_GRAPHS=<dir>` writes to
 `<dir>/.graph_dumps/`, so a non-recursive `listdir` reports **0 files** while the dumps sit one level
@@ -254,5 +264,6 @@ which is a third identifier space. `stats()` returns a **list of pairs**, not a 
 
 **Tagging convention** as throughout: **MEASURED** / **ASSUMED** / **INFERRED** / **UNKNOWN**, see
 `README.md`. The figures in this chapter are from one 4-AIP Gaudi 2 container, torch 2.13.0 /
-Habana 1.24.2, driver 1.24.2 — and the two export bugs in §5.7.1 are **version-specific**; check them
-before assuming the workarounds are still needed.
+Habana 1.24.2, driver 1.24.2 — and the export bug in §5.7.1 is **version-specific** (reported
+upstream as `HabanaAI/gaudi-pytorch-bridge` issue 23); check it before assuming the workaround is
+still needed. §5.7.1 also records a **retracted** claim, deliberately kept visible.
