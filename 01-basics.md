@@ -872,8 +872,33 @@ enough to read in full.
 
 **One more trap, same family:** collecting **CPU** activity alongside HPU activity inflates the
 trace's host span by roughly 3× (measured: 23.3 → 1.67 ops outstanding at the host's end), which
-makes a device-bound arm look host-bound. **Profile HPU-only** when the question is about the
-device. **MEASURED**
+makes a device-bound arm look host-bound. **MEASURED**
+
+**But "profile HPU-only" is not the whole rule, and read literally it costs you the profile's
+usefulness.** Measured on two runs of the same program, same iterations:
+
+| activity | merged device union | TPC | MME | DMA |
+|---|---:|---:|---:|---:|
+| CPU + HPU | 0.593 ms | 0.102 | 0.152 | 0.381 |
+| HPU only | 0.598 ms | 0.101 | 0.153 | 0.385 |
+
+**Device durations are unaffected by CPU collection** — 0.8 % on the union, ≤1 % per engine. What CPU
+collection corrupts is the **host span and queue depth**, which is what the paragraph above measures.
+And HPU-only collection **drops every compile id**, because `Torch-Compiled Region` is a CPU-side
+dynamo annotation — so an HPU-only trace cannot be joined to the code that produced it at all
+(**0 region spans** in the HPU-only run above; **60** with CPU included).
+
+⇒ **Three cases, not one rule:**
+
+| question | activity | why |
+|---|---|---|
+| device **durations / unions** | either — they agree | measured in the table above |
+| **host span, queue depth, overlap** | **HPU-only** | CPU collection inflates these ~3× |
+| **attribution to code** | **CPU + HPU, always** | the compile id lives in a CPU annotation |
+
+**Chapter 5 is about the third row** — the identity chain from a trace event to a source line, the
+knobs that must be set *before* the run, and the traps that silently break the join. **Read it before
+taking a profile you intend to act on.**
 
 ---
 

@@ -1,6 +1,6 @@
 # Gaudi 2 HPU Optimization Manual
 
-**Status: DRAFT.** Four chapters are written and filled with measured material. Gaps are
+**Status: DRAFT.** Five chapters are written and filled with measured material. Gaps are
 marked explicitly rather than left blank or guessed — each chapter carries its own
 **UNKNOWN register**, and chapter 3 also carries a **dead-end register**.
 
@@ -58,6 +58,7 @@ those in from general knowledge.**
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
 | 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 | 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
+| **5** | **[Profiling and the identity chain](05-profiling.md)** | ~400 | **read before taking a profile you intend to act on** — the five legs from a trace event to a source line, which are keys and which are inferences, the run-time knobs that cannot be set afterwards, and the traps that silently break the join |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the five had gone stale** — chapter 1 read 944 against an
@@ -65,12 +66,16 @@ actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked
 is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
 not cite it.**
 
-Example code lives in [`examples/`](examples/), organized by chapter — **14 files**, of which
-two run CPU-only and have been verified end to end on archived traces
-(`examples/02-regions/03_inspect_graph_dumps.py --demo` and
-`examples/01-basics/gap_histogram.py`, the latter including its `--selftest` control), and one
+Example code lives in [`examples/`](examples/), organized by chapter — **17 files**, of which
+three run CPU-only and have been verified end to end on archived traces
+(`examples/02-regions/03_inspect_graph_dumps.py --demo`, `examples/01-basics/gap_histogram.py`
+including its `--selftest` control, and `examples/05-profiling/attribute_chain.py`), and one
 (`examples/03-porting/fp8_scale_adjustment.py`) is host-only and has been run. **The rest are
 annotated sketches** that need a device; each says so in its header.
+
+Chapter 5's three programs are the exception to "annotated sketch": they were **run on a real
+Gaudi 2 on 2026-10-21** and their outputs are archived, so the worked example in §5.8 is a
+measurement rather than a description.
 
 ## What this draft does not yet cover
 
