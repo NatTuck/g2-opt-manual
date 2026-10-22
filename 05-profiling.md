@@ -74,9 +74,26 @@ sound when the two host streams are 1:1:
 | window ("next enqueue after this launch") | ambiguous 35 of 60 | — |
 
 **So on a real model this leg is currently unavailable, and a tool that produces a confident table
-anyway is lying to you.** Emit `<ambiguous>`. The fix is a one-line instrumentation change — put
-`recipeHandle` on `launch_recipe`'s args — and until it exists, `attribute_chain.py` verifies the
-1:1 property and refuses when it does not hold.
+anyway is lying to you.** Emit `<ambiguous>`. Until the join exists, `attribute_chain.py` verifies
+the 1:1 property and refuses when it does not hold.
+
+**The identity is already in the process — it is being filtered out.** The bridge annotates the FX
+graph name on the Python thread, inside the region span (`GraphExec::launch`,
+`habana_eager/graph_exec.cpp:794`), and the profiler drops it because its `mandatory_events` list is
+a regex set that no graph name matches (`backend/profiling/kineto_activity_profiler.cpp:517`). The
+name in the post-graph dump is that same FX name with **one substitution** — `jit` → `syn`
+(`backend/kernel/hpu_habana_launch_op_pt.cpp:247-248`) — plus a compile-time suffix
+(`get_unique_recipe_name`, `backend/synapse_helpers/graph.cpp:643`). So the join is reachable with
+two small edits and no new plumbing: let the annotation through the filter, and emit the
+substituted name.
+
+**Our fork carries this work:** <https://github.com/NatTuck/gaudi-pytorch-bridge>, branch
+`gaudi2-profiling-identity` (off upstream `v1.24.2`). At the time of writing it carries the
+`export_chrome_trace` fix from §5.7.1 **applied and verified**, and the recipe-identity change
+**identified but not applied** — the local bridge build does not link here (cmake 4.4.x against a
+patch set that needs 3.31.6), so nothing is claimed about its behaviour. `PATCHES.md` on that
+branch carries the exact lines, the reasoning, and the two candidate strings that turned out to be
+wrong.
 
 ---
 
@@ -254,7 +271,7 @@ which is a third identifier space. `stats()` returns a **list of pairs**, not a 
 
 | # | open | what would settle it |
 |---|---|---|
-| 1 | **A key for region → recipe.** Currently a pairing, and it fails on a real model (§5.2.2). | Put `recipeHandle`/`recipeId` on `launch_recipe`'s args (a one-line bridge change), or a compile-time metric that carries the dynamo compile id. |
+| 1 | **A key for region → recipe.** Currently a pairing, and it fails on a real model (§5.2.2). The identity is already annotated but filtered out, and the dump name is one `jit`→`syn` substitution away — so the fix is two small bridge edits, not new plumbing. **Our fork carries the patch, unverified** (it does not link here; §5.2.2). | Run a patched build on a real model and confirm the trace event name matches the dump's `graph_name`; then `attribute_chain.py`'s `AMBIGUOUS` path becomes dead code kept only for foreign traces. |
 | 2 | **Whether the compile-time metric can carry the compile id.** `graph_compilation.recipe` carries the graph name and duration, not the compile id. | Read the metric per compile — reset and re-read around a single region — and check whether a compile id is derivable; or ask the vendor. |
 | 3 | **`recipeId` == `recipe_debug_id` in general.** Established for this build and one run (three recipes, all matching). | A run where the two disagree, or the header documented. |
 | 4 | **Attribution of eager-placed nodes.** A node placed `eager` runs outside every recipe and emits no `LaunchRecipe` (§2.1), so it has a device event and no recipe. | Count them explicitly and report the residual rather than folding it into a recipe. |
