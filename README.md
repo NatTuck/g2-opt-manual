@@ -58,7 +58,7 @@ those in from general knowledge.**
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
 | 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 | 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
-| **5** | **[Profiling and the identity chain](05-profiling.md)** | ~400 | **read before taking a profile you intend to act on** — the five legs from a trace event to a source line, which are keys and which are inferences, the run-time knobs that cannot be set afterwards, and the traps that silently break the join |
+| **5** | **[Profiling and the identity chain](05-profiling.md)** | ~430 | **read before taking a profile you intend to act on** — the five legs from a trace event to a source line, which are keys and which are inferences, the run-time knobs that cannot be set afterwards, how to collect from a vLLM run (where the engine, not you, owns the device), and the traps that silently break the join |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the five had gone stale** — chapter 1 read 944 against an
