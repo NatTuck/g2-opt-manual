@@ -180,9 +180,35 @@ def main(argv):
                   and str(e.get("name", "")).startswith("enqueueWithExternalEventsExt")),
                  key=lambda e: e["ts"])
 
-    # ---- region -> recipe: try the 1:1 pairing first, and PROVE it before using it -------------
+    # ---- region -> recipe, method 1: the graph-name key (needs the patched bridge) ------------
+    # With the patch applied, GraphExec::launch emits an event whose NAME IS THE SYNAPSE GRAPH
+    # NAME (the jit->syn substitution), on the Python thread and inside the region span. That
+    # name is a prefix of the post-graph dump's `graph_name`, so the join is a key, not a pairing.
     method, pair_map = None, {}
-    if len(enq) == len(launches) and launches:
+    graph_events = [e for e in events
+                    if e.get("ph") == "X" and str(e.get("name", "")).startswith("graph_")
+                    and "_syn_" in str(e.get("name", ""))]
+    if graph_events and dumps:
+        # The dumper names each file after the graph, so the FILENAME is the key:
+        #   event  graph_0000_fused_0_syn_1000000
+        #   file   graph_0000_fused_0_syn_1000000_1000000_4.7.57369.post.json
+        cand = collections.defaultdict(set)
+        for e in graph_events:
+            cid = innermost(regions, e["ts"])
+            if cid is None:
+                continue
+            name = str(e["name"])
+            hits = [rid for rid, (fname, _c, _u) in dumps.items() if fname.startswith(name)]
+            if len(hits) == 1:
+                cand[cid].add(hits[0])
+        if cand and all(len(v) == 1 for v in cand.values()):
+            seen = [next(iter(v)) for v in cand.values()]
+            if len(seen) == len(set(seen)):
+                method = "KEY JOIN via graph name (patched bridge)"
+                pair_map = {cid: next(iter(v)) for cid, v in cand.items()}
+
+    # ---- region -> recipe, method 2: the 1:1 pairing (unpatched bridge) -----------------------
+    if method is None and len(enq) == len(launches) and launches:
         cand = collections.defaultdict(collections.Counter)
         for lr, ev in zip(launches, enq):
             cid = innermost(regions, lr["ts"])

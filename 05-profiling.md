@@ -87,13 +87,34 @@ name in the post-graph dump is that same FX name with **one substitution** — `
 two small edits and no new plumbing: let the annotation through the filter, and emit the
 substituted name.
 
-**Our fork carries this work:** <https://github.com/NatTuck/gaudi-pytorch-bridge>, branch
-`gaudi2-profiling-identity` (off upstream `v1.24.2`). At the time of writing it carries the
-`export_chrome_trace` fix from §5.7.1 **applied and verified**, and the recipe-identity change
-**identified but not applied** — the local bridge build does not link here (cmake 4.4.x against a
-patch set that needs 3.31.6), so nothing is claimed about its behaviour. `PATCHES.md` on that
-branch carries the exact lines, the reasoning, and the two candidate strings that turned out to be
-wrong.
+**Our fork closes it, and it is verified.** <https://github.com/NatTuck/gaudi-pytorch-bridge>,
+branch `gaudi2-profiling-identity` (off upstream `v1.24.2`). Two changes: let the graph-name
+annotation through the filter, and emit the `jit`→`syn` form at `GraphExec::launch`. With those,
+the leg becomes a **key join**, measured on a three-block program on a Gaudi 2:
+
+```
+=== region -> recipe: KEY JOIN via graph name (patched bridge)
+recipe_chain_demo.py:63:mme_block  MME 0.038 ms   recipe 57369  dump graph_0000_…_syn_1000000_1000000_4.5.57369
+recipe_chain_demo.py:76:dma_block  DMA 0.016 ms   recipe 61189  dump graph_0002_…_syn_1002000_1002000_6.5.61189
+recipe_chain_demo.py:68:tpc_block  TPC 0.014 ms   recipe 62418  dump graph_0001_…_syn_1001000_1001000_5.5.62418
+verification: PASS — engine attribution matches the code's intent
+```
+
+Three compile ids → three source lines → three recipes → three dumps, node types confirming the
+intent, and **every `_syn_` event name mapped to exactly one dump**. The match is a **prefix**, not
+an equality: the event carries `graph_0000_fused_0_syn_1000000` while the dump is
+`…_syn_1000000_1000000_4`, because the recipe name appends a compile-time suffix. The dumper names
+each file after the graph, so matching the event name against the *filename* is unambiguous — but
+assert uniqueness rather than assuming it.
+
+The same branch also carries a **build fix** the profiler work depends on: `cmake/Targets.cmake`
+applied `-pie` to every target including shared libraries, which makes `ld` link a PIE *executable*
+(`Scrt1.o: undefined reference to 'main'`, then every legitimately-undefined symbol becomes a hard
+error). Guarding it on target type is what makes the backend link at all here. **The earlier belief
+that this needed cmake 3.31.6 was wrong** — the flag was the cause, and 4.4.x builds it fine.
+
+**On a stock, unpatched installation this leg is still unavailable**, so `attribute_chain.py` keeps
+its fallbacks and still refuses (`AMBIGUOUS`) rather than guessing.
 
 ---
 
@@ -271,7 +292,7 @@ which is a third identifier space. `stats()` returns a **list of pairs**, not a 
 
 | # | open | what would settle it |
 |---|---|---|
-| 1 | **A key for region → recipe.** Currently a pairing, and it fails on a real model (§5.2.2). The identity is already annotated but filtered out, and the dump name is one `jit`→`syn` substitution away — so the fix is two small bridge edits, not new plumbing. **Our fork carries the patch, unverified** (it does not link here; §5.2.2). | Run a patched build on a real model and confirm the trace event name matches the dump's `graph_name`; then `attribute_chain.py`'s `AMBIGUOUS` path becomes dead code kept only for foreign traces. |
+| 1 | ~~**A key for region → recipe.**~~ **CLOSED on a patched bridge, OPEN on stock.** Two small edits make it a key join — verified on a three-block program (§5.2.2, our fork). On a stock installation it is still a pairing that fails on a real model. | **Run the patched build on a real model**, where compile ids outnumber recipes (121 vs 110 on W0) and one region may launch several recipes — that is the case the three-block program cannot exercise. |
 | 2 | **Whether the compile-time metric can carry the compile id.** `graph_compilation.recipe` carries the graph name and duration, not the compile id. | Read the metric per compile — reset and re-read around a single region — and check whether a compile id is derivable; or ask the vendor. |
 | 3 | **`recipeId` == `recipe_debug_id` in general.** Established for this build and one run (three recipes, all matching). | A run where the two disagree, or the header documented. |
 | 4 | **Attribution of eager-placed nodes.** A node placed `eager` runs outside every recipe and emits no `LaunchRecipe` (§2.1), so it has a device event and no recipe. | Count them explicitly and report the residual rather than folding it into a recipe. |
