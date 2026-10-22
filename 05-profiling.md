@@ -90,7 +90,8 @@ substituted name.
 **Our fork closes it, and it is verified.** <https://github.com/NatTuck/gaudi-pytorch-bridge>,
 branch `gaudi2-profiling-identity` (off upstream `v1.24.2`). Two changes: let the graph-name
 annotation through the filter, and emit the `jit`→`syn` form at `GraphExec::launch`. With those,
-the leg becomes a **key join**, measured on a three-block program on a Gaudi 2:
+the leg becomes a **key join** — measured on a three-block program here, and on a 40-layer
+MoE at 89.4 % coverage in §5.8.1:
 
 ```
 === region -> recipe: KEY JOIN via graph name (patched bridge)
@@ -194,6 +195,11 @@ and then every per-step figure is `total / steps` over an explicitly named windo
 
 ## 5.6 Collect
 
+**Which API you use depends on whether the model runs in-process or under an engine that owns the
+device.** Getting this wrong costs a full model load before it fails.
+
+### 5.6.1 A standalone program (you own the device)
+
 ```python
 from torch.profiler import ProfilerActivity, profile
 
@@ -208,6 +214,40 @@ prof.stop()
 prof.profiler.export_chrome_trace(path)                   # torch's own export passes 3 args; the shim takes 2
 ```
 
+### 5.6.2 A vLLM run (the engine owns the device — the common case)
+
+**Do not use the block above.** With vLLM's multiprocess engine the device is owned by the
+`EngineCore` child, and any HPU-side call from the parent process dies:
+
+```
+RuntimeError: synStatus=8 [Device not found] Device acquire failed.
+```
+
+That is not specific to the profiler. It fires for `prof.start()`, for
+`torch.hpu.mem_get_info()`, for `torch.hpu.synchronize()` — for anything that tries to acquire the
+device in the parent. **Nothing HPU-side may run in the parent process.** Drive the profiler through
+vLLM, which runs it in the worker that holds the device:
+
+```python
+import os
+os.environ["VLLM_TORCH_PROFILER_DIR"] = prof_dir   # where the worker writes the trace
+os.environ["VLLM_HPU_PROFILER_ACTIVITY"] = "1"     # device events; both names read by hpu_worker.py
+...
+llm = LLM(model=..., max_model_len=...)
+llm.generate([prompt], sp)                          # warm-up: this is where compilation happens
+llm.start_profile("identity")                       # runs in the worker
+llm.generate([prompt], sp)                          # steady-state window
+llm.stop_profile()
+```
+
+Two consequences worth stating:
+
+- **`Torch-Compiled Region` spans still arrive**, because the worker collects CPU activity — so the
+  attribution chain is intact. This is the same requirement as §5.4, satisfied by the worker's own
+  activity configuration rather than by your `ProfilerActivity` list.
+- **The warm-up generate must be outside the window.** With a cold recipe cache the first generate
+  compiles the model; profiling it measures compilation.
+
 **Pre-flight every trace** with `devprobe.py` (§1.9): require `kernel` and `hpu_op` in the category
 histogram, and — for an attribution trace — require **`Torch-Compiled Region` spans**. A trace that
 has device events and no region spans is unattributable; say so and stop.
@@ -216,7 +256,7 @@ has device events and no region spans is unattributable; say so and stop.
 
 ---
 
-## 5.7 Three traps that cost runs
+## 5.7 Four traps that cost runs
 
 **5.7.1 An export bug on this build, and a second one that we suspected and then RETRACTED.**
 (a) **MEASURED, reproducible, reported upstream** (`HabanaAI/gaudi-pytorch-bridge` issue 23):
@@ -225,6 +265,13 @@ torch 2.13 calls `export_chrome_trace(path, metadata)` while the Habana shim at
 `activity_profiler.py:63` and `:195` defines `(self, path)`. It fires **at profiler exit**, after the
 window has completed, so the run is lost. Call the wrapped profiler's method directly:
 `prof.profiler.export_chrome_trace(path)`.
+
+**This is not a convenience-handler problem — it blocks profiling a vLLM run outright.** vLLM's own
+`start_profile()` path calls the same method in the worker, so a `vllm` profiling run dies with the
+same `TypeError` *after* a full model load (measured: 17–23 minutes on a 35 B model). Two ways out:
+install the fix in the environment (our fork carries it, §5.2.2), or drive the profiler yourself in a
+standalone process (§5.6.1). **The fix has to be in the interpreter that runs the worker**, not only
+in a fork you have checked out — a fork does not change what `import` resolves to.
 
 (b) **RETRACTED.** An earlier version of this section claimed a second defect: that the exporter
 needs the output file to pre-exist, and otherwise emits a trace with `cpu_op` events and no device
@@ -249,6 +296,39 @@ a matmul block look DMA-bound (**DMA 0.673 ms > MME 0.595**); the unions give th
 > DMA 0.107**. The cause is per-TPC replication — 400 DMA events against 160 MME events. §2.9 rule 1,
 reproduced end to end.
 
+**And the same rule bites the arithmetic that *reports* coverage**, which is where we broke it. The
+first version of the coverage line computed the unexplained residual by **subtraction**:
+
+```
+unexplained = total_union - union(mapped) - union(no recipe)     ->  -0.602 ms
+```
+
+A negative bucket. `union(A) + union(B) ≥ union(A ∪ B)`, because two disjoint *event sets* still
+overlap in *time* — so subtracting sub-unions from a total is the sum-versus-union error wearing a
+different hat. The unexplained bucket has to be **its own union**, computed over the events that
+belong to it. The corrected line on the same trace reads 89.4 % mapped / 11.0 % no recipe / 1.4 %
+unexplained, and states that the three do not sum to 100 % because they are unions.
+
+**A coverage figure is the one number that makes an attribution table self-auditing** — it is what
+tells you a table is missing a third of the step. So it has to be right, and it has to be reported
+rather than implied.
+
+**5.7.4 With a multiprocess engine, nothing HPU-side may run in the parent.** Three instances, all
+measured, all the same root cause — the `EngineCore` child owns the device and the parent has no HPU
+context:
+
+| call in the parent | result |
+|---|---|
+| `torch.hpu.mem_get_info()` | `RuntimeError: synStatus=8 [Device not found] Device acquire failed.` |
+| `torch.hpu.synchronize()` | same |
+| `prof.start()` | same — the profiler acquires the device too |
+
+So a profiling harness for a vLLM run cannot be "wrap `llm.generate()` in a `torch.profiler` block".
+It must go through `llm.start_profile()` / `llm.stop_profile()` (§5.6.2), and any device statistics
+you want must come from the worker's own reporting (or from `hl-smi` outside the process), never from
+the parent. This is the same constraint the worker's own `mem_stats` documents: *the parent has no HPU
+context, and initialising one there reserves the device and breaks worker init.*
+
 ---
 
 ## 5.8 The worked example
@@ -263,15 +343,55 @@ one engine each, each its own `torch.compile` region, called from an **uncompile
 | `recipe_chain_demo.py:76:dma_block` | `2/0` | 61405 | `graph_0002_…` | `DmaMemcpy×1, add_fwd_bf16×1` | **DMA 0.069 ms**, TPC 0.045 |
 
 `attribute_chain.py` prints that table and then **verifies it**: each block's dominant engine,
-measured, is compared against the engine the code was written to use. It passes — and it refuses
-(`AMBIGUOUS`) on the real model, where the 1:1 pairing does not hold.
+measured, is compared against the engine the code was written to use. It passes.
 
 The node types are the independent confirmation: the two GEMMs appear as two `GEMM` nodes, the four
 elementwise ops **fuse to one** TPC kernel, and the copy block is one `DmaMemcpy` plus the `add`
 broadcast. **Read the dump, not just the engine mix** — a fused kernel and four kernels are the same
 engine and a different cost.
 
-### 5.8.1 Two more keys available from the backend metrics
+### 5.8.1 The real model — 40 layers, 256 experts, 89.4 % attributed
+
+The toy proves the mechanism. This proves it at scale, and it is the run that makes the chain worth
+having. **`Qwen/Qwen3.6-35B-A3B-FP8`** on one Gaudi 2: 35 GB of weights, 40 layers, 256 experts with
+8 active, profiled through `llm.start_profile()` (§5.6.2) with `TORCH_TRACE` and
+`DUMP_POST_GRAPHS` set and a cold recipe cache.
+
+| | |
+|---|---|
+| region spans | **7,515** |
+| compile ids | **33**, of which **23** mapped to a recipe |
+| recipes | **23** |
+| device union in the window | **121.7 ms** |
+| **attributed to a source line** | **89.4 %** |
+| in no recipe (eager / outside every recipe) | 11.0 % |
+| unexplained (a recipe id in no mapping) | 1.4 % |
+
+and the top of the table, which is the whole point:
+
+| source location | engine union |
+|---|---|
+| `hpu_fused_moe.py:756:torch_dynamo_resume_in_patched_fused_moe_forward_at_756` | **TPC 27.7 ms, MME 21.2 ms** |
+| `qwen3_next.py:549:forward` (the decoder layer) | TPC 13.3 ms, DMA 8.3 ms |
+| `hpu_gdn_pytorch.py:841:hpu_chunk_gated_delta_rule` | MME 4.5 ms |
+
+**Read those rows and check them against what the model is.** A 256-expert decode should spend most
+of its time in the fused MoE, then in the decoder layer, then in the gated-delta-net chunk kernel —
+and it does. That agreement is the validation; a join that mis-attributed would not produce it.
+
+**Three honest caveats, because this is one run:**
+
+- **The mapping was 1:1 in this window** — 23 compile ids, 23 recipes, **no** compile id launching
+  more than one recipe and no recipe shared between compile ids. The tool handles the one-to-many
+  case (it carries `{compile id → set of recipes}`, and prints the shape of the mapping precisely so
+  a 1:1 run is distinguishable from a hidden many-to-many), but **this run did not exercise it**.
+  A different batch or context length should make the specialisation diverge; that is the next run.
+- **33 compile ids but only 23 mapped.** The other 10 launched no recipe the tool could match — worth
+  understanding before the numbers are quoted as complete.
+- **Timing is not comparable to anything.** Cold cache, graph dumping and CPU collection all distort
+  it. This run is for identity.
+
+### 5.8.2 Two more keys available from the backend metrics
 
 With `PT_HPU_METRICS_GC_DETAILS=1` and `PT_HPU_ENABLE_CACHE_METRICS=1` (set before the metrics module
 is imported), `habana_frameworks.torch.hpu.metrics.metric_global(name).stats()` returns, per compile:
@@ -292,7 +412,10 @@ which is a third identifier space. `stats()` returns a **list of pairs**, not a 
 
 | # | open | what would settle it |
 |---|---|---|
-| 1 | ~~**A key for region → recipe.**~~ **CLOSED on a patched bridge, OPEN on stock.** Two small edits make it a key join — verified on a three-block program (§5.2.2, our fork). On a stock installation it is still a pairing that fails on a real model. | **Run the patched build on a real model**, where compile ids outnumber recipes (121 vs 110 on W0) and one region may launch several recipes — that is the case the three-block program cannot exercise. |
+| 1 | ~~**A key for region → recipe.**~~ **CLOSED on a patched bridge, OPEN on stock.** Two small edits make it a key join — verified on a three-block program **and on a 40-layer MoE** (§5.8.1). On a stock installation it is still a pairing that fails on a real model. | — **done** on the patched bridge. The stock path stays open, and is why the fallbacks remain in the tool. |
+| 1a | **The one-to-many case is untested on a real model.** §5.8.1's run was 1:1 — 23 compile ids, 23 recipes; no compile id launched more than one recipe and no recipe was shared. The tool supports both, but a 1:1 run cannot distinguish *handled* from *hidden*. | A second run at a different batch size or context length, where specialisation should diverge, plus a check that the shape-of-mapping block reports it. |
+| 1b | **33 compile ids, 23 mapped** in §5.8.1 — the other 10 launched no recipe the tool matched. | Per-compile-id inspection of those 10: the compile metric (§5.8.2) plus the dump set should say whether they compiled nothing, compiled to a recipe the dumper missed, or ran only eager work. |
+| 1c | **The chain has not been run on DeepSeek V4 Flash** — the port this manual is mostly about. Qwen proves the mechanism; it does not prove it on the model that matters here. | The same run shape as §5.8.1, on DSv4, at a batch size where its 121 compile ids and 110 recipes actually diverge. |
 | 2 | **Whether the compile-time metric can carry the compile id.** `graph_compilation.recipe` carries the graph name and duration, not the compile id. | Read the metric per compile — reset and re-read around a single region — and check whether a compile id is derivable; or ask the vendor. |
 | 3 | **`recipeId` == `recipe_debug_id` in general.** Established for this build and one run (three recipes, all matching). | A run where the two disagree, or the header documented. |
 | 4 | **Attribution of eager-placed nodes.** A node placed `eager` runs outside every recipe and emits no `LaunchRecipe` (§2.1), so it has a device event and no recipe. | Count them explicitly and report the residual rather than folding it into a recipe. |
