@@ -17,7 +17,10 @@ This is not a heuristic. It follows from three things this manual has already me
 
 1. **Device work across recipes is serial.** *"cross-recipe overlap is exactly zero"* (§3.6.4). The
    scheduler co-schedules independent nodes **inside** one submission and does nothing across
-   submissions (§2.1).
+   submissions (§2.1). **The evidence is an identity, not a correlation**: the 110 per-recipe busy
+   sets **partition `merged`** — 66.135 ms of per-recipe unions against `merged` = 66.1399, a 0.007 %
+   difference (§3.6.4, §2.9 rule 1). That identity is why a span's union can be *added* to the other
+   recipes' unions to predict the step, even though summing **event** durations is illegal.
 2. **At a recipe boundary, a recipe's leave-one-out equals its union.** The manual's warning that
    "the union overstates what a removal buys, by 1.5–4.3×" is about cuts **inside** a recipe, where
    the rest of the recipe still occupies the time. Across a whole recipe there is nothing left to
@@ -28,7 +31,8 @@ This is not a heuristic. It follows from three things this manual has already me
 Chain them and you get the licence for the whole workflow:
 
 > **A span cut at recipe boundaries has Δwall ≈ Δunion.** Make the span's device union smaller and
-> the step gets faster by about that much.
+> the step gets faster by about that much — and the arithmetic closes per recipe, because the step is
+> the *sum* of per-recipe unions, not a union over a set you cannot decompose.
 
 **It fails in exactly two places, and both are worth naming up front:**
 

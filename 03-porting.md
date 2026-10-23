@@ -2594,6 +2594,25 @@ the shape of this table: the two largest *op counts* are not the two largest *ti
 family with the largest op count is not in the top three by time. **Count and cost are different
 questions.**
 
+> **The quantity the families add up to: `merged` is a SUM of per-recipe unions, and that is exact.**
+> Because recipes execute sequentially — **cross-recipe overlap is exactly zero** — the **110
+> per-recipe busy sets partition `merged`**: `25.295` (attention) + `40.642` (MoE/FFN) + `0.198`
+> (head/embed/sampler) = **66.135** against `merged` = **66.1399**, a **0.007 %** difference.
+> **MEASURED.**
+>
+> So the arithmetic that is *illegal* is summing **event** durations (§2.9 rule 1) — not summing
+> recipe unions, which is the correct model and is what makes this section's tables additive. Two
+> consequences worth carrying:
+>
+> - **The partition is the evidence for the seriality**, and the seriality is the reason the sum is
+>   legal. Neither statement stands alone; quote them together.
+> - **The sum is exact only when every device event belongs to a recipe.** Eager-placed nodes have no
+>   recipe and sit outside the partition — on a Qwen decode trace the recipe-less events were **11 %**
+>   of the device union. Where the partition does not close, the shortfall is the eager work, and it
+>   belongs in its own row rather than folded into a family.
+> - **Per device, never across devices**: in TP the ranks run in lockstep, so per-rank sums are
+>   replicas; the step wall is the slowest rank plus the host term.
+
 > **⚠ Read the LOO column, not the union column, when you are pricing a change.**
 >
 > **A family's union is an *occupancy*; the most a change that removes that family can free is its

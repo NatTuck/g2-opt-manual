@@ -54,6 +54,13 @@ time can leave the wall flat. Before you optimise anything, ask what it removes 
 **union**.
 → *Chapter 2*
 
+**But the rule has two levels, and "never sum" is wrong on its own.** Union **within** a recipe;
+sum **across** recipes. Recipes execute sequentially, so the per-recipe unions **partition** the
+step exactly — on the reference arm, **110 recipes summing to 66.135 ms against `merged` = 66.1399**
+(0.007 %). What is illegal is summing **event** durations, which double-count. Summing recipe unions
+is the correct model, and it is what lets you price a span by its own union.
+→ *Chapter 2 §2.9 rule 1; chapter 3 §3.6.4*
+
 ---
 
 ## The one stale claim to watch for
