@@ -140,6 +140,10 @@ fails any of them is not a span yet:
 | **harness-able in seconds** | seconds, not minutes. ~10 s is comfortable; a minute is arguable; more is a full run with extra steps |
 | **covers what it touches** | if the span contains a collective, the harness must run it — which means multi-card |
 
+**These five tests establish that a span is VALID. They do not establish that it is WORTH doing** —
+and a span can pass all five and still waste a day. §6.3.2 is the test for worth, and it is the one
+that gets skipped.
+
 **Cut between recipes, and grow the range until you can.** The cut is the whole point: a boundary
 inside a recipe costs you up to 4× in over-prediction (§6.1). If the natural span ends mid-recipe,
 extend it to the recipe edge — take the neighbouring work in rather than cutting inside one.
@@ -186,6 +190,83 @@ inputs, capture the tensors **on the far side of it** — the payload before the
 before the materialisation — so the harness can express the rewrite that eliminates it. A capture
 taken only at the tight boundary bakes the avoidable work into the harness, and the best rewrite is
 then unavailable.
+
+### 6.3.2 How big should a span be
+
+> **As large as you can rewrite and still attribute a change, and as small as the harness's own noise
+> allows.**
+
+Both ends of that rule are arithmetic, and both are worth stating because the two failure modes look
+completely different.
+
+#### The small end: a span smaller than the harness's own overhead measures the harness
+
+The most common bad choice is a span of a few recipes totalling **tens of microseconds**. It passes
+every validity test — clean inputs, clean outputs, trivially timable — and it is worthless, twice
+over:
+
+- **It is smaller than one synchronisation.** A host sync on this stack is on the order of **20 µs**
+  (§3.6.1's ~21.7 ms host constant spread over the ~1,048 syncs per step of §3.10 item 9 — an order
+  of magnitude, not a measurement of one sync). A harness that syncs per iteration therefore spends
+  more time syncing than computing.
+- **Even a large win in it moves nothing.** On the Qwen decode step the device union is **5.80
+  ms/step** (121.7 ms over 21 steps). A 15 µs span is **0.26 %** of the step; a 3× win in it buys
+  **0.17 %** — far below any full run's noise.
+
+**The tell is how you found it.** A tiny span is usually chosen because it was *easy to isolate*, and
+that convenience is exactly what makes it worthless. If it took five minutes to pick and it is 15 µs,
+the selection process was optimised, not the model.
+
+#### The large end: a whole decode step is valid and fast — the objection is complexity
+
+**A whole 1-token decode step is a valid span**, and a harness for it is *not* slow: after a one-time
+model load it runs in **~5.8 ms per iteration**, which is the step's own device union. Nobody should
+be told that a step-level harness is too expensive; that is false by three orders of magnitude
+compared with a full run's load and compile.
+
+It is usually the wrong choice for *exploration* for four reasons that have nothing to do with speed:
+
+| | |
+|---|---|
+| **reasoning** | 40 layers, ~23 recipes, KV-cache state. A from-scratch rewrite of that is a *port*, not an optimisation |
+| **attribution** | change three things and the step improves — which one did it? At block granularity you can attribute; at step granularity you usually cannot |
+| **the gate** | bit-exactness across 40 layers of accumulated arithmetic is hard to justify, so the gate weakens — and a weak gate is what lets a fast wrong answer through |
+| **isolation cost** | a step harness needs the full weight set and the KV cache before it produces its first number |
+
+#### So there are three rungs, and each answers a different question
+
+| rung | harness cost | the question it alone can answer |
+|---|---|---|
+| **block harness** — a repeated block across layers (the MoE is **28 %** of a Qwen step) | ~0.1 s/iter | *"can this computation be made faster?"* — **exploration** |
+| **step harness** — one whole 1-token decode | ~5.8 ms/iter after a load | *"does the change survive integration?"* — cross-recipe effects, compiler-chosen staging, host cost per submission |
+| **full run** | minutes | *"does it still work, and is the wall down?"* — **confirmation** |
+
+**Start at the block, integrate at the step, confirm on the run.** Skipping the middle rung is how a
+block win that does not survive integration gets discovered at the most expensive rung.
+
+#### Two numbers to compute before you start
+
+Both come free from chapter 5's artifacts plus the step count — no extra run:
+
+1. **Share of the step** — `span_union / step_wall`. The share is the ceiling on what any rewrite can
+   buy, and a realistic win is a fraction of it. Below a few percent, do not start.
+2. **Above the harness floor** — the span's own time against one synchronise (~20 µs), and ideally
+   ≫1 ms.
+
+**And prefer a block that recurs.** The MoE span runs **840 times** in the profiled window — once per
+layer per step. A repeated block is a larger share *and* a more stable measurement than one instance
+of something, because per-iteration noise averages out over the repetitions.
+
+#### Worked numbers, on the Qwen run
+
+| granularity | share of the 5.80 ms step | harness | verdict |
+|---|---|---|---|
+| full run | — | minutes | confirmation only |
+| whole decode step | 100 % | ~5.8 ms/iter | valid; **integration**, not exploration |
+| MoE block, all 40 layers | **28 %** (1.62 ms) | ~0.1 s/iter | **the sweet spot** |
+| one layer | ~2.5 % (0.15 ms) | ms | good when the block is too big to reason about |
+| one recipe | 0.1–28 %, varies wildly | µs–ms | good *when it is a big recipe* |
+| two small recipes, 15 µs | 0.26 % | below the harness floor | **a waste of a day** |
 
 ---
 
@@ -407,6 +488,12 @@ removed work it was supposed to keep.
 Once per span, when the harness has stopped improving. One full run with the replacement in place,
 and compare against the same full run before it.
 
+**Consider confirming at the step rung first (§6.3.2).** A one-token decode harness costs ~5.8 ms per
+iteration against a full run's minutes, and it already catches what a block harness structurally
+cannot: cross-recipe effects, staging the compiler chose, and the host cost per submission. If the
+win does not survive the step rung, the full run will only confirm that more expensively — and if it
+does survive, the full run becomes a formality rather than a discovery.
+
 **Set the expectation before you look.** If the predicted saving is smaller than the full run's
 run-to-run spread, the confirmation will come back inconclusive — that is arithmetic, not failure.
 The rank-to-rank spread on `merged` is on the order of a millisecond (§3.6.4's rank-spread note), so
@@ -438,6 +525,11 @@ in seconds. At that point it has stopped being an iteration tool.
 
 **Tuning the harness until the proxy check passes.** Covered above, and it is the failure mode this
 chapter most wants to prevent, because it looks like diligence.
+
+**Picking a span because it is easy to isolate.** The tiny span — a few recipes, tens of
+microseconds — is attractive precisely because its inputs and outputs are clean and its harness takes
+minutes to write. That convenience is the tell (§6.3.2): it is smaller than one synchronise and worth
+a fraction of a percent of the step. **Choose by share of the step, not by how cleanly it extracts.**
 
 **Optimising without a floor.** If you do not know what the computation *could* cost, you cannot tell
 a win from noise, you cannot tell which lever to pull, and you have no stopping condition — so you
