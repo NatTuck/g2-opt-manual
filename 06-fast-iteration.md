@@ -75,6 +75,56 @@ From the run behind §5.8.1 (`Qwen3.6-35B-A3B-FP8`, one card, decode):
 The fused MoE is the first span by inspection: largest single contributor, its inputs are the
 routed-expert tensors, and at TP=1 it contains no collectives.
 
+### 6.2.2 That span's floor, declared before any rewrite
+
+This is the §6.4 exercise done once, on real numbers, so the shape of it is concrete.
+
+**The computation.** Per token, per layer: 8 of 256 routed experts, each 3 matrices of
+`[hidden 2048, moe_intermediate 512]`, plus one shared expert of the same shape; 40 layers.
+
+| quantity | value |
+|---|---|
+| routed-expert parameters per token | 8 × 3 × 2048 × 512 × 40 = **1.007 G** |
+| shared-expert parameters per token | 3 × 2048 × 512 × 40 = **0.126 G** |
+| **bytes per token at fp8** | **1.132 GB** |
+| FLOPs per token | 2.27 GFLOP |
+| arithmetic intensity | **2.0 FLOP/byte** — against a ridge of ~200, so **bandwidth-bound by ~100×** |
+
+**The floor.** At the two envelopes this manual has measured:
+
+| carrier | rate | floor |
+|---|---|---|
+| DMA engine, 16–64 MB band (§3.2.2) | 1,776 GB/s | **0.638 ms/token** |
+| TPC stream envelope (§3.1.1) | 2,147 GB/s | **0.527 ms/token** |
+
+So the declared floor is **~0.53–0.64 ms per token**, and the compute term (0.005 ms) is irrelevant.
+Anything slower than that is not paying for arithmetic and not paying for the bytes it must move.
+
+**The measured value.** The decode recipe for this span executes once per layer per step; in the
+profiled window it runs 21 steps:
+
+| | |
+|---|---|
+| merged union, decode recipe | **34.1 ms** |
+| steps in the window | **21** |
+| **measured** | **1.62 ms/step** |
+| **ratio to floor** | **2.5×** |
+
+*(The span's other recipe — 30.0 ms — is the prefill path, 80 execution clusters against the decode
+recipe's 643. Attributing it as decode would have inflated the figure to 3.05 ms/step. Check which
+recipe is which before dividing.)*
+
+**So there is ~1.0 ms/step of headroom in this span, and the floor says where to look: bytes.** The
+plausible explanations are the ones this manual has already named — a static expert count read where
+fewer are routed (§3.1.1's over-read), bandwidth not reached at these tile sizes (§3.2.1's cliff), or
+scaffolding around the GEMMs (the prefill recipe of the same span carries 1,024 `MoeMultiplexer`
+nodes, 514 `ExpandDims` and 258 `Reshape`). **Which one it is has not been established** — that is the
+rewrite's job, and §6.3.1 says to look for exactly that scaffolding while choosing the span.
+
+**What this example does not yet have:** the rewrite. The floor is declared, the measured value is
+attributed, and the gap is quantified — but no rewrite has been attempted and no harness exists for
+this span. §6.11 records that as the open item.
+
 ---
 
 ## 6.3 Step 2 — pick a span
@@ -404,11 +454,16 @@ skipping it is not a wrong number but an endless loop.
 | 2 | **How far a harness can drift before the proxy check matters.** The check compares recipe count, node mix, op counts and union, but no threshold on any of them is calibrated. | Two harnesses of the same span at deliberately different fidelity, and the point at which their speedups diverge. |
 | 3 | **The cost of a faithful multi-card harness** for a span containing a collective — measured only as "expensive", not as a number. | Build one for a collective-bearing span and time the rebuild cycle. |
 | 4 | **Whether a captured span reproduces the in-situ data distribution.** A capture is one sample; a span whose cost depends on data (routed-expert patterns, sparsity) may be unrepresentative. | Compare harness union across several captures against the in-situ union across several steps. |
-| 4a | **No span has been taken all the way through with a declared floor** — §6.4's ceiling has never
-been compared against what a rewrite actually achieved. So the *shape* of the exercise is stated and
-the arithmetic behind it is measured, but the claim "this span is now at its floor" has no worked
-instance. | One span, floor declared first, rewritten, and the achieved/floor ratio reported — including
-the case where the floor turns out to be wrong (§6.4.5). |
+| 4a | **No span has yet been *rewritten* against a declared floor.** §6.2.2 now does the first half on
+real numbers — floor declared, measured value attributed, gap quantified at **2.5×** — but the rewrite
+itself has not been attempted and no harness exists for that span. So "the floor was reached" has no
+worked instance anywhere in this manual. | Build the harness for §6.2.2's span (§6.5–6.7), rewrite it
+(§6.4), and report the achieved/floor ratio — including the case where the floor turns out to be wrong
+(§6.4.5). |
+| 4b | **Which of three explanations owns the 2.5× gap in §6.2.2** — a static expert count read where
+fewer are routed (§3.1.1), bandwidth not reached at these tile sizes (§3.2.1), or scaffolding around
+the GEMMs (the same span's prefill recipe carries 1,024 `MoeMultiplexer` nodes). | The rewrite, plus a
+per-node byte/op accounting of the decode recipe against the 1.132 GB/token the floor assumes. |
 | 5 | **The correctness-gate tier for a span that ends in a reduction over experts.** Bit-exactness is unavailable once routing changes; what bound is defensible is not established here. | A ulp histogram across a set of realistic routing patterns, with the bound declared first. |
 
 ---
