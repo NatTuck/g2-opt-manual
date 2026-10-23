@@ -106,11 +106,138 @@ worth doing.
 
 **What "timable alone" does not require.** It does not require the span to be a pure function of its
 inputs. A span that reads a KV cache or a running state is fine — capture the state as part of the
-inputs (§6.4).
+inputs (§6.5).
+
+### 6.3.1 Look for removable work at the boundary — it is what makes a span worth rewriting
+
+While you are choosing the span, look at what sits **immediately around it**: a dtype conversion, a
+materialisation, a staging copy, a `cat`, a transpose-for-layout. Those are not just context — they
+are the most profitable thing a rewrite can delete, and a span whose boundary is full of them is a
+better target than one that is already clean.
+
+**What to look for**, in the profile and the dumps you already have from step 1:
+
+| tell | where it shows up | what a rewrite may be able to do |
+|---|---|---|
+| **a dtype conversion** | `_cast` / `_to_copy` nodes; a cast fused into a kernel prologue | keep the value in the dtype the consumer wants, or fold the conversion into the producer |
+| **a materialisation** | `cat`, `contiguous`, a `memcpy_dma` staging node, `num_of_ROIs` in the hundreds | produce the result in the layout the consumer reads, so the copy never exists (§3.6.5's KV slab is the canonical case) |
+| **an avoidable transpose** | `DmaTranspose` / `transpose_dma` nodes | choose the producer's output layout |
+| **an eager-placed round trip** | `aten._to_copy` ×2 placed `eager`, which also splits the recipe (§2.2) | remove the host round trip entirely |
+| **a re-read of the same bytes** | the same tensor appearing as an input to several nodes | fuse, so it is read once |
+
+**Why this is worth a rule rather than a habit:** deleting work is the only kind of win that
+transfers unconditionally. A rewrite that removes a staging pass or a cast reduces the span's device
+union by construction, and by §6.1 that union reduction is a wall reduction. A rewrite that merely
+*moves* the same work around has to earn its win against the launch/overlap accounting — which is
+exactly where the manual's dead ends live.
+
+**And it changes what you capture.** If the avoidable work sits just outside the span's natural
+inputs, capture the tensors **on the far side of it** — the payload before the cast, the source
+before the materialisation — so the harness can express the rewrite that eliminates it. A capture
+taken only at the tight boundary bakes the avoidable work into the harness, and the best rewrite is
+then unavailable.
 
 ---
 
-## 6.4 Step 3 — capture the inputs and outputs
+## 6.4 The conceptual task: an optimal rewrite against a ceiling
+
+Once the span is chosen, the job is **not** "make it faster". That has no target and no stopping
+condition. The job is:
+
+> **Estimate the fastest this computation could possibly run on this hardware, then rewrite the span
+> from scratch to reach it.**
+
+The estimate is the target. The rewrite is the work. The gap between them is the headroom, and the
+headroom is the only thing worth spending iterations on.
+
+**"Rewrite" is meant literally.** Not "tune the existing op", but *what is the fastest way to produce
+these outputs from these inputs on this hardware* — constrained only by the correctness gate. This is
+where the harness pays for itself: a from-scratch implementation can be dropped in and gated
+immediately, against the same captured bytes, in seconds.
+
+### 6.4.1 Compute the ceiling first, and name which term binds
+
+The ceiling is not one number, it is one of three regimes, decided by the span's arithmetic
+intensity `AI = FLOPs / bytes`:
+
+| regime | test | what binds | what the rewrite must do |
+|---|---|---|---|
+| **bandwidth-bound** | `AI` below the machine's ridge point | bytes moved | **move fewer bytes** — fuse producer and consumer, stop materialising intermediates, keep tiles above the ~16 MB cliff (§3.2.1) |
+| **compute-bound** | `AI` above the ridge | FLOPs at the MME rate | fewer FLOPs, or better tiling |
+| **launch-bound** | neither — the span is small | per-launch latency | fewer, larger ops |
+
+**§3.1.1 is the template for the calculation:** build the floor from the config and the checkpoint
+headers — bytes the span must move, FLOPs it must do — and see which term dominates. It is a
+pre-code exercise, not something read off a trace. §3.1.2 gives the FLOPs test, and the answer for
+decode is usually that FLOPs do not bind at all.
+
+**Getting the regime wrong sends you at the wrong lever**, which is the failure §3.6.4 documents: a
+decomposition that ranked data movement first sent the port at DMA, when the same work later showed
+the DMA families were the ones the staging rewrite had already removed.
+
+### 6.4.2 State the floor with its assumptions
+
+A floor is a claim of the form: *this span must move X bytes and do Y FLOPs; at Z GB/s and W TFLOP/s
+that is T ms, provided …*.
+
+The provisions are load-bearing:
+
+- **which engine carries the bytes** — the TPC stream envelope (2,147 GB/s) is not the DMA engine's
+  (~1,776 GB/s in the 16–64 MB band, §3.2.2), and the two differ by ~17 %;
+- **which dtype** — the byte count is `elements × bytes_per_element`, and fp8/fp4 change it by 2–4×;
+- **which tile size** — below ~16 MB the GEMV cliff means you are paying launch, not bandwidth
+  (§3.2.1), and the floor is not the binding term at all;
+- **whether the bytes are actually read once** — a materialisation reads and writes the same payload
+  twice, so the *avoidable* byte count is larger than the necessary one (§6.3.1).
+
+**A floor without its assumptions is a wish.** And a floor computed from the wrong bytes is worse than
+no floor, because it will be believed — the trace carries no byte field at all, so every byte figure
+is a *population × per-event-size* model (§3.4.6), and the model can be wrong by a factor.
+
+### 6.4.3 Declare it before the rewrite
+
+Write the ceiling down before you touch the code — same discipline as the correctness bound (§6.6). A
+ceiling chosen after the fact is a description of what you achieved, and it will always be reached.
+
+### 6.4.4 Judge the rewrite against the floor, not against the previous version
+
+Comparing against the previous version tells you whether you moved; comparing against the floor tells
+you whether you are done. Those are different questions, and only the second one terminates.
+
+### 6.4.5 This is the loop's stopping condition
+
+| where you land | what it means | what to do |
+|---|---|---|
+| **at the floor** | the span is done | stop, pick the next span |
+| **2× off** | the gap is real headroom | the floor's binding term tells you which lever: bytes, FLOPs, or launches |
+| **faster than the floor** | **the floor was wrong** | recompute it. That is a finding, not a victory — and it usually means a term was mis-costed (wrong engine, wrong tile regime, a byte count that double-counted) |
+
+Without this, the loop has no exit: you stop when you get bored, and "done" is a feeling.
+
+### 6.4.6 The floor moves when the computation changes
+
+If the rewrite fuses, changes dtype, removes staging or changes the tile regime, the floor for the
+*new* computation is a different number. Recompute it. Iterating toward the floor of a computation you
+no longer perform is chasing a stale target — and the stale target is always the flattering one,
+because it was computed for the slower version.
+
+### 6.4.7 When the floor is unreachable, say which reason
+
+Some spans cannot reach their floor, and the useful output is *which* limit stopped them:
+
+- **launch granularity** — the span is below the tile cliff and pays per-launch cost (§3.2.1);
+- **dependency structure** — the work is serial by construction, and recipes are serial across
+  submissions (§6.1);
+- **staging the compiler chose** — a layout decision outside the span, like the KV-slab
+  materialisation (§3.6.5);
+- **a term outside the span** — the host constant (§6.1), which the harness cannot see.
+
+Naming the reason is what stops the next person re-attempting it, and it is the difference between
+"we could not do better" and "this is where the limit is".
+
+---
+
+## 6.5 Step 3 — capture the inputs and outputs
 
 Do an instrumented run of the real model and save, at the span boundary, the tensors going in and
 the tensors coming out.
@@ -141,7 +268,7 @@ the layer" is mostly payload the span never touches.
 
 ---
 
-## 6.5 Step 3b — build the correctness gate
+## 6.6 Step 3b — build the correctness gate
 
 **The gate runs on every harness run, and a failing gate refuses to report a time.** A harness that
 gets faster while producing different answers is measuring a different computation, and the speedup
@@ -165,7 +292,7 @@ the ordered-integer key differs per format. Use a per-format instrument, not a g
 
 ---
 
-## 6.6 Step 4 — check the harness is a proxy
+## 6.7 Step 4 — check the harness is a proxy
 
 **This is a gate, and it is separate from "iterate" for that reason.** A harness that is faster than
 the model is not the goal; a harness that is faster *and is the same computation* is.
@@ -189,9 +316,13 @@ tuned into agreement is measuring itself.
 
 ---
 
-## 6.7 Step 5 — iterate
+## 6.8 Step 5 — iterate
 
-Change one thing, run the harness, read four numbers:
+**The work here is the rewrite described in §6.4** — a from-scratch attempt at the computation, aimed
+at the floor and judged against it. What this step adds is the instrumentation that tells you whether
+each attempt moved you, and why.
+
+Change one thing, run the harness, read five numbers:
 
 | number | what it tells you |
 |---|---|
@@ -221,7 +352,7 @@ removed work it was supposed to keep.
 
 ---
 
-## 6.8 Step 6 — confirm in situ
+## 6.9 Step 6 — confirm in situ
 
 Once per span, when the harness has stopped improving. One full run with the replacement in place,
 and compare against the same full run before it.
@@ -239,7 +370,7 @@ than from another full run.
 
 ---
 
-## 6.9 Anti-patterns
+## 6.10 Anti-patterns
 
 **The harness that measures itself.** The fastest harness is not the goal — a *faithful* one is. The
 manual's own dead-end register has the canonical case: a component benchmark silently destroyed by
@@ -258,9 +389,14 @@ in seconds. At that point it has stopped being an iteration tool.
 **Tuning the harness until the proxy check passes.** Covered above, and it is the failure mode this
 chapter most wants to prevent, because it looks like diligence.
 
+**Optimising without a floor.** If you do not know what the computation *could* cost, you cannot tell
+a win from noise, you cannot tell which lever to pull, and you have no stopping condition — so you
+stop when you get bored, and "done" becomes a feeling. §6.4 exists to prevent this, and the cost of
+skipping it is not a wrong number but an endless loop.
+
 ---
 
-## 6.10 What this chapter does not establish
+## 6.11 What this chapter does not establish
 
 | # | open | what would settle it |
 |---|---|---|
@@ -268,6 +404,11 @@ chapter most wants to prevent, because it looks like diligence.
 | 2 | **How far a harness can drift before the proxy check matters.** The check compares recipe count, node mix, op counts and union, but no threshold on any of them is calibrated. | Two harnesses of the same span at deliberately different fidelity, and the point at which their speedups diverge. |
 | 3 | **The cost of a faithful multi-card harness** for a span containing a collective — measured only as "expensive", not as a number. | Build one for a collective-bearing span and time the rebuild cycle. |
 | 4 | **Whether a captured span reproduces the in-situ data distribution.** A capture is one sample; a span whose cost depends on data (routed-expert patterns, sparsity) may be unrepresentative. | Compare harness union across several captures against the in-situ union across several steps. |
+| 4a | **No span has been taken all the way through with a declared floor** — §6.4's ceiling has never
+been compared against what a rewrite actually achieved. So the *shape* of the exercise is stated and
+the arithmetic behind it is measured, but the claim "this span is now at its floor" has no worked
+instance. | One span, floor declared first, rewritten, and the achieved/floor ratio reported — including
+the case where the floor turns out to be wrong (§6.4.5). |
 | 5 | **The correctness-gate tier for a span that ends in a reduction over experts.** Bit-exactness is unavailable once routing changes; what bound is defensible is not established here. | A ulp histogram across a set of realistic routing patterns, with the bound declared first. |
 
 ---

@@ -44,11 +44,11 @@ def load_capture(path):
     """Captured bytes: inputs, expected outputs, and any state the span reads.
 
     If the capture is missing, stop -- a harness that invents its own inputs is measuring a
-    different computation (chapter 6 §6.4).
+    different computation (chapter 6 §6.5).
     """
     if not os.path.exists(path):
         raise SystemExit(
-            f"no capture at {path}. Run the model with SPAN_CAPTURE=1 first (chapter 6 §6.4); "
+            f"no capture at {path}. Run the model with SPAN_CAPTURE=1 first (chapter 6 §6.5); "
             "a harness with synthetic inputs is not a proxy for the span.")
     import torch
     blob = torch.load(path, map_location="hpu", weights_only=False)
@@ -162,7 +162,7 @@ def main(argv):
           f"p90 {sorted(times)[int(len(times) * 0.9)]:.3f}   (n={len(times)})")
     print(f"counters {json.dumps(device_counters())[:300]}")
     print("\nNext: compare recipe count / node mix / op counts against the in-situ dump "
-          "(chapter 6 §6.6). A harness that does not match is measuring itself.")
+          "(chapter 6 §6.7). A harness that does not match is measuring itself.")
     if args.json_out:
         with open(args.json_out, "w") as fh:
             json.dump({"span": args.span, "median_ms": med, "times_ms": times,
