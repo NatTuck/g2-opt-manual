@@ -134,7 +134,7 @@ fails any of them is not a span yet:
 
 | test | what it means in practice |
 |---|---|
-| **clear inputs** | a finite, enumerable set of tensors you can save and reload |
+| **clear inputs and outputs** | every value the span **reads**, and every value it **writes** that a later step reads — **not the function signature**. See §6.5.1. |
 | **replicable outputs** | same inputs → same outputs, so a correctness gate can compare them |
 | **timable alone** | it can run without the rest of the model — no dependency on state you cannot capture |
 | **harness-able in seconds** | seconds, not minutes. ~10 s is comfortable; a minute is arguable; more is a full run with extra steps |
@@ -384,10 +384,6 @@ if os.environ.get("SPAN_CAPTURE"):
 run compares against different data and the correctness gate compares nothing. Every harness run must
 load the identical bytes.
 
-**Capture state, not just arguments.** If the span reads a KV cache, a counter, a running statistic
-or a router table, that state is an input. A harness that omits it will produce plausible numbers for
-a computation the model never performs.
-
 **Capture more than one step.** One capture is one sample; a span whose timing depends on data (a
 routed-expert pattern, a sparsity level) needs a handful, or the harness is measuring one lucky
 iteration. Three to five is usually enough, and they must all pass the gate.
@@ -396,6 +392,64 @@ iteration. Three to five is usually enough, and they must all pass the gate.
 `data-inventory.md` entry — they are records, not scratch, and they are not re-derivable without
 another instrumented run. Trim to the tensors the span actually reads: a capture of "everything in
 the layer" is mostly payload the span never touches.
+
+### 6.5.1 What counts as an input (and an output)
+
+> **A span's inputs are every value it reads to inform its computation. Its outputs are every value it
+> writes that a future step reads. The function signature is NOT the boundary — the boundary is
+> memory: what the span reads, and what it writes.**
+
+This is the definition people get wrong, and the KV cache is the canonical case. It is **written in
+place**, it is **not a return value**, it is **not an argument**, and it is **read by every later
+step**. So for an attention span the cache is *both* an input (the history this step attends over) and
+an output (the entry this step appends) — and a capture built from the signature contains neither.
+
+**An audit table, because "remember the state" is not enough:**
+
+| category | examples | why it gets missed |
+|---|---|---|
+| **arguments** | hidden states, expert weights | — this is the part everyone captures |
+| **in-place buffers** | **KV cache, attention buffers**, running state | written, not returned; not an argument |
+| **indexing state** | block tables, sequence lengths, slot mappings | looks like metadata, but it decides *which* memory is read |
+| **constants that vary** | position ids, masks, scale tensors, rope tables | "just context" — but a wrong one changes the answer |
+| **routing state** | router tables, expert assignments | produced by an earlier span, read by this one |
+| **counters / RNG** | step index, seeds | changes behaviour without being tensor data |
+
+**And anything in the output column is also an input.** A span that writes the KV cache must have the
+cache in *both* lists, or the rewrite's write is unverifiable: you would be gating the returned
+tensors and ignoring the state the next step depends on.
+
+#### Two ways this failure hides — which is why it needs a rule, not a reminder
+
+**1. It is often TIMING-invisible.** Cache buffers are allocated at their full size regardless of
+contents, so attention runs the same ops over the same memory whether the cache holds real history or
+zeros. **The harness's timing can be right while the computation is wrong.** The byte difference
+scales with context — for Qwen3.6 at 2,048 tokens the KV read is ~84 MB/token against a 1.13 GB/token
+MoE floor, but at 32 k it is ~13 % of the step — so timing will not reliably tell you either way.
+
+**2. It is GATE-invisible, and this is the dangerous one.** If the cache is missing from *both* the
+inputs and the outputs, the reference and the rewrite both see the same empty cache, they agree, and
+**the gate passes**. You have built a self-consistent harness for a computation the model never
+performs. This is exactly why §6.7's proxy check compares **device union and op counts** and not only
+outputs — those are the numbers that move when the span is not the span.
+
+#### The audit: diff the capture against the recipe's own tensor table
+
+Do not answer "did I get them all" by inspection. Chapter 5's dump gives, for every node in the
+span's recipe, `input_tensors` / `output_tensors`, resolved through the graph's own `tensors` table
+into `dtype`, `max_shape`, `allocation`, `persistent`, `in_persist_storage` and
+`user_mem_section_index`.
+
+So the check is a diff, not a judgement:
+
+1. take the union of every tensor the span's recipe **reads**, and every tensor it **writes**;
+2. **the stateful ones are labelled for you** — `persistent: true` / `in_persist_storage` — and they
+   are precisely the KV cache and the long-lived buffers in the table above;
+3. compare the **(dtype, shape) multiset** of that set against the tensors in your capture.
+
+A capture missing the attention buffers is short by exactly the persistent, section-backed buffers,
+and the diff says so. **A capture that matches the recipe's own tensor table cannot be missing an
+input** — that is the strongest statement available, and it is cheap.
 
 ---
 
@@ -525,6 +579,13 @@ in seconds. At that point it has stopped being an iteration tool.
 
 **Tuning the harness until the proxy check passes.** Covered above, and it is the failure mode this
 chapter most wants to prevent, because it looks like diligence.
+
+**Capturing the function signature instead of the span.** Arguments and return values are not the
+boundary; memory is. A harness built from the signature omits the KV cache and the attention buffers
+— and that omission is usually **invisible twice over**: the timing is unchanged (buffers are
+allocated at full size whatever they contain) and the gate passes (reference and rewrite both see the
+same empty cache, so they agree). You end up with a self-consistent harness for a computation the
+model never performs. §6.5.1's audit against the recipe's own tensor table is the defence.
 
 **Picking a span because it is easy to isolate.** The tiny span — a few recipes, tens of
 microseconds — is attractive precisely because its inputs and outputs are clean and its harness takes

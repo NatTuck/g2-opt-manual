@@ -27,6 +27,9 @@ import statistics
 import sys
 import time
 
+# Set by --require-state; read by load_capture. See chapter 6 §6.5.1.
+REQUIRE_STATE = False
+
 
 def load_span(spec):
     """'module.path:function' -> the model's OWN function. Never a copy."""
@@ -55,6 +58,14 @@ def load_capture(path):
     for key in ("inputs", "outputs"):
         if key not in blob:
             raise SystemExit(f"capture {path} has no {key!r}")
+    if REQUIRE_STATE and "state" not in blob:
+        # A stateful span captured without its state is self-consistent and wrong: the timing is
+        # unchanged (buffers are allocated at full size whatever they hold) and the gate passes
+        # (reference and rewrite both see the same empty buffer). Chapter 6 §6.5.1.
+        raise SystemExit(
+            f"capture {path} has no 'state', but --require-state was given. Audit the capture "
+            "against the recipe's own tensor table: the persistent, section-backed buffers are "
+            "the ones you are missing (chapter 6 §6.5.1).")
     return blob
 
 
@@ -142,9 +153,14 @@ def main(argv):
     ap.add_argument("--bound", type=int, default=0, help="ulp bound; declare it BEFORE running")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=10)
+    ap.add_argument("--require-state", action="store_true",
+                    help="fail if the capture has no 'state' (use for any span that reads a KV "
+                         "cache, attention buffer, counter or router table)")
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args(argv[1:])
 
+    global REQUIRE_STATE
+    REQUIRE_STATE = args.require_state
     fn = load_span(args.span)
     blob = load_capture(args.capture)
 

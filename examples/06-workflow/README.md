@@ -16,6 +16,7 @@ substitute would teach the wrong lesson: the workflow is worth having *because* 
 
 ## The three things the template enforces
 
+0. **Inputs mean every value the span reads, outputs every value it writes that a later step reads** — not the function signature. `--require-state` makes a stateful span without its state a hard failure rather than a silently self-consistent harness (§6.5.1).
 1. **Captured bytes, not synthetic inputs.** `--capture` is required and there is no fallback. A
    harness that invents its inputs is measuring a different computation, and it will keep producing a
    number while doing so.
@@ -30,7 +31,7 @@ substitute would teach the wrong lesson: the workflow is worth having *because* 
 | trap | where it bites |
 |---|---|
 | a seed instead of saved bytes | every harness run compares against different data, so the gate compares nothing |
-| omitting state (KV cache, counters, router table) | plausible timings for a computation the model never performs |
+| **omitting state (KV cache, attention buffers, counters, router table)** | the omission is invisible twice over: timing is unchanged (buffers are allocated at full size whatever they hold) and the **gate passes** (reference and rewrite both see the same empty buffer). Use `--require-state` and audit the capture against the recipe's own tensor table (chapter 6 §6.5.1) |
 | summing durations instead of unions | per-TPC replication inflates the sum; the same block reads DMA-bound one way and MME-bound the other (§2.9 rule 1) |
 | reading a win as "faster" without asking *which* work went away | a win from fewer launches may not transfer; a win that removes device work does (chapter 0) |
 | tuning the harness until the proxy check passes | the harness is then measuring itself |
