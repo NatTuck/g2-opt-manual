@@ -372,7 +372,7 @@ tied to any particular implementation.
 | level | size | scope | basis |
 |---|---|---|---|
 | **HBM2E** | **96 GiB per HPU** | per card | **MEASURED** |
-| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — MME/DMA staging | **source read** |
+| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — compiler-scheduled slicing of MME operands (**[chapter 7](07-sram.md)**) | **source read** |
 | **TPC local memory** | **1 KB scalar + 80 KB vector** | **per TPC core, private** | **ASSUMED** (vendor documentation) |
 | **L1 / L2 data cache** | — | **there is none** | **ASSUMED** (vendor documentation) |
 
@@ -434,6 +434,10 @@ overview and the whitepaper pages return the same three levels and never a cache
 > must be **engineered** — tiled into local memory, or staged through SRAM — or it does not
 > happen. That is the single most important consequence of this section for a bandwidth model, and
 > it is why the figures in §1.6 are *stream* bandwidths rather than cache-resident ones.
+
+**This section establishes the level and its size. The operating manual for it is
+[chapter 7](07-sram.md)** — what actually reaches SRAM, what decides placement, how to observe it,
+what it is worth, and the routes to it that are closed.
 
 ---
 
@@ -793,6 +797,62 @@ queue was empty cannot produce a negative result — it produces INCONCLUSIVE.**
 rule was earned: a naive reading of the lowest point would have scored a false "the hardware is
 slow" conclusion.
 
+### The union leaves a gap — decompose it by hole width before you call it communication
+
+`merged` is an occupancy, so it is always **less** than the step period, and the difference is the
+part of the step in which **no engine was executing**. The first inference a reader makes — "the gap
+is communication" — is the one to test, and testing it costs no device: merge the device intervals,
+take the complement, and histogram the holes **by width**.
+
+| hole width | what it is | scales with |
+|---|---|---|
+| **< 50 µs**, tens of thousands per step | inter-descriptor turnaround | **op count** — launch granularity, not communication |
+| **50 µs – 1 ms**, hundreds | host-side stalls between submissions | submission structure |
+| **> 1 ms**, a handful | dependency, host or collective stalls — the only bucket where "communication" can hide | — |
+
+**The alignment test is what decides the last row, and it needs a null.** A per-layer collective on
+the critical path shows **~one aligned hole per layer** (40+ per step), where "aligned" must mean
+aligned in **both start and width** across the ranks that take part. With ~20,000 holes per step a
+±50 µs start tolerance matches almost anything by chance, so an observed alignment rate means
+nothing without the rate obtained from holes drawn at the same density.
+
+**MEASURED [DSv4F]** — W0 decode arm, **rank 0**, 4 steps (`typhon_789`, the same arm §3.6.4's table
+comes from; `merged` reproduces that table's **66.1349 ms/step** exactly, which is the cross-check
+that the reduction is the same one):
+
+| | ms/step | runs/step |
+|---|---:|---:|
+| window (first → last device event) | 113.33 | — |
+| `merged` | 66.13 | — |
+| **holes, total** | **47.19** | 21,068 |
+| — under 50 µs | **19.80** | 20,982 |
+| — 50–200 µs | 5.82 | 47 |
+| — 200 µs – 1 ms | 11.98 | 34 |
+| — over 1 ms | 9.59 | 5 |
+
+So **~42 % of the gap is ~21,000 sub-50 µs holes per step** — a granularity cost that tracks op count
+— while the multi-millisecond part is **5 holes per step**, far too few to be one per layer. Rank
+alignment says the same from the other side: **0 of 153** wide holes were aligned across all four
+ranks (null 0.0 %), against a pairwise rate of **19.4 %** versus a **0.4 %** null. Partially aligned
+but never aligned on all four ⇒ **not a clean all-rank barrier**, and therefore not evidence of a
+per-layer collective.
+
+**Two bounds on those numbers, both real.** The window is **profiler-inflated** (113.33 ms/step
+against a ~88 ms/step wall, ≈1.29×), so the absolute widths are upper bounds — quote the
+**proportions** and the **run counts**, which the profiler does not inflate. And this gap is measured
+**inside the device-active window**, which is *not* the step period: §3.6.1's `a` is wall − `merged`
+and is a different, smaller quantity (~21.7 ms). Do not substitute one for the other.
+
+**And a capture with no NIC engine rows cannot see communication at all.** "No engine in flight"
+must never be read as "waiting on the network": it is the absence of an event, not the absence of
+work, and the gap is unattributable in such a capture in either direction.
+
+[`gap_histogram.py`](examples/01-basics/gap_histogram.py) does all of this from a trace you already
+have, CPU-only. Its `--selftest` proves the alignment test can see alignment when it is there
+(**12 of 12** injected aligned holes found; **0 of 149** in the noise-only control). That control
+earned its place: the first version of the test double-subtracted the start from the width and
+reported **0 % aligned on both populations** — a broken instrument reporting the answer we expected.
+
 ---
 
 ## 1.9 Profiling setup
@@ -816,8 +876,33 @@ enough to read in full.
 
 **One more trap, same family:** collecting **CPU** activity alongside HPU activity inflates the
 trace's host span by roughly 3× (measured: 23.3 → 1.67 ops outstanding at the host's end), which
-makes a device-bound arm look host-bound. **Profile HPU-only** when the question is about the
-device. **MEASURED**
+makes a device-bound arm look host-bound. **MEASURED**
+
+**But "profile HPU-only" is not the whole rule, and read literally it costs you the profile's
+usefulness.** Measured on two runs of the same program, same iterations:
+
+| activity | merged device union | TPC | MME | DMA |
+|---|---:|---:|---:|---:|
+| CPU + HPU | 0.593 ms | 0.102 | 0.152 | 0.381 |
+| HPU only | 0.598 ms | 0.101 | 0.153 | 0.385 |
+
+**Device durations are unaffected by CPU collection** — 0.8 % on the union, ≤1 % per engine. What CPU
+collection corrupts is the **host span and queue depth**, which is what the paragraph above measures.
+And HPU-only collection **drops every compile id**, because `Torch-Compiled Region` is a CPU-side
+dynamo annotation — so an HPU-only trace cannot be joined to the code that produced it at all
+(**0 region spans** in the HPU-only run above; **60** with CPU included).
+
+⇒ **Three cases, not one rule:**
+
+| question | activity | why |
+|---|---|---|
+| device **durations / unions** | either — they agree | measured in the table above |
+| **host span, queue depth, overlap** | **HPU-only** | CPU collection inflates these ~3× |
+| **attribution to code** | **CPU + HPU, always** | the compile id lives in a CPU annotation |
+
+**Chapter 5 is about the third row** — the identity chain from a trace event to a source line, the
+knobs that must be set *before* the run, and the traps that silently break the join. **Read it before
+taking a profile you intend to act on.**
 
 ---
 
@@ -829,7 +914,7 @@ looks like a hardware fault:
 | notion | what it is | how you see it |
 |---|---|---|
 | **local device index** | a **dense** `0..N-1` numbering over the devices *visible to your process* | what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes — **not** the vendor tool's index order |
-| **physical module id / AIP** | the **fixed** per-card identity, stable across processes | the vendor tool's per-AIP listing (Module ID / PCI bus); its **index order is a third numbering** — neither the module id nor the local index (Chapter 3 §3.7) |
+| **physical module id / AIP** | the **fixed** per-card identity, stable across processes | the vendor tool's per-AIP listing (Module ID / PCI bus); its **index order is a third numbering** — and the row number that listing prints is a **fourth** — neither the module id nor the local index (Chapter 3 §3.7) |
 
 **`*_VISIBLE_DEVICES` is a container-runtime input, consumed *outside* the container.** Setting it
 *inside* a container does nothing — nothing in the image reads it; the container's own device flags
@@ -874,7 +959,7 @@ analysis finds the PT-bridge's by-type function does not consult it (**INFERRED*
 driver/thunk level is not settled (`hpu_isolation` §10.2), and the two-process arm we *have*
 (two unpinned processes, watching which modules they take) used the container's **full** table,
 so it cannot separate the table from the container's `--device` cgroup. A **discriminating** arm
-is still open. The deployment-named treatment, the three numberings, and the per-rank rule are in
+is still open. The deployment-named treatment, the numberings, and the per-rank rule are in
 **Chapter 3 §3.7**.
 
 ---
@@ -897,6 +982,21 @@ Two gotchas worth knowing before you try them:
 - **`**`-globbing skips hidden directories.** The dumps land in a dot-directory, so a shell glob
   can silently see a small fraction of them (one recon saw **24 of 1,141** files). Use
   `os.walk`/`find`. **MEASURED**
+- **There are two dump mechanisms, and confusing them costs a run.** `DUMP_POST_GRAPHS` is the
+  **graph compiler's** post-graph JSON — the per-node table the row above describes. The torch
+  bridge has a separate family: **`PT_HPU_GRAPH_DUMP`** (on/off), **`PT_HPU_GRAPH_DUMP_MODE`**,
+  **`PT_HPU_GRAPH_DUMP_FORMAT`** and **`PT_HPU_GRAPH_DUMP_PREFIX`**, which writes torch-level graph
+  visualisations, not post-graph node tables. Both exist in the shipped libraries — `GCFG_DUMP_POST_GRAPHS`
+  in `libSynapse.so`, the four `PT_HPU_GRAPH_DUMP*` env-flags in the bridge's
+  `libhabana_pytorch_backend.so` (**source read**, verified by symbol and string in the shipped
+  binaries) — so a project can enable one, believe it enabled the other, and read the empty
+  directory as a failure. **Check which instrument you enabled before you conclude anything from an
+  empty dump.** *(The value set of `PT_HPU_GRAPH_DUMP_MODE` is **UNKNOWN** here: only the literal
+  `compile` was found in the shipped binary, and the package ships no documentation for it. What
+  would settle it is a read of the bridge's env-flag registration.)*
+- **`DUMP_POST_GRAPHS` is read once per process.** In a job that compiles in more than one phase, the
+  per-phase directories all land in the **first** phase's — so a later phase's empty directory is
+  **not** evidence of "no compile". **MEASURED**
 
 ### A note on where the vendor claims in this chapter come from
 

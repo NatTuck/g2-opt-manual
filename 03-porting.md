@@ -474,6 +474,60 @@ this port: 16.0× down to 1.0×.
   model on one box. The *shapes* of the argument are the general part: build the floor, measure the
   port, divide, and rank by removable bytes.
 
+### 3.1.5 Batch size > 1 on a *sparse* model does not amortise the way a dense one does
+
+Everything above is **bs = 1**. The obvious next move — raise the batch, read the same weights once
+and serve N tokens — is right in form and much weaker in degree on a MoE, and the reason is worth
+stating before someone plans around it.
+
+**The conclusion holds; the mechanism most people reach for does not.** Both the conclusion and its
+replacement were measured on a parallel port of this model, and the second refutes a mechanism this
+section previously carried.
+
+**What the cost is a function of: the compiled bucket, not the routed-expert set.** A decode step is
+compiled per batch bucket, and its cost is a **step function of the bucket** — flat in the number of
+real rows inside it:
+
+| bucket | 1 | 2 | 4 |
+|---|---|---|---|
+| step time, ms | **10.4** | **25.9** | **32.5** |
+
+Fitted per bucket, the residual rms is **0.11 ms** (max 0.15); fitted as an affine function of rows
+it is **3.95 ms**. And **n = 3 and n = 4 are both bucket 4 and cost the same** — +33 % of the rows for
+−0.9 % of the time. **Rows inside a bucket are free.** **MEASURED** (a parallel port's serving arm,
+TP4×PP1, buckets 1/2/4, 96–128 generated tokens per cohort, median of two cohorts).
+
+**The routed-expert union is NOT the pacing term — it was tested directly, and it failed.** Two
+requests carrying the **same** prompt route to nearly the same six experts per layer, holding the
+distinct-expert count at its n = 1 minimum; two different-domain prompts reach up to 12. At every n
+the two arms are **0.1–0.4 ms apart** — noise. A single-card arm with real prepared N256 weights and
+the ids passed as data (so the distinct count varies without recompiling) puts **D = 6 vs D = 36
+identical within 1 %** at every row count. And the routed MoE's own row scaling (1.0 / 1.05 / 1.16 /
+1.75 at 1/2/4/6 rows) explains **at most 1.16× of the step's 3.13×** growth. **MEASURED**
+
+> **CORRECTED 2026-10-24.** This section previously stated the mechanism as **INFERRED**: that on a
+> sparse model the weight bytes are "the **union of the routed experts over the batch**, and that
+> union **grows with N**", so the amortisation is N ÷ union growth. The measurement above was
+> designed to test exactly that, and it refutes it. The **conclusion** — batching is not ~N× on a
+> sparse model — survives and is now **MEASURED** rather than inferred; the **mechanism** does not.
+
+**⇒ The lever this changes — and it is a different lever than the one this section used to name.** If
+the term is fixed per **bucket**, the thing to attack is whatever is fixed per bucket: the compiled
+graph's own cost at that bucket, not the expert union. **More rows inside a bucket is free; crossing
+into the next bucket is what costs.** Before choosing a batching change, read `merged` **per token**
+at the batch sizes you care about (§3.6.1) *and* which bucket each maps to — a change that keeps you
+inside a bucket has bought nothing however much summed work it moved, and a change that moves you
+across one has bought a step.
+
+**Two bounds on the curve.** On that port **bs > 4 does not compile** — a wiring limit of that build,
+not a kernel limit — so the measured curve ends at bucket 4. And the earlier statement that this
+manual carries **no** batch-scaling curve at all is now superseded: it carries one at **1 / 2 / 4**,
+on a parallel port's code state, and it is not ours. *(That port separately reports **10.6 / 28.4 /
+35.2 ms/step** at bs 1 / 2 / 4 on a **different arm** of the same port — the same bucket-shaped curve
+from a different code state, and not directly comparable to the 10.4 / 25.9 / 32.5 above. Quote one
+or the other, not a mix. See also §3.1.1's independent-corroboration note for that source's
+accounting.)*
+
 ---
 
 ## 3.2 The M = 1 GEMV ceiling is HBM — and it has a cliff
@@ -1699,6 +1753,88 @@ each case is the GC's own log at a raised level (`LOG_LEVEL_GC`) — **not attem
 *(Source: `Archive/by-date/2026-10-12/fp4-guid-probe/REPORT.md` §4–§5 — five device rows, one process
 each, `HLS_MODULE_ID=3`, shipped `.so` md5 unchanged before and after.)*
 
+#### The other face of `synStatus 26`: the message TEXT is the handle, and it names the node
+
+The GUID-lookup mechanism above is one cause. **`synStatus 26` is `synFail`** — a generic failure in
+the status enum (`synapse/include/synapse_common_types.h`, where `synInvalidArgument = 1`,
+`synUnavailable = 24`, `synInvalidTensorDimensions = 25`, `synFail = 26`) — so the number alone can
+never be diagnostic. What *is* diagnostic is the **message text**, and one form of it carries more
+than the section above suggests.
+
+**MEASURED, on a parallel port of this model:** `synGraphCompile: Invalid Node Params! Node name:
+n_aa`, `synStatus 26`, raised at a `synchronize()` flush point. The cause was **not** a missing
+kernel. It was an in-place copy into an **offset view of a larger buffer with a mixed dtype**:
+
+```python
+packet = torch.empty(b * 10244, dtype=torch.int32, device=dev)
+pre    = packet[b * 10240:].view(torch.float32).view(b, 4)   # offset view, same itemsize
+pre.copy_(values["pre_mix"])                                 # this was rejected
+```
+
+It compiled at `b == 1` and failed at `b == 2`; removing the copy fixed it. **That attribution is
+theirs and rests on one A/B** — no log line isolated the node's params — so read it as a reported
+cause, not a demonstrated mechanism.
+
+**The message has two forms, and the suffix tells you which constructor fired** (source read,
+`synapse/src/infra/types_exception.h`, `InvalidNodeParamsException`):
+
+| text | constructor | what it adds |
+|---|---|---|
+| `Invalid Node Params! Node name: <n>` | one-arg | a node whose *validation or shape inference* failed |
+| `Invalid Node Params! Node name: <n>, param name : <p>` | two-arg | **names the offending user parameter** — far more useful when you get it |
+
+**And the companion line that names the cause does exist — it is just not emitted at the default
+log level.** These four strings are all present in the shipped `libSynapse.so` (sha256
+`6796f09dac786b95970f55541c8c27dd4005e87a5ecd1b95bb11daec6f3b3913`):
+
+```
+Node Validation Failed. Cannot create node {}.
+Failure to update output shape for node: "{}"
+projectDmaRoisToFullSizes No output roi for node {}
+Graph optimization failed pass: {}
+```
+
+So the recipe for this form is **raise the level and re-run**, then grep for those four — not "there
+is no line". **Verified empirically** on that port's failing run: `synapse_runtime.log` carries only
+the top-level re-print (`[SYN_API][critical] exception thrown in function: synGraphCompile, what:
+Invalid Node Params! Node name: n_aa`) while its `graph_compiler.log` is **0 bytes** — the
+node-naming lines are `GC` / `HABANA_NODE` / `ROI_SPLITTER` / `PASS_MANAGER` category `LOG_ERR`s and
+are silent until `LOG_LEVEL_ALL`/`LOG_LEVEL_GC` is set. **A zero count here is a claim about the
+instrument** (§3.10 item 23).
+
+**What `n_aa` is — and why it never resolves in a dump.** It is **not** an op name. It matches the
+**eager** graph's own name generator (source read, `synapse/src/eager/lib/eager_graph.h`,
+`NameBuilder`): prefix `n_`, then **two base-16 letters** (`a`–`p`), starting at `n_aa` for id 0. So
+it is an **insertion index in the eager graph** — `n_aa` is the first auto-named eager node. Two
+consequences: it will never appear in a `DUMP_POST_GRAPHS` post-graph, whose nodes are named
+`<op>/<guid>/<cnt>`, so "the name does not resolve" is expected and not a dead end; and **seeing an
+`n_XX` name at all tells you the failing graph is the eager one**, which is a real discriminator when
+you are deciding whether to look at the compiled-recipe path or the eager path.
+
+**Reconcile this with the paragraph above, which is not retracted.** "Never read `synStatus 26` as
+'the shape was wrong'" is right about the **number** and wrong if applied to the **message**: given
+`Invalid Node Params!` plus a node name, a shape, view or alias cause is exactly what the companion
+lines report. The GUID-lookup story remains the mechanism for the *unnameable* form; this is the
+mechanism for the *named* one. They are different failures sharing a status code.
+
+**Provenance, because it matters here.** The four message strings and the two message forms are
+verified in the **shipped 1.24.2** `libSynapse.so` above. The **throw-site enumeration** — the
+one-arg constructor is thrown from `graph_compiler/habana_nodes/node_factory.cpp` (a failed
+`validateNode()`, and a failed max-dims shape inference) and from
+`graph_compiler/roi_splitter.cpp` (`projectDmaRoisToFullSizes`, a DMA ROI with no output ROI), with
+the two-arg form thrown from many `habana_nodes/*.cpp` sites passing `"userParams"` — is read from a
+vendor Synapse **1.16-era source snapshot**, not from 1.24.2. Treat it as a map of *where the message
+comes from*, not as a line-exact citation for the shipping build; **the count of throw sites in
+1.24.2 is UNKNOWN** here, and the one place the snapshot and the shipped binary disagree is the
+pass-level message text (`Graph optimization failed! Got SynapseException: {}` in the snapshot,
+`Graph optimization failed pass: {}` in the binary) — which is why the binary is quoted above and
+the snapshot is not. **The `n_aa` decode is INFERRED, not source-read:** it matches that snapshot's
+generator format exactly (and the name is identical on all four ranks and across repeats, as a
+per-graph counter starting at zero would be), but `NameBuilder` is a header-only class, so there is
+no symbol in the shipped binary to confirm it against. *(A vendor-source enumeration of the 1.24.2
+throw sites would settle it; our attempt to consult one returned HTTP 503 during this work, so that
+is "could not consult", not "no evidence".)*
+
 **And do not over-generalise this caveat.** The dump-directory `synStatus 26` failures elsewhere in
 this manual — Chapter 2 §2.10 trap 1 and Chapter 1 §1.11 — are **not** in this class: they rest on
 their own controlled A/B evidence and carry **distinct corroborating symptoms** of their own
@@ -2133,7 +2269,8 @@ the 3.853× must never be read as "the model got 3.853× faster".
 > diff counts are identical for both schedules).
 
 **Whole-model decode at TP=4 — the run that closes §3.9 item 21, and it is bit-exact.** *Five arms,
-one engine process each, **four modules held simultaneously** (`HABANA_VISIBLE_MODULES = 0,3,6,7`), the
+one engine process each, **four modules held simultaneously** (`HABANA_VISIBLE_MODULES = 0,3,6,7` —
+**not** one of the vendor's recommended 4-Gaudi combinations; §3.7.2), the
 W0-anchor config (TP=4, EP, `max_model_len` 2048, fp8 quant, bf16 KV), a **cold per-arm recipe cache**,
 and `hl-smi` confirmed at the **768 MiB baseline with no compute processes** immediately before every
 launch.* One fixed prompt of 35 real tokens padded to the model runner's `('prompt', 1, 128, 0)`
@@ -2445,6 +2582,18 @@ We got this wrong once by quoting the relation without its limits. Do not repeat
 
 ### 3.6.4 The device-time decomposition, for orientation [DSv4F]
 
+> **⚠ This table is a PRE-OPTIMISATION BASELINE, not a current profile.** It is one decode arm —
+> **`lad_traceW0`, rank 0, 4 decode steps, `merged` = 66.1349 ms/step** — taken at a code state
+> **before** the staging work of §3.6.5 and §3.6.6 landed. Its own step is **66.13 ms** against
+> **10.6 ms** at bucket 1 on a later state of a parallel port of the same model, so it describes
+> what was left to fix, not where a tuned step spends its time. **Re-take it before you steer by
+> it.** The two families it ranks first by *union* (`DmaMemcpy`, `DmaTranspose`) are also the ones
+> whose op counts fall fastest when staging is fused away — **treat the `Dma*` counts as the
+> symptom to watch while fusing staging, not as a budget to optimise within.** *(A later
+> decomposition of the same model — TPC 88.6 % of the union at bucket 8 — is a different arm on a
+> different port state and does not supersede this table's rows; it only shows how far the mix can
+> move.)*
+
 **The column is the family's own UNION — its device *occupancy* — and it is NOT a removal price.**
 That distinction was missing from this table until 2026-10-13, and the header even called the column
 `merged`; it is not `merged` (the whole step's device union, **66.1349 ms/step** — measured on the
@@ -2465,6 +2614,54 @@ different `merged`), it is the family's own busy-set union.
 the shape of this table: the two largest *op counts* are not the two largest *time* items, and the
 family with the largest op count is not in the top three by time. **Count and cost are different
 questions.**
+
+#### The node-count census is not a cost model — and there is a family this table cannot show
+
+Two facts hold at once, and a reader needs both:
+
+- **Metadata nodes are numerous and free.** `Reshape`, `StaticReshape`, `logical_slice_fwd`,
+  `ExpandDims`, `Split` and `Concatenate` appear in the post-graph dumps and are **absent from the
+  device trace entirely**. A census reporting "74.6 % of node executions are metadata" is therefore a
+  *graph-node* count with **no device-time implication**, and pricing a fusion from node counts
+  overstates the win.
+- **Many tiny integer nodes are numerous and expensive.** On a parallel port's **bs = 2** arm
+  (81 recipes, 14.30 ms attributed), one family of integer layout arithmetic — `ge_i32` 609 µs,
+  `div_mod_i32` 599, `where_i32` 542, `cast_i64_to_i32` 493, `less_i32` 446, `and_i8` 431,
+  `constant_i64` 306, `add_i32` 213, `gather_elements` 114 — totals **4,356 µs, 30.5 % of the
+  attributed step**: the **largest single term** on that arm. Each node is **1–3 µs**, so the family
+  is invisible in any per-node ranking and in TPC lane-time, yet together it dominates. In one
+  2-layer attention recipe, 78 integer TPC nodes cost ~124 µs of 182 µs per execution.
+
+**They are distinguishable only by engine identity in the trace, not by op name.** That is why the
+table above, which ranks node-name families over a *different* arm (W0, bucket 8), has no such row:
+its families are named kernels, and a 1–3 µs node never reaches a ranking built from them. **Do not
+add this family to the table above** — it is another arm, and it would mix two populations.
+
+**⇒ The category this names, for the regime table.** "Many tiny integer nodes" is neither bandwidth-,
+compute- nor launch-bound in the usual sense — it is **per-node cost paid ~78 times per recipe**. A
+reader following a launch-bound diagnosis concludes "fewer, larger ops", which is right but does not
+say *which work to delete*. The audit that does: rank nodes by **engine identity × count × mean
+duration**, not by count alone, and look for a large count of sub-5 µs TPC nodes.
+**MEASURED** (a parallel port's bs = 2 arm, TP4×PP1 — their port state, not ours).
+
+> **The quantity the families add up to: `merged` is a SUM of per-recipe unions, and that is exact.**
+> Because recipes execute sequentially — **cross-recipe overlap is exactly zero** — the **110
+> per-recipe busy sets partition `merged`**: `25.295` (attention) + `40.642` (MoE/FFN) + `0.198`
+> (head/embed/sampler) = **66.135** against `merged` = **66.1399**, a **0.007 %** difference.
+> **MEASURED.**
+>
+> So the arithmetic that is *illegal* is summing **event** durations (§2.9 rule 1) — not summing
+> recipe unions, which is the correct model and is what makes this section's tables additive. Two
+> consequences worth carrying:
+>
+> - **The partition is the evidence for the seriality**, and the seriality is the reason the sum is
+>   legal. Neither statement stands alone; quote them together.
+> - **The sum is exact only when every device event belongs to a recipe.** Eager-placed nodes have no
+>   recipe and sit outside the partition — on a Qwen decode trace the recipe-less events were **11 %**
+>   of the device union. Where the partition does not close, the shortfall is the eager work, and it
+>   belongs in its own row rather than folded into a family.
+> - **Per device, never across devices**: in TP the ranks run in lockstep, so per-rank sums are
+>   replicas; the step wall is the slowest rank plus the host term.
 
 > **⚠ Read the LOO column, not the union column, when you are pricing a change.**
 >
@@ -2915,12 +3112,21 @@ record, and the control that identifies the shipped expression, are §3.6.5's
 
 ## 3.7 Multi-device, pinning, and concurrent processes
 
-### 3.7.1 There are two distinct notions of device identity — and confusing them is the classic failure
+### 3.7.1 There are four numberings of one card — and the **module id** is the one to reason and pin in
 
+- **Physical module id / AIP** — what `hl-smi -L` shows as each AIP's Module ID. **The card's
+  identity, fixed per card** — and the numbering that the pin (`HLS_MODULE_ID`) and the
+  device-acquire path both speak, so **it is the one to reason and pin in**.
 - **Local device index** — a **dense `0..N-1`** numbering over the devices visible to your process;
-  what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes. **This is NOT
-  the vendor tool's index order** — see the table below.
-- **Physical module id / AIP** — what `hl-smi -L` shows as each AIP's Module ID. **Fixed per card.**
+  what `torch.hpu.device_count()` reports and what `torch.hpu.set_device(i)` indexes. It is a
+  **position**, not an identity: it is an index *into* `HABANA_VISIBLE_MODULES`, so it moves when the
+  allocation moves. **This is NOT the vendor tool's index order** — see the table below.
+- **`hl-smi` card index** — the vendor tool's own numbering, and a **third** one. It is
+  **position-dependent** as well: it is a host index, and it is not the local index.
+- **`hl-smi`'s default per-AIP row number** — the **accel-enumeration ordinal**, i.e. the same
+  numbering the tool prints as `accelN`. It is **dense** over the AIPs you can see, which is why it is
+  neither the index nor the local index: on this box the default view numbers its four rows `0..3`
+  while `-Q index` reads `0, 2, 3, 6` for the same four cards.
 
 `HABANA_VISIBLE_DEVICES` is a **container-runtime input**, consumed **outside** the container.
 Nothing in the image reads it, so setting it *inside* a container is **inert** — the container's
@@ -2931,22 +3137,114 @@ through to the by-type acquire. **INFERRED** *(grep + disassembly; `hpu_isolatio
 effect is the **local-index → module-id table** that `torch.hpu.set_device(i)` indexes. **MEASURED**
 *(`hls_module_id` §4.7 — the mapping was verified physically for all four indices.)*
 
-⚠ **Three numberings disagree, and "card N == module N" fails for two of the four `hl-smi` indices
-and three of the four local torch indices.** The arithmetic, from the map below: `hl-smi` index →
-module is `0→0, 1→6, 2→7, 3→3`, so the identity holds only for indices **0 and 3** (2 of 4 fail);
-local torch index → module is `0→0, 1→3, 2→6, 3→7`, so it holds only for index **0** (3 of 4 fail).
-On this box:
+> **"Not a filter" is scoped to the *image*, and the vendor's page is the other half of the same
+> sentence — read them together, or they look like a contradiction.** The container runtime accepts
+> **either** variable to select the mount — *"you can select a Gaudi device to mount on Docker by
+> setting `HABANA_VISIBLE_DEVICES` or `HABANA_VISIBLE_MODULES` when the Docker container is started"*
+> — and recommends the module-id form (same page and fetch as below). So **the runtime** is where the
+> module-id spelling is preferred, and **the image** is where the variable is a table rather than a
+> filter; the INFERRED finding above is scoped to `/usr/lib/habanalabs/` and says nothing about the
+> runtime. Both halves are needed: the runtime is why the module-id form is the one to set, the image
+> is why the module *set* is what you read back.
+
+**`HABANA_VISIBLE_DEVICES` and `HABANA_VISIBLE_MODULES` are not two knobs and not alternatives: they
+are ONE allocation written in two numberings.** The module set is the identity; the index list is its
+**position-dependent image**. On this box, 2026-10-15:
+
+```
+HABANA_VISIBLE_MODULES=0,1,2,3          <- the allocation, named in module ids
+HABANA_VISIBLE_DEVICES=2,6,0,3          <- the SAME four cards, as its equivalent index rendering
+hl-smi -Q index,module_id -f csv   ->   index 0 -> module 2
+                                        index 2 -> module 0
+                                        index 3 -> module 3
+                                        index 6 -> module 1
+```
+
+The indices `2,6,0,3` are **exactly** the host indices of modules `0,1,2,3`, so the two name the same
+four cards — and the index list is **derived, not given**: note that it is *not* `0,1,2,3` in order,
+because the allocation is dense in **module** space, not in index space.
+
+**Which of the two is actually *set* is a separate question, and the honest answer is narrower than
+"both".** The container launcher here sets **only** `HABANA_VISIBLE_MODULES` — while **its own header
+comment names `HABANA_VISIBLE_DEVICES=2,6,0,3` as the mechanism**, which is the same allocation in the
+other numbering. The index list `2,6,0,3` is therefore the **equivalent rendering** of what the
+launcher sets: documented in that comment, and **observed set alongside the module variable in an
+earlier launch**, where the two agreed. So do not read this as "the container sets both" — read it as:
+*the module variable is the one to set and to read; the index form is a rendering of the same
+allocation.* **⇒ reason and pin in module ids; treat any index list as a derived, position-dependent
+rendering of the module set.** **MEASURED** *(`Archive/by-date/2026-10-15/` — the index→module→PCI map
+and both `hl-smi` snapshots: `ordpost2/REPORT.md`'s "Device, before and after" table; the
+serial-carrying capture and the by-serial comparison:
+`device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md`. **Scope:** the launcher is **working-tree state in
+this project, not a committed artifact**, and the "earlier launch" is a recorded observation — so this
+one sentence is **deployment-local**, not a property of the stack. What is `MEASURED` is the
+index→module map and the module table.)*
+
+⚠ **The numberings disagree, and "card N == module N" is not a rule — it is a coincidence when it
+holds.** On this box (**SUPERSEDED 2026-10-15** at the values below — they were right for their own
+box and were overtaken by a later one; the rule did not move):
 
 | what | order |
 |---|---|
-| `hl-smi` card index → module | **`0→0, 1→6, 2→7, 3→3`** |
-| local torch index → module | **`0→0, 1→3, 2→6, 3→7`** |
-| modules **visible to this container** | **`0, 3, 6, 7`** |
+| `hl-smi` card index → module | **`0→2, 2→0, 3→3, 6→1`** |
+| local torch index → module | **`0→0, 1→1, 2→2, 3→3`** |
+| modules **visible to this container** | **`0, 1, 2, 3`** |
+
+Read the arithmetic, because the *shape* of the failure has changed: the identity holds for **1 of the
+4** `hl-smi` indices (only `3→3` coincides; `0→2`, `2→0` and `6→1` all fail), and for **all 4** local
+torch indices — but that last row is an **accident of this allocation**: the visible module set
+happens to be the contiguous `0,1,2,3`, so the table *is* the identity. On the previous allocation
+(`0,3,6,7`) the same row read `0→0, 1→3, 2→6, 3→7` and failed for **3 of 4**. **Do not read the
+current row as a law; read `HABANA_VISIBLE_MODULES`.**
+
+**Note which rows are measured and which is derived, because the tags differ.** The first and third
+rows are **MEASURED** — the `-Q` read-out, and the module table with its acquire probe
+(`Archive/by-date/2026-10-15/ordpost2/` — `REPORT.md`'s "Device, before and after" table). The
+**middle row is DERIVED, not measured on this box**: a local index *is* an offset into
+`HABANA_VISIBLE_MODULES`, so with the table `0,1,2,3` the row is the identity **by construction** —
+which is exactly why it must not be read as a law, and why the previous allocation's `0→0, 1→3, 2→6,
+3→7` is that row's real shape.
 
 Derive a local index from `HABANA_VISIBLE_MODULES`, **never** from `hl-smi -L`'s accel order (which
-here is `0, 6, 7, 3` — the *same* sequence as the table's first row read left to right, i.e. the
-module ids listed in `hl-smi` index order, and neither of the other two rows). **MEASURED** *(verbatim
-`hl-smi -Q index,module_id,memory.used -f csv,nounits`: `0,0,768 / 1,6,768 / 2,7,768 / 3,3,768`.)*
+here is `2, 0, 3, 1` — the module ids listed in `hl-smi` index order, and neither of the other two
+rows). The **fourth** numbering — the default per-AIP row number — is the one to be careful with,
+because it is the one you read by eye: on this box the default view numbers its four rows `0..3` while
+`-Q index` reads `0, 2, 3, 6`, so **the row you are looking at is not the index you need**.
+**MEASURED** *(the default view verbatim:
+`Archive/by-date/2026-10-15/ordpost2/hl-smi-pre-ordpost2b.txt`; the mapping: `REPORT.md` as above.)*
+
+**The index numbering is not stable across a reboot; the module ids are — and we have now measured
+that, on the card rather than on the numbering.** The vendor's public multi-container page states it:
+*"…`HABANA_VISIBLE_MODULES` when the Docker container is started. The device index set with
+`HABANA_VISIBLE_DEVICES` may change after a system reboot or driver reinstallation, while module ID set
+with `HABANA_VISIBLE_MODULES` remains the same."* *(the vendor's
+`Multiple_Dockers_each_with_Single_Workload` page:
+`https://docs.habana.ai/en/latest/Orchestration/Multiple_Tenants_on_HPU/Multiple_Dockers_each_with_Single_Workload.html`
+— fetched 2026-10-15, HTTP 200, 81,909 bytes, sha256
+`294b68dc8596f654a76b8151233b72c7dee55d9e583dbcc675261b8fca6dd344`.)* Across this box's 2026-10-15
+reboot (with a driver reinstall, 1.24.1 → 1.24.2), **four of the four cards visible both before and
+after kept their module ids exactly** — while the index map moved: host index `0` was module `0` before
+and is module `2` now, and the host map now reads `0→2, 1→6, 2→0, 3→3, 4→7, 5→4, 6→1, 7→5`.
+**MEASURED, and scoped — and the scope only parses once the two dumps are named.** The *before* read
+is our container's **4-card `hl-smi -L`** (whose per-AIP blocks report Serial Number and Module ID);
+the *after* read is the host's **8-card `hl-smi -Q index,module_id,serial,uuid -f csv`**. So the
+comparison covers the **four** cards our container could see in both — not the host's eight, and not
+two (the container's own 4-card view is the *before*; it is not a second container dump). Both dumps,
+the post-reboot map and the by-serial comparison are in
+`Archive/by-date/2026-10-15/device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md`.
+
+**Reconcile two `hl-smi` dumps by SERIAL — not by index, and not by module id.** `hl-smi -Q` exposes a
+per-card **serial** (and **UUID**), and those are the only fields that say whether two dumps describe
+*the same card*:
+
+```
+hl-smi -Q index,module_id,serial,uuid -f csv,nounits
+```
+
+A card present in both dumps can then be checked for **which of the two numberings moved** — its
+module id (identity) or its index (position). Reading the module *set* or the index instead is how
+"the same card, renumbered" gets mistaken for "a different card": in a dump that does not carry the
+serial, the two look identical. **MEASURED**
 
 > **A module is acquired EXCLUSIVELY — one module, one process.** When two processes request the
 > same physical module, the second **hard-fails at device-acquire** with
@@ -2967,19 +3265,52 @@ the cards). Do not rely on it, and do not try to pick global devices. Use relati
 **INFERRED** *(whole-image grep + disassembly of the one device-acquire site:
 `Archive/by-date/2026-10-11/hpu_isolation/REPORT.md` §2.3.)*
 
-On this 4-AIP box the container shows **`HABANA_VISIBLE_DEVICES=0,1,2,3` AND
-`HABANA_VISIBLE_MODULES=0,3,6,7`** — a clean dense local view over a physical subset. **The module
-set is box-specific: read it, do not assume it** (an earlier version of this section said
-`4,5,6,7`; that is wrong here — it also contradicts §3.7.1's own table, whose mapping `0→0, 1→3,
-2→6, 3→7` *requires* `0,3,6,7`). That is why 4-device runs "just work" there. **MEASURED**
-*(verbatim `hl-smi -Q index,module_id,memory.used -f csv,nounits`: `0,0,768 / 1,6,768 / 2,7,768 /
-3,3,768`.)*
+On this 4-AIP box the container's allocation is **`HABANA_VISIBLE_MODULES=0,1,2,3`** — the host
+indices `2,6,0,3`, i.e. the same four cards (§3.7.1) — a clean dense local view over a physical
+subset. **The module set is box-specific: read it, do not assume it.** That sentence is the durable
+one; the *value* moves — **four times** on this project, and the history is two paragraphs down.
+**Every one of the four is a real box's set**, which is the point: the value is not a fact about
+Gaudi, it is a fact about the box in front of you. **SUPERSEDED 2026-10-15** at the value; the rule
+did not move. That is why 4-device runs "just work" there — and why the check below is not optional.
+**MEASURED** *(`Archive/by-date/2026-10-15/ordpost2/` — `REPORT.md`'s "Device, before and after"
+table and the `hl-smi` snapshots.)*
+
+⚠ **Then check the set against the vendor's recommended combinations — because a set that is merely
+unusual is a set you will end up debugging.** Read the page precisely, because the distinction is
+load-bearing: *"only 2-Gaudi and 4-Gaudi scenarios are supported. **It is highly recommended** to set
+module ID in `HABANA_VISIBLE_MODULES` using the combinations listed below: 2-Gaudi: `0,1`, `2,3`,
+`4,5` or `6,7` — 4-Gaudi: `0,1,2,3` or `4,5,6,7`"* — and *"Avoid mounting the same index on multiple
+containers."* ⇒ **"supported" is the vendor's word for the *count* of processors; the combinations are
+a *recommendation*.** The lists are **module IDs**: **2-Gaudi = `0,1`, `2,3`, `4,5` or `6,7`; 4-Gaudi
+= `0,1,2,3` or `4,5,6,7`.** And the page's **own first example is non-adjacent** — it mounts four
+processors with module IDs `5,4,7,6` — so a non-adjacent set is not forbidden by the page; it is
+simply **outside the recommended list**. *(Same vendor page and fetch as §3.7.1.)*
+
+**Our own container's allocation, and it has moved four times:** `4,5,6,7` — which **is** one of the
+two recommended 4-Gaudi combinations — until **2026-10-07** (archived as `4,5,6,7` on 2026-09-26 and
+2026-10-04; the first `0,3,6,7` record is 2026-10-07); then `0,3,6,7` from 2026-10-07, then `0,2,3,6`
+after the 2026-10-15 driver bump, and now `0,1,2,3`. **So the recommended regime is the LONG one and
+the non-recommended regime is the short one: the switch is at 2026-10-07, ~8 weeks after this project's
+first archived work (2026-08-13), and the non-recommended sets are 8 days old.** The HPU measurements
+this manual reports therefore fall in **both** regimes, and its CPU-only figures have no topology at
+all. A reader who copies the allocation published in this section builds a TP4 run on a set **outside**
+the recommended combinations; **this manual cannot tell them what that costs, because we have not
+measured it.** *(The September `4,5,6,7` runs are the natural comparison for anyone who wants the
+number, but they are code-state-confounded.)* **⇒ For any collective or interconnect figure, check
+which regime it came from before attributing anything to the model.** **ASSUMED (vendor
+documentation)** for the recommendation — the quotation above is the citation — and **MEASURED** for our
+own allocations: `Archive/by-date/2026-09-26/runA.env` and `runB.env` (the `4,5,6,7` era),
+`Archive/by-date/2026-10-04/old-notes/picking-hpus.md` (the same set, as *"physical set = host modules
+4-7"*), `Archive/by-date/2026-10-15/device-host-map/HOST-AND-CONTAINER-DEVICE-MAP.md` **§2** (the
+pre-reboot block, which is the `0,3,6,7` record) and **§3** (the post-reboot `0,1,2,3` map), and
+`Archive/by-date/2026-10-15/ordpost2/REPORT-01-device-blocked.md` (the `0,2,3,6` state).
 
 **Check before you assume:**
 
 ```
 hl-smi -L                                   # 8 AIPs on a host, 4 in a limited container
 hl-smi -Q index,module_id,memory.used -f csv,nounits   # the only honest placement read-out
+hl-smi -Q index,module_id,serial,uuid -f csv,nounits   # ... and the serial: "same card" vs "different card"
 env | grep -iE "HABANA_VISIBLE"
 python -c "import torch, torch_hpu; print(torch.hpu.device_count())"
 ```
@@ -3000,9 +3331,9 @@ python -c "import torch, torch_hpu; print(torch.hpu.device_count())"
   torch_hpu`, as long as it precedes the first HPU tensor. A non-numeric value fails with
   **`ValueError: stoul` at allocation**, not at import. **MEASURED**
 - **`torch.hpu.set_device(i)` as the FIRST HPU call** is the in-process wrapper: it writes
-  `HLS_MODULE_ID = HABANA_VISIBLE_MODULES[i]`. In one 4-AIP container the observed mapping was
-  **0→0, 1→3, 2→6, 3→7**. Called after a device is already selected it is **silently ignored**.
-  **MEASURED**
+  `HLS_MODULE_ID = HABANA_VISIBLE_MODULES[i]`. In one 4-AIP container — **the `0,3,6,7` allocation of
+  §3.7.1, not the current one** — the observed mapping was **0→0, 1→3, 2→6, 3→7**. Called after a
+  device is already selected it is **silently ignored**. **MEASURED**
 - **It does not override an existing pin — *except* when that pin is `0`.** An existing
   `HLS_MODULE_ID` wins, so keep the environment pin and any `set_device(i)` **consistent**
   (**INFERRED** — code analysis of `hpu/__init__.py:352-367`, `:381`; not executed). The exception is
@@ -3117,6 +3448,8 @@ as valuable as the wins.**
 | 6 | **"Avoid custom ops" as a heuristic** | **Refuted by the model's own op.** Three arms held customness fixed and flipped the outcome purely on **submission count**: custom op → 0.2217 at 1 submission; custom op → 0.0000 at 2; native op → 0.4179 at 1. The discriminator is the submission count. | **MEASURED** |
 | 7 | **Region coalescing alone** | Grouping 4 layers into one compiled unit **moved no operational count** — the *parameter*, not the region boundary, sets the instance count. | **MEASURED** |
 | 8 | **Launch count / sync count / recipe count as the lever** | r² 0.15 / 0.195 / 0.066, **all with the wrong sign**. | **MEASURED** |
+| 9 | **Reaching the 48 MiB SRAM from your own code** | Every route is closed. `synDeviceMalloc` at an SRAM address returns **`synSuccess` and relocates to DRAM**; `MEMORY_ATTRIBUTE_SRAM` is `// currently not supported`; a TPC kernel **cannot name the address** (32-bit pointers — a 64-bit constant cast to a pointer compiles to `ld_l`/`st_l`, i.e. **local memory**, and *appears to work*); `AuxTensor.sramAlloc` is a **dead field with no readers**. Placement is the compiler's decision, not yours. **Chapter 7** is the whole map. | **MEASURED** |
+| 10 | **A node-count census as a cost model** | Metadata nodes (`Reshape`, `logical_slice_fwd`, `Split`, `Concatenate`, …) are numerous and **absent from the device trace**; conversely a family of 1–3 µs integer nodes can be **30 % of a step** while never reaching a per-node ranking. Node counts have **no device-time implication in either direction** — rank by **engine identity × count × mean duration**. §3.6.4. | **MEASURED** |
 | 9 | **Optimising for "the step is launch/serialization-bound"** | **Two readings exist, and they point at opposite levers — so name both.** *(i) **launch/serialization-bound**: device idle ~80 %, host busy through most of it, ~573 graph launches and ~1048 host syncs per step.* *(ii) **device-occupancy-bound**: the step is ~76 % device-occupancy and the wall tracks device busy.* **These describe different CODE STATES, not two measurements of one** — the 573/1048 numbers are a 2026-09-19/20 `with_stack=True` state ~3× slower than the current one, and the launch/sync/recipe **counts** fail to predict the wall on the current corpus (wrong sign, r² ≤ 0.2) while `merged` fits at r² 0.9999. A later archived fit re-tests the launch-side model directly and **refutes it again** (`Archive/by-date/2026-10-11/node_law/`: wall = k × node-executions gives R² **0.346** through the origin with a per-run `k` spread of **171 %**, against wall = 21.703 + 0.99713 × `merged` at R² **0.99995**). **⇒ Do not optimise for launch count.** But if you are on a code state with the *other* symptom, the other reading is the right one — check which regime you are in before choosing a lever. | **MEASURED** |
 | 10 | **`torch.stack([a, a], dim=-1)` — the same tensor twice** | Costs **22,532 µs vs 301 µs** for two *distinct* tensors — **75×** — on a 50 MB output. It silently destroyed a component benchmark (read 22,500 µs inside a 4,300 µs whole-op measurement). | **MEASURED** |
 | 11 | **Profiling with CPU activity enabled** | Inflates the trace's host span **~3×** and collapsed a queue-depth metric from 23.3 to 1.67, manufacturing a false empty queue. **Use HPU-activity-only profiling.** | **MEASURED** |
@@ -3137,10 +3470,13 @@ subsection in §3.4.1.)*
 additions, not closures.** **Item 21, opened 2026-10-13 by the fp4 LUT promotion (§3.4.8), is now
 CLOSED — the whole-model TP=4 run resolved it (below).** **Item 22 is new, opened 2026-10-13 by the
 two-arm compile gate (§3.6.5), and it is the *bound on that gate's result* rather than a new question.**
+**Item 23 is new, opened 2026-10-14, and it is a *negative*: it records an outside compiler failure
+that does *not* reproduce here, so it is scoped away from this stack rather than added to it.**
+**Item 24 is new, opened 2026-10-21 from a parallel port's batched-decode notes (§3.1.5), and
+HALF-CLOSED 2026-10-24 by that port's own scaling study — its routed-expert mechanism is refuted, and
+what replaces it is measured; what remains open is a `merged`-per-token curve on *our* arm.**
 They are registered here rather than left inside §3.4.7 so that a reader who
-consults this register to find out what we do *not* know gets a complete answer. **Item 23 is new,
-opened 2026-10-14, and it is a *negative*: it records an outside compiler failure that does *not*
-reproduce here, so it is scoped away from this stack rather than added to it.**
+consults this register to find out what we do *not* know gets a complete answer.
 
 > **The habit that keeps this honest, and it is cheap.** When a later section **corrects or supersedes**
 > a pattern, the **earlier** section that **prescribes** it must be re-checked **in the same pass**. A
@@ -3178,6 +3514,7 @@ reproduce here, so it is scoped away from this stack rather than added to it.**
 | ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
 | **22** | **The rewrite's per-launch cost — the plan's N4 — is unmeasured, and the two-arm compile gate does not measure it.** The gate (§3.6.5) establishes that the KV-slab staging pass **disappears** when the slab is a declared operand read and written through its base address; it does **not** establish what the replacement kernel costs. Its treatment op is a **skeleton** at the model's geometry (the model itself may not be edited), and the rewrite's floor still carries a per-launch term read off a **harness** kernel (§4.2.10's bundle law), not off model nodes. So *"the staging pass is removed"* is **MEASURED** while *"R costs `0.2324 ms/step`"* remains **DERIVED**. | Compile the **real** fused per-layer kernel at the model's own geometry and read its per-launch term off its own launch, the way §4.2.10's arms were read. *(Opened 2026-10-13 by the two-arm compile gate; §3.6.5; `Archive/by-date/2026-10-13/compile-gate-run/`.)* |
 | **23** | **Whether a graph whose operations do not form a single connected component breaks the compiler *here* — NO, not on this stack, and it is recorded as a NEGATIVE so nobody re-chases it.** An outside port (`github.com/thediymaker/autoresearch-gaudi`, MIT, commit `a629f04d6ec98224d7e2d31f2ffe70cb3f89d4df`, Habana **1.23.0 / torch 2.9.0**) reports a recurring hard failure: a graph region whose ops do not form one connected component — its own paraphrase, *"multiple connected components"* — hangs or errors in the Synapse tile-size calculator, and the fix is **more** `mark_step` boundaries, not fewer. *(The same source separates **horizontal batching** — one op over N independent instances — from **vertical fusion** — merging sequential stages into one recipe — and reports the first ahead and the second behind; §2.5.2 cites it for that asymmetry, and we have not measured either kind against the other.)* **On Habana 1.24.0 / torch 2.11.0a0 it does not reproduce.** 70 arms, each in its own subprocess under a hard wall-clock timeout with process-group kill, across both `PT_HPU_LAZY_MODE=1` + `mark_step` and `torch.compile(backend="hpu_backend")`: **49 of them handed the compiler a graph with ≥ 2 weakly-connected components, up to 8 in one graph — 0 hangs, 0 errors, 49/49 numerically correct**, every arm compiling in ≤ 0.4 s. The decisive form: lazy mode really does close a graph at `mark_step`, so the *same* computation can be handed over both ways — **one graph with 8 components (0.02 s)** and **8 graphs of 1 component (0.04 s)** — both compile, both correct, so **the prescribed workaround is unnecessary here.** *(That split control is lazy-mode-only: under `torch.compile` `mark_step` is inert, so the compile-config split arms are duplicates of their unsplit twins.)* **MEASURED** (our stack, 2026-10-14). **Scope, and it is the point of the entry: this is NOT a property of the stack this manual documents, and it is NOT a refutation — the failure may well be real on 1.23.0, which is what the source claims and what we cannot test.** What was **not** established: that the tile-size calculator was actually exercised is **INFERRED** (the arms carry MME ops and one arm maximises irreconcilable tilings, but the pass was not instrumented); everything tested was a **microbenchmark** (≤ 8 MB per tensor), so nothing is claimed about scale; and the source's own `train.py` was **never executed**. **The source's evidence problem, so its figures are not built on: its own documented example output block is internally inconsistent** — against its own constants it implies **~107 % of its stated BF16 peak**, and its MFU figure contradicts its own step count — **so its MFU must not be quoted as a measured Gaudi 2 result.** The repo has **no tests, no CI and no issues ever opened**, and **36 of its 46 commits are inherited from upstream.** | An arm on **Habana 1.23.0 / torch 2.9.0** — ideally the source's own `train.py` run there — which is the configuration the claim is scoped to and the one we cannot test. On our stack: instrument the tile-size pass (rather than inferring it ran from fast compiles of MME-bearing graphs), and repeat at model scale. *(Opened 2026-10-14; `Archive/by-date/2026-10-14/connected-components-repro/`.)* |
+| **24** | **HALF-CLOSED 2026-10-24 — the routed-expert half is answered (negatively); the `merged`-per-token half is not.** ~~The mechanism is INFERRED: on a sparse model the weight set is the **union of the routed experts**, which grows with the batch.~~ **REFUTED** by a direct test on a parallel port: routing diversity moves step time by **0.1–0.4 ms** at every n, and **D = 6 vs D = 36** is within **1 %**; the routed MoE explains **at most 1.16× of the step's 3.13×** growth. What the step *is* a function of is the **compiled bucket** — 10.4 / 25.9 / 32.5 ms at buckets 1/2/4, **flat in rows inside a bucket** (§3.1.5). **Still open:** this manual has **no** `merged`-per-token curve **on its own arm** — the campaign's serving arm never ran a concurrency sweep (`--max-num-seqs 1`, sweep **NOT RUN**) — and the parallel port's curve ends at bucket 4 because **bs > 4 does not compile** there. | The original ask stands, minus its second half: one arm at bs = **1, 2, 4, 8** on **our** code state, reading **`merged` per token** (§3.6.1) **and** the bucket each batch size maps to — the bucket, not the expert union, is the quantity to separate "the weights amortised" from "we crossed a step". *(Opened 2026-10-21; half-closed 2026-10-24 by the parallel port's own scaling study; §3.1.5.)* |
 
 ---
 
@@ -3187,8 +3524,13 @@ reproduce here, so it is scoped away from this stack rather than added to it.**
 
 **A. Get a trustworthy baseline.**
 1. `hl-smi -L`; count AIPs, and read the module set with
-   `hl-smi -Q index,module_id,memory.used -f csv,nounits`. **Decide the pinning story from what you
-   see**, not from what you expect — the module set is box-specific.
+   `hl-smi -Q index,module_id,serial,uuid -f csv,nounits`. **Decide the pinning story from what you
+   see**, not from what you expect — the module set is box-specific, and the **module id** is the
+   numbering to pin in (§3.7.1). **Check the set against the vendor's recommended combinations before
+   you build a TP group on it — in module IDs: 2-Gaudi = `0,1` / `2,3` / `4,5` / `6,7`; 4-Gaudi =
+   `0,1,2,3` or `4,5,6,7`.** The recommendation covers the *combinations*, and the page's own example
+   is non-adjacent — so a set outside the list is not forbidden, but **the manual cannot price it:
+   what a non-recommended set costs is not measured here** (§3.7.2).
 2. If a container already limited you, **do not set `HABANA_VISIBLE_DEVICES`** — inside the container
    it is **inert** (nothing in the image reads it), so it neither helps nor isolates.
 3. **Pin by module id, and make the pin set a partition.** Export `HLS_MODULE_ID=<module>` per job.
@@ -3381,6 +3723,43 @@ reproduce here, so it is scoped away from this stack rather than added to it.**
     sides' logprobs are **float32-exact** — so these are ordinary float32 differences, spanning
     **3e-5 … 0.53**. *(§3.4.8; `Archive/by-date/2026-10-13/serve-nondeterminism/REPORT.md` §1.1, §3–§5;
     the measurement: `Archive/by-date/2026-10-13/vllm-serve-smoke-retry/REPORT.md` §5–§7 and §11 item 2.)*
+
+28. **An env knob that "does not exist" usually lives in the plugin, not in vLLM.** **MEASURED:** a
+    parallel port of this model concluded that `VLLM_T_COMPILE_DYNAMIC_SHAPES` "appears **zero**
+    times in the vLLM tree we actually run" and that setting it "is a no-op" — from a grep of
+    **upstream vLLM core** (`vllm/`). The knob is defined in the **plugin**, as a feature flag:
+    `vllm_gaudi/extension/features.py` carries
+    `Value('dynamic_shapes_compilation', True, env_var='VLLM_T_COMPILE_DYNAMIC_SHAPES',
+    env_var_type=boolean)`, and it works — it is the same variable item 26 above is about. Upstream
+    vLLM core cannot contain a plugin's knob, so **the zero count is a property of where the grep
+    ran, not of the build.** Grep the plugin tree (`vllm_gaudi/`) for `env_var=`, and check the
+    **product default** rather than the absence of the name. This is item 24 in a new costume, and it
+    is worth its own item because the wrong conclusion here is *reassuring* — "the switch does
+    nothing, so dynamic shapes are not the problem" — and it retires a live hypothesis without
+    testing it. *(The knob's definition site: `vllm_gaudi/extension/features.py`; the consumer:
+    `vllm_gaudi/utils.py`'s `HPUCompileConfig`, which reads `get_config().dynamic_shapes_compilation`.
+    **And "the default is on" does not imply "the default reached *your* graph".** The knob reaches
+    `torch.compile` through exactly **one** consumer — `HPUCompileConfig.__init__` — and a port that
+    passes `dynamic=False` at its own compile site bypasses it completely. A parallel port found
+    exactly that: every layer-group / bucket entry is compiled at a site that hardcodes
+    `dynamic=False`, so `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` changed nothing there — **not because the
+    knob was absent, but because the call site overrode it.** Read the consumer before believing the
+    default. **Source read.**)*
+
+29. **A compile failure surfaces at a FLUSH POINT, not at the culprit — bisect with `synchronize()`
+    markers, and two rounds is usually enough.** **MEASURED:** a graph-compile failure presented at a
+    **D2H copy** (`token_host.copy_(token, non_blocking=True)`) — which is simply where the lazy graph
+    was flushed, and therefore *not* the location of the defect (§3.4.7's `synStatus 26` shows the
+    same pattern from the other side). Inserting `torch.hpu.synchronize()` at successive statement
+    boundaries, behind an env flag, took it down in **two runs and no theory**: round 1 bracketed the
+    model forward and **proved the forward was fine**, collapsing the search to four statements;
+    round 2 split those four and collapsed it to two. The theory being pursued in parallel (a
+    collective inside the sampler) was **wrong**, and the markers did not care — which is the point:
+    this instrument does not depend on being right about the cause. **Rules that make it safe:** the
+    flag **defaults off** and warns once when enabled; every marker costs a **device
+    synchronisation**, so an arm carrying markers measures a different thing and must not be used for
+    timing; and the markers are removed by their `PROBE EDIT` marker before commit, not left behind a
+    flag.
 
 ---
 

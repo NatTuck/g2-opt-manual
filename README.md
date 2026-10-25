@@ -1,6 +1,6 @@
 # Gaudi 2 HPU Optimization Manual
 
-**Status: DRAFT.** Four chapters are written and filled with measured material. Gaps are
+**Status: DRAFT.** Seven chapters are written and filled with measured material. Gaps are
 marked explicitly rather than left blank or guessed — each chapter carries its own
 **UNKNOWN register**, and chapter 3 also carries a **dead-end register**.
 
@@ -54,10 +54,13 @@ those in from general knowledge.**
 | # | chapter | ~lines | status |
 |---|---|---|---|
 | **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
-| 1 | [Gaudi/HPU Basics](01-basics.md) | ~900 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
+| 1 | [Gaudi/HPU Basics](01-basics.md) | ~1,000 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
-| 3 | [Porting a large language model to HPU](03-porting.md) | ~2,000 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
+| 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
 | 4 | [The TPC execution model](04-execution-model.md) | ~600 | the three concurrency levels · the VLIW bundle as the cost currency · vector registers and dtype rules · the VLIW scheduler · reading a listing |
+| **5** | **[Profiling and the identity chain](05-profiling.md)** | ~430 | **read before taking a profile you intend to act on** — the five legs from a trace event to a source line, which are keys and which are inferences, the run-time knobs that cannot be set afterwards, how to collect from a vLLM run (where the engine, not you, owns the device), and the traps that silently break the join |
+| **6** | **[The fast iteration workflow](06-fast-iteration.md)** | ~630 | **how optimisation actually gets done** — one attributable profile, then spans cut at recipe boundaries, harnessed against captured bytes in seconds instead of minutes, gated on correctness, rewritten from scratch against an estimated hardware ceiling, and confirmed in situ once per span — including how to tell a span worth doing from one that merely extracts cleanly |
+| **7** | **[The on-die SRAM](07-sram.md)** | ~430 | **read before you plan around SRAM** — the 48 MiB pool and where it sits, the compiler's live slicer and the knobs it reads, what actually decides placement, the routes to it that are closed (most of them silently), how to observe what the slicer did, and what it is worth |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the five had gone stale** — chapter 1 read 944 against an
@@ -65,11 +68,18 @@ actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked
 is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
 not cite it.**
 
-Example code lives in [`examples/`](examples/), organized by chapter — **13 files**, of which
-one (`examples/02-regions/03_inspect_graph_dumps.py --demo`) runs CPU-only and has been
-verified end to end, and one (`examples/03-porting/fp8_scale_adjustment.py`) is host-only and
-has been run. **The rest are annotated sketches** that need a device; each says so in its
-header.
+Example code lives in [`examples/`](examples/), organized by chapter — **21 files**, of which
+**four** run CPU-only and have been verified end to end
+(`examples/02-regions/03_inspect_graph_dumps.py --demo`, `examples/01-basics/gap_histogram.py`
+including its `--selftest` control, `examples/05-profiling/attribute_chain.py`, and
+`examples/06-workflow/traced_state_gate.py` — whose `--selftest` is a gate **on** the gate: it asserts
+that it *fails* on the buggy construct), and one
+(`examples/03-porting/fp8_scale_adjustment.py`) is host-only and has been run. **The rest are
+annotated sketches** that need a device; each says so in its header.
+
+Chapter 5's three programs are the exception to "annotated sketch": they were **run on a real
+Gaudi 2 on 2026-10-21** and their outputs are archived, so the worked example in §5.8 is a
+measurement rather than a description.
 
 ## What this draft does not yet cover
 
@@ -83,6 +93,10 @@ mistaken for omissions:
   a 2× unit ambiguity in its source artifact, so the target is stated as pending.
 - **All workload-specific numbers are from one model** — DeepSeek V4 Flash, tagged `[DSv4F]`
   where they appear. No per-chapter figures exist for any other model.
+- **Chapter 7's measurements are from a parallel port, not from this project's own arms.** Its
+  archived artifacts are not published, so its figures are provenance pointers rather than
+  checkable citations; where a claim could instead be grounded in something a reader *can* open —
+  the runtime device attributes, the public driver header, the shipped `libSynapse.so` — it is.
 - **No engine-scale worked overlap verdict.** Chapter 2's numbers are all from synthetic
   harness arms; the project's one engine-scale figure is recorded as UNRESOLVED.
 - **The shared-layer op-support table** (what decides `hpu_cluster` vs `eager`) is measured as

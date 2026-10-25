@@ -54,6 +54,13 @@ time can leave the wall flat. Before you optimise anything, ask what it removes 
 **union**.
 → *Chapter 2*
 
+**But the rule has two levels, and "never sum" is wrong on its own.** Union **within** a recipe;
+sum **across** recipes. Recipes execute sequentially, so the per-recipe unions **partition** the
+step exactly — on the reference arm, **110 recipes summing to 66.135 ms against `merged` = 66.1399**
+(0.007 %). What is illegal is summing **event** durations, which double-count. Summing recipe unions
+is the correct model, and it is what lets you price a span by its own union.
+→ *Chapter 2 §2.9 rule 1; chapter 3 §3.6.4*
+
 ---
 
 ## The one stale claim to watch for
@@ -86,9 +93,25 @@ does not reduce the union.** The two facts are one fact.
 So: if you inherit a "launch-bound" claim, **check it against the union before acting on it.**
 The stale framing is the single most likely thing to send you optimising the wrong quantity.
 
+**And when you find a gap between the union and the wall, do not name it "communication" — count
+the holes.** Merge the device intervals, take the complement, and histogram the holes by width: the
+sub-50 µs ones are launch granularity and track **op count**, and a multi-millisecond hole is only a
+collective if it is **aligned across the ranks that take part** — tested against a null, because at
+~20,000 holes per step anything matches by chance. → *[Chapter 1 §1.8](01-basics.md)*,
+[`examples/01-basics/gap_histogram.py`](examples/01-basics/gap_histogram.py)
+
 ---
 
 **And when you write your own TPC kernel, the unit of cost is the VLIW *bundle*, not the instruction** — a `{...}` group in a `tpc-clang -S` listing is a 4-slot issue bundle, the device retires one per cycle, and the shipping scheduler leaves 1.2–3.4× of bundle count on the table. → *[Chapter 4](04-execution-model.md)*
+
+---
+
+**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot address it from your
+own code.** Placement is decided by **graph structure** — a tensor needs a real *compute* producer (a
+view does not qualify) — not by any request you can make. Every obvious route to it is closed and most
+fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
+appears to work. **Observe, do not request** — and read the chapter before you plan around it. On a
+batched MME workload it is worth **~20 % on min iteration time**. → *[Chapter 7](07-sram.md)*
 
 ---
 

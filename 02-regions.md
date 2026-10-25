@@ -1093,6 +1093,38 @@ order of magnitude: **925.1 ms/step of summed device work executes inside a 70.5
 parallelism** (**MEASURED**). Only the **un-overlapped** part of a reduction counts. A useful
 corollary for optimisation: *reducing summed work is not the lever; reducing occupancy is.*
 
+> ### The rule has two levels — and read only as "never sum", it is wrong
+>
+> **Union within a recipe. Sum across recipes.**
+>
+> The prohibition is on summing **event** durations, which double-count because one op emits many
+> overlapping events (per-TPC replication 18–24×, MME marker self-overlap ~4×, DMA ~14.5×). It is
+> **not** a prohibition on summing *recipe* unions — that is the correct model, because **recipes
+> execute sequentially**.
+>
+> **MEASURED, and it is an identity rather than a correlation:** on the W0 decode arm the **110
+> per-recipe busy sets partition `merged` exactly** — `25.295` (attention) + `40.642` (MoE/FFN) +
+> `0.198` (head/embed/sampler) = **66.135** against `merged` = **66.1399**, a 0.007 % difference. So
+> `Σ(per-recipe union) = merged`, and `merged` is what the wall tracks (§3.6.1).
+>
+> **Three qualifications, and each one has bitten us:**
+>
+> - **It is valid because cross-recipe overlap is exactly zero** (§3.6.4). The partition *is* the
+>   evidence for that seriality, and the seriality is the *reason* the sum is legal — quote them
+>   together, and do not apply the sum to a stack where seriality has not been checked.
+> - **Eager-placed nodes have no recipe**, so they sit outside the partition. Where the partition is
+>   exact, no eager work contributed; where it is not, the shortfall **is** the eager work and must be
+>   reported as its own bucket rather than smeared into a recipe. On a Qwen decode trace the
+>   recipe-less events were **13.45 of 121.7 ms (11 %)**.
+> - **Sum per device, never across devices.** In TP every rank runs the same workload in lockstep, so
+>   per-rank sums are **replicas** — adding them multiplies the work by the TP degree for no gain. The
+>   step wall is the **slowest rank** plus the host term. Per-device sums become independent only when
+>   the devices are genuinely unsynchronised, and even then they add for *aggregate throughput*, never
+>   for latency.
+>
+> **And the host term is outside the sum**: `Σ = merged`, while `wall = 21.724 + 0.996812 · merged`
+> (§3.6.1). The sum predicts the wall through that fit; it is not the wall.
+
 **A union is an occupancy, not a removal price — and this is the second half of rule 1.** Once you
 have a union, the natural next step is to read it as *"what this family costs me"*. It is not. The
 most a change that **removes** a family can free is that family's **leave-one-out** (LOO) — how much
