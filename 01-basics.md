@@ -807,7 +807,7 @@ take the complement, and histogram the holes **by width**.
 | hole width | what it is | scales with |
 |---|---|---|
 | **< 50 µs**, tens of thousands per step | inter-descriptor turnaround | **op count** — launch granularity, not communication |
-| **50 µs – 1 ms**, hundreds | host-side stalls between submissions | submission structure |
+| **50 µs – 1 ms**, tens to a few hundred | host-side stalls between submissions | submission structure |
 | **> 1 ms**, a handful | dependency, host or collective stalls — the only bucket where "communication" can hide | — |
 
 **The alignment test is what decides the last row, and it needs a null.** A per-layer collective on

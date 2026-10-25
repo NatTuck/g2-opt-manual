@@ -1,11 +1,13 @@
 # Examples — Chapter 6 (The fast iteration workflow)
 
-One file, and it is a **template** rather than a runnable program: the workflow's whole point is that
-each span is different, and the harness is built per span against captured data.
+**Two files**, and only one of them is a template. The workflow's whole point is that each span is
+different, so the harness is built per span against captured data — but the *gate* is the part that
+generalises, and one of its failure modes needs no device at all.
 
 | file | what it does | needs a device? |
 |---|---|---|
 | [`span_harness.py`](span_harness.py) | the harness pattern: load captured bytes → run the **model's own** span function → gate correctness **first** → time, reporting ops/launches/busy alongside → print what the proxy check needs | yes (it runs the span), but the *loop* it enables costs seconds |
+| [`traced_state_gate.py`](traced_state_gate.py) | the gate for a span that **reads state**: a tensor cache inside a traced region is baked into the graph on a hit, and the input is then ignored. Runs three variants (no clear / per-region clear / per-use clear) against a reference; `--selftest` asserts it **fails** on the buggy constructs | **no** — CPU only |
 
 ## Why there is no worked example here
 
