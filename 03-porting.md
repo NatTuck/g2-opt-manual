@@ -480,32 +480,53 @@ Everything above is **bs = 1**. The obvious next move — raise the batch, read 
 and serve N tokens — is right in form and much weaker in degree on a MoE, and the reason is worth
 stating before someone plans around it.
 
-**The mechanism.** On a dense model the weight set is fixed, so at batch N the weight term per token
-falls ~N× until the KV, activation or compute term binds. On a sparse model the weight set is a
-**function of the batch**: each request routes to its own top-k experts, so the bytes you must read
-are the **union of the routed experts over the batch**, and that union **grows with N**. The
-amortisation is therefore not N× but (N ÷ union growth), and union growth is the term a dense-model
-intuition does not have. At bs = 1 this model reads **6 of 256** experts per layer; the union at
-bs = 8 is not 48, and it is also not 6.
+**The conclusion holds; the mechanism most people reach for does not.** Both halves were measured on
+a parallel port of this model, and the second half refutes a mechanism this section previously
+carried.
 
-**INFERRED** — from the floor table above (which is bs = 1 by construction) plus the routing rule.
-**What is NOT measured here: any batch-scaling curve.** This manual has **no** measured bs = 1 → 8
-step-time curve, for any model — the campaign's own serving arm never ran a concurrency sweep
-(`--max-num-seqs 1`, sweep **NOT RUN**), so the shape of the curve is an open item, not a result.
-Do not fill it in from general knowledge.
+**What the cost is a function of: the compiled bucket, not the routed-expert set.** A decode step is
+compiled per batch bucket, and its cost is a **step function of the bucket** — flat in the number of
+real rows inside it:
 
-**A second implementation of the same model on the same hardware** reports its decode step at
-**10.6 ms at bs = 1, 28.4 ms at bs = 2 and 35.2 ms at bs = 4** — four times the rows for **3.3×** the
-step time. That is neither a launch-count story nor the dense-model weight-amortisation story; it is
-consistent with the step being paced by the number of **distinct experts whose weights must be
-read**. *(Their figures, their port state, not ours: quote them as a second port's, and see §3.1.1's
-independent-corroboration note for the same source's accounting.)*
+| bucket | 1 | 2 | 4 |
+|---|---|---|---|
+| step time, ms | **10.4** | **25.9** | **32.5** |
 
-**⇒ The lever this changes.** If the expert union is the pacing term, then **more rows is the weak
-direction and more *tokens per weight pass* is the strong one** — speculative decoding amortises
-exactly the term batching fails to. Before choosing between them, measure `merged` **per token** at
-the batch sizes you care about (§3.6.1): a batching change that leaves `merged` per token flat has
-bought nothing, however much summed work it moved.
+Fitted per bucket, the residual rms is **0.11** (max 0.15); fitted as an affine function of rows it
+is **3.95**. And **n = 3 and n = 4 are both bucket 4 and cost the same** — +33 % of the rows for
+−0.9 % of the time. **Rows inside a bucket are free.** **MEASURED** (a parallel port's serving arm,
+TP4×PP1, buckets 1/2/4, 96–128 generated tokens per cohort, median of two cohorts).
+
+**The routed-expert union is NOT the pacing term — it was tested directly, and it failed.** Two
+requests carrying the **same** prompt route to nearly the same six experts per layer, holding the
+distinct-expert count at its n = 1 minimum; two different-domain prompts reach up to 12. At every n
+the two arms are **0.1–0.4 ms apart** — noise. A single-card arm with real prepared N256 weights and
+the ids passed as data (so the distinct count varies without recompiling) puts **D = 6 vs D = 36
+identical within 1 %** at every row count. And the routed MoE's own row scaling (1.0 / 1.05 / 1.16 /
+1.75 at 1/2/4/6 rows) explains **at most 1.16× of the step's 3.13×** growth. **MEASURED**
+
+> **CORRECTED 2026-10-24.** This section previously stated the mechanism as **INFERRED**: that on a
+> sparse model the weight bytes are "the **union of the routed experts over the batch**, and that
+> union **grows with N**", so the amortisation is N ÷ union growth. The measurement above was
+> designed to test exactly that, and it refutes it. The **conclusion** — batching is not ~N× on a
+> sparse model — survives and is now **MEASURED** rather than inferred; the **mechanism** does not.
+
+**⇒ The lever this changes — and it is a different lever than the one this section used to name.** If
+the term is fixed per **bucket**, the thing to attack is whatever is fixed per bucket: the compiled
+graph's own cost at that bucket, not the expert union. **More rows inside a bucket is free; crossing
+into the next bucket is what costs.** Before choosing a batching change, read `merged` **per token**
+at the batch sizes you care about (§3.6.1) *and* which bucket each maps to — a change that keeps you
+inside a bucket has bought nothing however much summed work it moved, and a change that moves you
+across one has bought a step.
+
+**Two bounds on the curve.** On that port **bs > 4 does not compile** — a wiring limit of that build,
+not a kernel limit — so the measured curve ends at bucket 4. And the earlier statement that this
+manual carries **no** batch-scaling curve at all is now superseded: it carries one at **1 / 2 / 4**,
+on a parallel port's code state, and it is not ours. *(That port separately reports **10.6 / 28.4 /
+35.2 ms/step** at bs 1 / 2 / 4 on a **different arm** of the same port — the same bucket-shaped curve
+from a different code state, and not directly comparable to the 10.4 / 25.9 / 32.5 above. Quote one
+or the other, not a mix. See also §3.1.1's independent-corroboration note for that source's
+accounting.)*
 
 ---
 
@@ -1810,9 +1831,9 @@ pass-level message text (`Graph optimization failed! Got SynapseException: {}` i
 the snapshot is not. **The `n_aa` decode is INFERRED, not source-read:** it matches that snapshot's
 generator format exactly (and the name is identical on all four ranks and across repeats, as a
 per-graph counter starting at zero would be), but `NameBuilder` is a header-only class, so there is
-no symbol in the shipped binary to confirm it against. *(The Gaudi Grimoire would settle the 1.24.2
-enumeration; it returned HTTP 503 during this work, so that is "could not consult", not "no
-evidence".)*
+no symbol in the shipped binary to confirm it against. *(A vendor-source enumeration of the 1.24.2
+throw sites would settle it; our attempt to consult one returned HTTP 503 during this work, so that
+is "could not consult", not "no evidence".)*
 
 **And do not over-generalise this caveat.** The dump-directory `synStatus 26` failures elsewhere in
 this manual — Chapter 2 §2.10 trap 1 and Chapter 1 §1.11 — are **not** in this class: they rest on
@@ -2593,6 +2614,35 @@ different `merged`), it is the family's own busy-set union.
 the shape of this table: the two largest *op counts* are not the two largest *time* items, and the
 family with the largest op count is not in the top three by time. **Count and cost are different
 questions.**
+
+#### The node-count census is not a cost model — and there is a family this table cannot show
+
+Two facts hold at once, and a reader needs both:
+
+- **Metadata nodes are numerous and free.** `Reshape`, `StaticReshape`, `logical_slice_fwd`,
+  `ExpandDims`, `Split` and `Concatenate` appear in the post-graph dumps and are **absent from the
+  device trace entirely**. A census reporting "74.6 % of node executions are metadata" is therefore a
+  *graph-node* count with **no device-time implication**, and pricing a fusion from node counts
+  overstates the win.
+- **Many tiny integer nodes are numerous and expensive.** On a parallel port's **bs = 2** arm
+  (81 recipes, 14.30 ms attributed), one family of integer layout arithmetic — `ge_i32` 609 µs,
+  `div_mod_i32` 599, `where_i32` 542, `cast_i64_to_i32` 493, `less_i32` 446, `and_i8` 431,
+  `constant_i64` 306, `add_i32` 213, `gather_elements` 114 — totals **4,356 µs, 30.5 % of the
+  attributed step**: the **largest single term** on that arm. Each node is **1–3 µs**, so the family
+  is invisible in any per-node ranking and in TPC lane-time, yet together it dominates. In one
+  2-layer attention recipe, 78 integer TPC nodes cost ~124 µs of 182 µs per execution.
+
+**They are distinguishable only by engine identity in the trace, not by op name.** That is why the
+table above, which ranks node-name families over a *different* arm (W0, bucket 8), has no such row:
+its families are named kernels, and a 1–3 µs node never reaches a ranking built from them. **Do not
+add this family to the table above** — it is another arm, and it would mix two populations.
+
+**⇒ The category this names, for the regime table.** "Many tiny integer nodes" is neither bandwidth-,
+compute- nor launch-bound in the usual sense — it is **per-node cost paid ~78 times per recipe**. A
+reader following a launch-bound diagnosis concludes "fewer, larger ops", which is right but does not
+say *which work to delete*. The audit that does: rank nodes by **engine identity × count × mean
+duration**, not by count alone, and look for a large count of sub-5 µs TPC nodes.
+**MEASURED** (a parallel port's bs = 2 arm, TP4×PP1 — their port state, not ours).
 
 > **The quantity the families add up to: `merged` is a SUM of per-recipe unions, and that is exact.**
 > Because recipes execute sequentially — **cross-recipe overlap is exactly zero** — the **110
@@ -3398,6 +3448,8 @@ as valuable as the wins.**
 | 6 | **"Avoid custom ops" as a heuristic** | **Refuted by the model's own op.** Three arms held customness fixed and flipped the outcome purely on **submission count**: custom op → 0.2217 at 1 submission; custom op → 0.0000 at 2; native op → 0.4179 at 1. The discriminator is the submission count. | **MEASURED** |
 | 7 | **Region coalescing alone** | Grouping 4 layers into one compiled unit **moved no operational count** — the *parameter*, not the region boundary, sets the instance count. | **MEASURED** |
 | 8 | **Launch count / sync count / recipe count as the lever** | r² 0.15 / 0.195 / 0.066, **all with the wrong sign**. | **MEASURED** |
+| 9 | **Reaching the 48 MiB SRAM from your own code** | Every route is closed. `synDeviceMalloc` at an SRAM address returns **`synSuccess` and relocates to DRAM**; `MEMORY_ATTRIBUTE_SRAM` is `// currently not supported`; a TPC kernel **cannot name the address** (32-bit pointers — a 64-bit constant cast to a pointer compiles to `ld_l`/`st_l`, i.e. **local memory**, and *appears to work*); `AuxTensor.sramAlloc` is a **dead field with no readers**. Placement is the compiler's decision, not yours. **Chapter 7** is the whole map. | **MEASURED** |
+| 10 | **A node-count census as a cost model** | Metadata nodes (`Reshape`, `logical_slice_fwd`, `Split`, `Concatenate`, …) are numerous and **absent from the device trace**; conversely a family of 1–3 µs integer nodes can be **30 % of a step** while never reaching a per-node ranking. Node counts have **no device-time implication in either direction** — rank by **engine identity × count × mean duration**. §3.6.4. | **MEASURED** |
 | 9 | **Optimising for "the step is launch/serialization-bound"** | **Two readings exist, and they point at opposite levers — so name both.** *(i) **launch/serialization-bound**: device idle ~80 %, host busy through most of it, ~573 graph launches and ~1048 host syncs per step.* *(ii) **device-occupancy-bound**: the step is ~76 % device-occupancy and the wall tracks device busy.* **These describe different CODE STATES, not two measurements of one** — the 573/1048 numbers are a 2026-09-19/20 `with_stack=True` state ~3× slower than the current one, and the launch/sync/recipe **counts** fail to predict the wall on the current corpus (wrong sign, r² ≤ 0.2) while `merged` fits at r² 0.9999. A later archived fit re-tests the launch-side model directly and **refutes it again** (`Archive/by-date/2026-10-11/node_law/`: wall = k × node-executions gives R² **0.346** through the origin with a per-run `k` spread of **171 %**, against wall = 21.703 + 0.99713 × `merged` at R² **0.99995**). **⇒ Do not optimise for launch count.** But if you are on a code state with the *other* symptom, the other reading is the right one — check which regime you are in before choosing a lever. | **MEASURED** |
 | 10 | **`torch.stack([a, a], dim=-1)` — the same tensor twice** | Costs **22,532 µs vs 301 µs** for two *distinct* tensors — **75×** — on a 50 MB output. It silently destroyed a component benchmark (read 22,500 µs inside a 4,300 µs whole-op measurement). | **MEASURED** |
 | 11 | **Profiling with CPU activity enabled** | Inflates the trace's host span **~3×** and collapsed a queue-depth metric from 23.3 to 1.67, manufacturing a false empty queue. **Use HPU-activity-only profiling.** | **MEASURED** |
@@ -3418,9 +3470,9 @@ subsection in §3.4.1.)*
 additions, not closures.** **Item 21, opened 2026-10-13 by the fp4 LUT promotion (§3.4.8), is now
 CLOSED — the whole-model TP=4 run resolved it (below).** **Item 22 is new, opened 2026-10-13 by the
 two-arm compile gate (§3.6.5), and it is the *bound on that gate's result* rather than a new question.**
-**Item 23 is new, opened 2026-10-21 from a parallel port's batched-decode notes (§3.1.5) — the
-batch-scaling curve has never been measured here, and the mechanism argument is therefore
-**INFERRED** rather than priced.**
+**Item 23 is new, opened 2026-10-21 from a parallel port's batched-decode notes (§3.1.5), and
+HALF-CLOSED 2026-10-24 by that port's own scaling study — its routed-expert mechanism is refuted, and
+what replaces it is measured; what remains open is a `merged`-per-token curve on *our* arm.**
 They are registered here rather than left inside §3.4.7 so that a reader who
 consults this register to find out what we do *not* know gets a complete answer.
 
@@ -3459,7 +3511,7 @@ consults this register to find out what we do *not* know gets a complete answer.
 | **20** | **A like-for-like cost of the vendor fused op against our dequant + fp8-GEMM chain — and its cost at the real production shape.** The only microbenchmark we have compares the vendor **whole fused op** (routing + 2 GEMMs + activation, **0.591 ms**) against our **dequant alone** (**0.409 ms**), so **no ratio may be quoted from it** (§3.4.7); the GEMM term — the term that would make the comparison meaningful — is **not measured at all**. Separately, the shape is **synthetic** (`T = 512, H = 4096, F = 2048`, one expert), not the real production shape with a real expert count. | Build the chain: our `fp4_dequant` **plus** the `fp8_gemm_v2` consumer at the same shape, timed under one protocol; then repeat at the production shape and expert count. *(Opened 2026-10-12; §3.4.7; `Archive/by-date/2026-10-12/fp4-builtin-conformance/REPORT.md` §4.4 and `REPORT.md` §7 items 5–6.)* |
 | ~~21~~ | ~~**Whether the promoted fp4 LUT path is safe — and as fast — end to end on the model.**~~ **CLOSED — RESOLVED 2026-10-13: the whole-model TP=4 decode RAN, it is bit-exact, and it is faster by 1.13× / 1.36× — not 3.853×.** Five arms, one engine process each, **four modules held simultaneously**, W0-anchor config, cold per-arm recipe cache. **Both real tables are bit-exact to the shipped path at model level** — `guarded` and `noguard_floor` each 24/24 token ids and **0 of 3072** logprob cells, `max|d| = 0` — and the tie cells are **reached**: **24 of 132,096 routed (token, layer, slot) events** land on a tie-carrying expert, and the amplified `tieprobe` table moves **24/24 positions**, so the `2⁻⁹ → 0` floor fix is a real, reached correction whose effect is **below the model's bf16 output resolution**. The **end-to-end** speedups are **1.1337× on the decode step** and **1.358× on the prefill step**; the **3.853×** is **kernel-local** (the dequant kernel alone at `[4096,2048]`) and is **not** a model-level speedup. Scope: one 35-token prompt, greedy, 24 steps × 2, `max_num_seqs = 1` — step walls, not throughput, and the prefill figure has **n = 2** (the measured-request-#1 ratio). *(§3.4.8; `Archive/by-date/2026-10-13/fp4-tp4-model-safety/REPORT.md` VERDICT and §2–§7; the earlier block-level and promotion evidence stays at `Archive/by-date/2026-10-13/fp4-lut-promotion-safety/REPORT.md` §5–§6, §9.)* | — **done** |
 | **22** | **The rewrite's per-launch cost — the plan's N4 — is unmeasured, and the two-arm compile gate does not measure it.** The gate (§3.6.5) establishes that the KV-slab staging pass **disappears** when the slab is a declared operand read and written through its base address; it does **not** establish what the replacement kernel costs. Its treatment op is a **skeleton** at the model's geometry (the model itself may not be edited), and the rewrite's floor still carries a per-launch term read off a **harness** kernel (§4.2.10's bundle law), not off model nodes. So *"the staging pass is removed"* is **MEASURED** while *"R costs `0.2324 ms/step`"* remains **DERIVED**. | Compile the **real** fused per-layer kernel at the model's own geometry and read its per-launch term off its own launch, the way §4.2.10's arms were read. *(Opened 2026-10-13 by the two-arm compile gate; §3.6.5; `Archive/by-date/2026-10-13/compile-gate-run/`.)* |
-| **23** | **No measured batch-scaling curve — `merged` *per token* as a function of batch size is unknown, for this model and for any other.** §3.1.5 states the mechanism (on a sparse model the weight set is the **union of the routed experts**, which grows with the batch, so the amortisation is not ~N×) and marks it **INFERRED**; the manual carries **no** measured bs = 1 → 8 step-time or `merged`-per-token curve, and the campaign's own serving arm never ran a concurrency sweep (`--max-num-seqs 1`, sweep **NOT RUN**). A parallel port reports **10.6 / 28.4 / 35.2 ms/step** at bs **1 / 2 / 4** — a data point on their code state, not a curve, and not ours. | One arm at bs = **1, 2, 4, 8**, same code state, reading **`merged` per token** (§3.6.1) — plus the **routed-expert union per step** from the same traces, because that is the quantity that separates "the weights amortised" from "the expert set grew". *(Opened 2026-10-21 from a parallel port's batched-decode notes; §3.1.5.)* |
+| **23** | **HALF-CLOSED 2026-10-24 — the routed-expert half is answered (negatively); the `merged`-per-token half is not.** ~~The mechanism is INFERRED: on a sparse model the weight set is the **union of the routed experts**, which grows with the batch.~~ **REFUTED** by a direct test on a parallel port: routing diversity moves step time by **0.1–0.4 ms** at every n, and **D = 6 vs D = 36** is within **1 %**; the routed MoE explains **at most 1.16× of the step's 3.13×** growth. What the step *is* a function of is the **compiled bucket** — 10.4 / 25.9 / 32.5 ms at buckets 1/2/4, **flat in rows inside a bucket** (§3.1.5). **Still open:** this manual has **no** `merged`-per-token curve **on its own arm** — the campaign's serving arm never ran a concurrency sweep (`--max-num-seqs 1`, sweep **NOT RUN**) — and the parallel port's curve ends at bucket 4 because **bs > 4 does not compile** there. | The original ask stands, minus its second half: one arm at bs = **1, 2, 4, 8** on **our** code state, reading **`merged` per token** (§3.6.1) **and** the bucket each batch size maps to — the bucket, not the expert union, is the quantity to separate "the weights amortised" from "we crossed a step". *(Opened 2026-10-21; half-closed 2026-10-24 by the parallel port's own scaling study; §3.1.5.)* |
 
 ---
 
@@ -3683,7 +3735,13 @@ consults this register to find out what we do *not* know gets a complete answer.
     nothing, so dynamic shapes are not the problem" — and it retires a live hypothesis without
     testing it. *(The knob's definition site: `vllm_gaudi/extension/features.py`; the consumer:
     `vllm_gaudi/utils.py`'s `HPUCompileConfig`, which reads `get_config().dynamic_shapes_compilation`.
-    **Source read.**)*
+    **And "the default is on" does not imply "the default reached *your* graph".** The knob reaches
+    `torch.compile` through exactly **one** consumer — `HPUCompileConfig.__init__` — and a port that
+    passes `dynamic=False` at its own compile site bypasses it completely. A parallel port found
+    exactly that: every layer-group / bucket entry is compiled at a site that hardcodes
+    `dynamic=False`, so `VLLM_T_COMPILE_DYNAMIC_SHAPES=0` changed nothing there — **not because the
+    knob was absent, but because the call site overrode it.** Read the consumer before believing the
+    default. **Source read.**)*
 
 29. **A compile failure surfaces at a FLUSH POINT, not at the culprit — bisect with `synchronize()`
     markers, and two rounds is usually enough.** **MEASURED:** a graph-compile failure presented at a
