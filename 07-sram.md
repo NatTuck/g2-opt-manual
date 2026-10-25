@@ -8,9 +8,10 @@ request a buffer.
 
 This chapter is worth reading before you plan anything that assumes SRAM, because **every obvious
 route to it is closed and most of them fail without an error** (§7.4). It is also worth reading if you
-have already decided SRAM is irrelevant: on a batched MME workload it is worth roughly **20 % on min
-iteration time** (§7.6), and it is the only lever in this manual that changes *where bytes live*
-rather than how they are moved.
+have already decided SRAM is irrelevant: **it should be significantly faster than HBM for a compute
+engine, and we have not yet demonstrated that** (§7.6). It is still the only lever in this manual that
+changes *where bytes live* rather than how they are moved, and the chapter gives you the two ways to
+put bytes there yourself (§7.3.2) and the ladder for proving what the compiler placed (§7.5.4).
 
 > **Provenance for this chapter.** The measured results were taken on a **parallel port of the same
 > model, on the same 4-AIP Gaudi 2 hardware**, by the project that shares this manual's measurement
@@ -287,16 +288,40 @@ placed can lose placement entirely.
 into per-expert GEMMs plus a `cat`, it will **not** get SRAM placement even though the same shapes do
 when built as a single `bmm`. **Check the construction, not the shape.** **MEASURED**
 
-### 7.3.2 A TPC's aux tensor: the one route you can drive directly
+### 7.3.2 Using SRAM directly: the two routes that work
+
+Placement is the compiler's decision (§7.3.1, §7.3.3). But SRAM is not sealed off: there are **two
+verified routes** by which you can put bytes there yourself and read them back. **Neither of them
+places a tensor** — they populate and observe, while the compiler decides what lives where. Keep that
+distinction, because it is the one that gets lost.
+
+#### (a) Host DMA to a raw address
+
+The aperture is in the same "driver device map" address space that `synDeviceMalloc` hands out, so
+`synMemCopyAsync` reaches it at a raw address. **MEASURED:** with every host buffer from
+`synHostMalloc`, it round-trips **byte-exactly** into `SRAM_BASE + 1 MiB`, and at **five** separate
+in-window offsets (1 / 2 / 4 / 8 / 16 MiB), **each reading back its own distinct pattern** — so it is
+the real aperture, not one shadow page. Pre-existing content at `SRAM+1 MiB` was non-zero and
+structured (`0x40000e38, 0x40000dbc`); it was overwritten and **restored exact**.
+
+> **This retracts an earlier conclusion, and the retraction is the useful part.** A previous probe got
+> `synMappingNotFound (34)` and concluded *"SRAM is not DMA-addressable."* **Code 34 is returned when
+> the *host* side of the copy is ordinary heap rather than `synHostMalloc` memory** — it says nothing
+> about the device address. The old test passed a Python ctypes array. **A return code is a statement
+> about the call, not about the address.**
+
+**The host staging buffer must come from `synHostMalloc`.** That is the whole of the trap.
+
+#### (b) A TPC via an aux tensor
 
 `AuxTensor.sramAlloc` is documented as *"This flag instruct GC to allocate the aux tensor in SRAM
-memory"* and is a **dead field** — one declaration, no readers anywhere, and three GUIDs differing only in
-`(sramAlloc, noInit)` produced an **identical** recipe address. **Do not use it.**
+memory"* and is a **dead field** — one declaration, no readers anywhere, and three GUIDs differing
+only in `(sramAlloc, noInit)` produced an **identical** recipe address. **Do not use it.**
 
 What actually decides aux placement is whether the buffer has data, and its size:
 
 ```
-pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB)   ⇒ SRAM
+pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB)   => SRAM
 ```
 
 `noInit` controls **initialisation**, not placement. **MEASURED**, same ELF and same glue, only
@@ -309,20 +334,26 @@ pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB)   �
 | 12 MiB | **no SRAM address** | 25,166,080 B |
 
 So the usable ceiling is **~10 MiB per aux tensor** — *per tensor, not per node* — against a 48 MiB
-aperture shared with every TPC and every concurrent kernel. Two SRAM aux tensors in one graph get
-distinct contiguous buffers (`+0x80000` and `+0x81000`); **no collision**. **MEASURED**
+aperture shared with every TPC and every concurrent kernel.
+
+**And it works end to end. MEASURED:** the aux tensor lands at `0x1000fffffd080000` inside the
+aperture, the kernel writes `0x5A5A1234` **through its descriptor**, and the host DMAs those exact
+bytes back from that address. Reproduced **3x**. Host -> SRAM -> compute engine, all three legs. Two
+nodes in one graph, each with its own 4 KiB SRAM aux, get addresses `SRAM+0x80000` and `SRAM+0x81000`
+— delta exactly `0x1000`, each signature found exactly once. **No collision.**
 
 **What this buys, stated plainly:** a declared **scratch buffer** up to ~10 MiB. It is **not** a way
-to hold model weights. It pays off only for a span whose working set is small, hot and
-bandwidth-bound.
+to hold model weights, and it is **not** a way to place a tensor. It is how you get a small hot buffer
+somewhere you can prove, and it is one of the instruments for proving that the compiler's own
+placement is real (§7.5.4).
 
-**And the header comment on the neighbouring field is wrong too:** `auxiliaryTensorNr` is documented as
-*"will be set by GC to MAX_AUX_NUM"* and arrives as **0** on first instantiation. A glue that treats
-it as a capacity and returns `GLUE_FAILED` surfaces as **`synGraphCompile → synFail (26)` with a
-0-byte build log**. The array is a real `std::array<AuxTensor, MAX_TENSOR_NR>`; index 0 is always
-writable. **Do not gate on the incoming value.**
+**And the neighbouring header comment is wrong too:** `auxiliaryTensorNr` is documented as *"will be
+set by GC to MAX_AUX_NUM"* and arrives as **0** on first instantiation. A glue that treats it as a
+capacity and returns `GLUE_FAILED` surfaces as **`synGraphCompile -> synFail (26)` with a 0-byte build
+log**. The array is a real `std::array<AuxTensor, MAX_TENSOR_NR>`; index 0 is always writable. **Do
+not gate on the incoming value.**
 
-### 7.3.3 Graph tensors — the mechanism that matters, and it has no user-facing request
+### 7.3.3 Graph tensors — the mechanism that matters, and no route to it that we could find
 
 A graph tensor *can* be SRAM-resident, and this is the only route that can serve an **MME** (an aux
 tensor is a TPC-only mechanism — it arrives as an extra kernel parameter, so an MME cannot read one).
@@ -354,8 +385,8 @@ Each of these was tried and refused. Two of them **fail silently**, which is why
 | route | result |
 |---|---|
 | `synDeviceMalloc` at a requested SRAM address | returns **`synSuccess`** and hands back a **DRAM** address. The header says the request is *"a hint"* and that malloc *"will succeed regardless"* — **the returned-address comparison is the only thing that catches it.** |
-| `synTensorSetDeviceAddress` / `synSectionSetDeviceAddress` | **do not exist** |
-| `MEMORY_ATTRIBUTE_SRAM = 4` | `// currently not supported` |
+| `synTensorSetDeviceAddress` / `synSectionSetDeviceAddress` | **not declared in the shipped headers** — a search, not a proof of absence |
+| `MEMORY_ATTRIBUTE_SRAM = 4` | **untried, not refuted** — the only support for this row is a header comment (`// currently not supported`), and a header comment is not evidence (§7.3.2). Nobody has tried it. |
 | a TPC kernel computing the address | **impossible, and silently wrong** — see below |
 | `AuxTensor.sramAlloc` | **dead field** (§7.3.2) |
 | asking the orphaned memory-strategy optimizer | **dead code** (§7.2.1) |
@@ -467,90 +498,83 @@ drift; only a floor tells you whether the delta is real.
 
 ---
 
-## 7.6 What it is worth
+### 7.5.4 Verifying that a tensor is actually in SRAM
 
-**The claim to carry, stated so it can be defended:** *SRAM placement of an MME weight operand
-lowers min iteration time on a batched MME GEMM, typically by **~15–25 %**. The effect is real, but
-it is **not a hard separation**.* **MEASURED** (a parallel port; artifacts unpublished)
+**Placement fails silently** — the graph still runs, just from HBM — so "I think it's in SRAM" is
+worth nothing. There is a ladder of instruments; each proves something different, and each has a trap.
 
-The evidence — **10 gated runs per arm** at 50 iterations, interleaved, same graph, same work, only
-placement differing, **pooled across 20 runs**:
-
-| arm | min µs range | CV |
+| instrument | what it proves | its trap |
 |---|---|---|
-| **SRAM** | **353.0 – 423.4** | ~7 % |
-| **control** (slicing off) | **411.3 – 1096.3** | ~50 % |
+| `[SRAM_SOL_GEN]` **`inSram: true`** plus the slice/buffer line | the slicer placed **this** operand | valid only after a **completed log delta** — the compiler is asynchronous (§7.5.1) |
+| `[EPOCH_ALLOC]` `Allocate N Tensors in Sram` / `epoch size:` | how much actually went to SRAM | 0 bytes is not "no slicing" until the give-up line is present |
+| **`No slicing dims were found`** | placement was **attempted and refused** | this is the *positive* evidence of a silent failure — the most useful line in the log |
+| `maxRange.size` | the budget actually in force | must be identical across arms, or the clamp did not take (§7.2.3) |
+| post-graph dump `"allocation": "SRAM"` | a tensor is section-backed in SRAM | a **graph-node** fact, not runtime occupancy — and it needs a cold cache, since a hit builds no graph |
+| a scan of the recipe for 64-bit values inside `[SRAM_BASE, SRAM_BASE + 48 MiB)` | a recipe carries SRAM addresses | **under-reports**: one base at a fixed offset, with per-node placement as base-relative patch data |
+| **`synRecipeSerialize`** → scan the written file for in-window 64-bit values | the aux tensor's **actual device address** | the check that separates real placement from a silent fallback — one in-window value at a fixed offset here, none in the DRAM window |
+| **a runtime signature scan** — write a known pattern into the aperture and DMA it back | the aperture is real and yours to populate | needs `synHostMalloc` staging; a plain heap buffer returns 34 and tells you nothing (§7.3.2) |
+| re-gating `inSram` on the **exact graph** | *this* graph placed, not one that looked equivalent | construction decides placement, not shape (§7.3.1) |
 
-**Typical min improvement is ~15–25 %, and the pooled extremes OVERLAP** — the best control run beat
-the worst SRAM run. So this is **a real effect, not a hard separation**; on median the distributions
-overlap in some pairings and separate in others. *(An earlier, smaller sample — 5 runs per arm —
-showed no overlap on min at all. The larger sample does not support that, which is why the smaller
-one is not quoted here.)*
+**The principle under all of them, and it is the transferable part:** *require a property the wrong
+explanation cannot produce.* An address inside the aperture. A byte-exact host DMA match. `st_g`
+rather than `st_l` in a TPC listing. A fault that the alternative explanation would also have produced
+proves nothing.
 
-> **Do not quote a single percentage as a floor.** "~24 %" was one pairing in the small sample and
-> "~20 %" was that sample's typical; the larger sample's typical is **~15–25 %**, and its worst
-> pairing sits inside the overlap. **Quote the range, and say the distributions overlap.**
+## 7.6 What it is worth — and why we cannot price it yet
 
-**Budget pressure is real, and the case that matters was exercised.** The test weight was **47.2 MB**
-against a **~47.25 MB** budget — it fits **only** by 3-way slicing with double buffering (epoch
-40.0 MB), and placement did not degrade. That is the configuration worth knowing about: a tile that
-*just* fits.
+**The position this chapter takes, and it is a position rather than a result:**
 
-**An unexplained finding, and it may be the real value.** The control arm is **heavy-tailed** — CV
-50 % against SRAM's 7 % — with two outliers of 560 µs and 1096 µs across 20 control runs while SRAM
-never left 353–423 µs. If that tail is intrinsic, SRAM's benefit is partly the **removal of
-occasional 2–3× slow iterations**, which would matter far more for tail latency than for the mean.
-**Not established.**
+> **SRAM should be significantly faster than HBM for a compute engine that reads from it. We have not
+> yet demonstrated that.**
 
-**The instrument matters, and two things about it were learned the hard way:**
+**Why we expect it.** The design intent is explicit — the vendor's architecture page says the SRAM has
+*"sufficient bandwidth to allow MME, TPC, DMAs and RDMA NICs to operate in parallel"* — and on-die
+memory being slower than off-die HBM is not credible. The compiler is built for it too: `m_mmeBundles`
+exists specifically to slice MME operands so they fit in SRAM, and `flatten_mme` propagates SRAM
+placement onto MME operands (§7.2.1). **ASSUMED** — design intent and source read, not a measurement.
 
-- **`torch.hpu.Event(enable_timing=True)` works and has `elapsed_time()`.** Recording events around
-  the call and synchronising afterwards cut the spread enough to resolve a delta; **wall-clock around
-  `synchronize()` did not.**
-- **Repeating identical work inside a compiled region does not raise the timed unit.** `--repeat 4`
-  gave 351 µs and `--repeat 8` gave 345 µs — identical — because `torch.compile` CSEs the copies.
-  To raise the timed unit you must **vary** the work, not duplicate it.
+**Why we cannot price it.** The A/B experiments behind this chapter do not resolve the effect, and
+each of the following is independently disqualifying:
 
-**And the floor is workload-dependent — re-measure it per graph.** On a 2.1 ms workload it was ±3 %
-on min; on this 0.4 ms one it is **~10 %** for the SRAM arm and **~30 %** for the control. **A floor
-carried across graphs is not a floor.**
+- **The sample is small and the arms overlap.** Five to ten gated runs per arm, and the pooled ranges
+  of the SRAM and control arms **overlap** — the best control run beat the worst SRAM run. A direction
+  read out of that is a direction read out of noise.
+- **The gate those runs rest on is a log read, and log reads are racy.** The compiler is asynchronous
+  and its placement lines land **seconds** after `synchronize()` returns (§7.5.1). The source's own
+  later note is blunt: *"every placement reading in this project was exposed to this, **including
+  readings reported as facts**."*
+- **The arms cannot be interleaved in one process.** Capacity is latched before the first compile
+  (§7.5.3), so an in-process A/B is dead; any interleaved run needs one process per arm.
+- **The measured span may not be the span that matters.** One arm is a `mul`-producer bf16 GEMM graph;
+  another is a compute-bound dequant span where slicing adds double-buffer overhead and there is
+  nothing to win. **Neither is a production decode step**, and neither result transfers to the other.
 
-### 7.6.1 The negative result: none of this transfers to the dequant span
+**So no number is quoted, and that is a decision rather than an omission.** A chapter that says
+"~20 %" gets built on, and the person who builds on it has no way to know the gate was racy. A chapter
+that says *we expect it and have not shown it* sends the reader to the measurement, which is where the
+answer is. **§7.8 item 2 is that measurement.**
 
-**Read this before planning around SRAM, because it closes the obvious next idea.**
+### 7.6.1 What a valid measurement must satisfy
 
-The same A/B, run on the **fused fp4→fp8 dequant span** — the span that actually materialises the
-expert weights — both arms gated (`inSram: true` = 3 vs 0):
+This is the part of the work that **is** solid — several of these were learned by getting them wrong —
+and any future measurement of this effect has to meet all of them:
 
-| arm | min µs (5 runs) | mean | range |
-|---|---|---|---|
-| **SRAM** | 316.88, 327.65, 304.22, 302.94, 297.81 | **309.90** | 297.8–327.7 |
-| **control** | 284.31, 319.89, 295.34, 255.58, 280.62 | **287.15** | 255.6–319.9 |
-
-**SRAM is 7.9 % SLOWER on mean min, and the ranges overlap.** The delta is inside the control's own
-floor **and it is the wrong sign**; medians are not resolvable either — one outlier flips the sign
-between 6.2 % faster and 12.2 % slower.
-
-**The best explanation, and it is derived rather than measured:** that span is dominated by the
-dequant **compute**, not by HBM traffic on the tile, so relocating the tile removes little and adds
-slicing and double-buffer overhead. The arithmetic agrees — writing 37.50 MB at 873 GB/s is ~43 µs
-and reading it at 1,889 GB/s ~20 µs, i.e. **~63 µs of a ~300 µs span: roughly 21 % traffic, 79 %
-compute.** There is no large traffic win to collect.
-
-> **⇒ The consequence, plainly: avoiding HBM materialisation of the fp8 tile is NOT the lever for that
-> span. The dequant compute is.** The ~15–25 % above was measured on a `mul`-producer bf16 GEMM
-> graph; **it does not transfer**, and a reader who carries it over will spend a week on a span where
-> the effect has the wrong sign.
-
-**A second negative result, about method.** An earlier A/B showed **no** measurable benefit — 1.0 %
-faster on min, inside the floor — and the reason was **the graph, not SRAM**: it regenerated its
-47 MB weight with `torch.randn` *inside* the compiled region every iteration, so the timed region was
-dominated by weight generation and the saving on the weight *read* was diluted below resolution.
-**The instrument was fine; the graph was wrong.** The fix was a producer chain that costs nothing
-*extra* — one elementwise pass, not a view, since a view does not qualify (§7.3.1) — which is also
-the production-relevant shape.
-
----
+1. **One process per arm.** Capacity is latched before the first compile (§7.5.3).
+2. **Interleave at process level** (`A,B,A,B`), and **measure the noise floor for the graph you are
+   measuring.** It is workload-dependent: ±3 % on a 2.1 ms graph, ~10 % / ~30 % on a 0.4 ms one. **A
+   floor carried across graphs is not a floor.**
+3. **Gate every run on a completed log delta**, never on a log read taken after `synchronize()`
+   (§7.5.1) — and assert the gate's own reading, for the arm you believe you are in.
+4. **Time with `torch.hpu.Event(enable_timing=True)` and `elapsed_time()`.** Wall-clock around
+   `synchronize()` did not resolve a delta; events did.
+5. **Do not try to raise the timed unit by repeating the work.** `--repeat 4` gave 351 us and
+   `--repeat 8` gave 345 us — identical — because `torch.compile` CSEs identical subgraphs. **Vary**
+   the work instead.
+6. **Quote min and median together, and compare distributions, not single pairs.** A single pairing
+   can differ by 2 % while the arms differ by 20 % typically.
+7. **Re-gate placement on the exact graph every time.** Whether a tensor is placed at all depends on
+   the graph's **construction**, not its shape (§7.3.1) — so a span that looks equivalent to one that
+   was placed can lose placement entirely, silently.
 
 ## 7.7 Safety: how to brick a card, and how not to
 
@@ -604,7 +628,7 @@ this table is the raw mapping.)
 | # | open | what would settle it |
 |---|---|---|
 | 1 | **Whether the MME can read SRAM at the hardware level.** The compiler evidence is strong (`m_mmeBundles`, and `flatten_mme` propagating SRAM onto MME operands), and §7.6's result is consistent with it — but a clean isolated MME-from-SRAM bandwidth test has not been run. | A kernel pair differing only in operand placement, with `inSram: true` gated, at a size large enough to be bandwidth-bound. |
-| 2 | **Whether SRAM is actually faster than HBM for a compute engine, as a bandwidth figure.** Unmeasured. The one per-TPC number on record (1.24 GB/s SRAM vs 1.02 GB/s DRAM, 1.21×) came from a single TPC doing scalar accesses with index-space parallelism held at 1 — **not a bandwidth figure**. Host DMA into SRAM is PCIe-bound at ~19 GB/s and says nothing. | Keep the kernel body fixed and vary TPC parallelism; report GB/s per engine, not an aggregate. |
+| 2 | **Whether SRAM is faster than HBM for a compute engine, and by how much — THE question, and the reason this chapter quotes no speedup (§7.6).** Unmeasured. The one per-TPC figure on record (1.24 GB/s SRAM vs 1.02 GB/s DRAM, 1.21×) came from a single TPC doing scalar accesses with index-space parallelism held at 1 — **not a bandwidth figure**. Host DMA into SRAM is PCIe-bound at ~19 GB/s and says nothing. The A/Bs that exist are small-n, gated on racy log reads, with overlapping arms. | A per-engine bandwidth test — keep the kernel body fixed, vary TPC parallelism, report GB/s per engine rather than an aggregate — **and** a span A/B meeting every item in §7.6.1. |
 | 3 | **Whether the orphaned memory-strategy optimizer works on Gaudi 2.** It has never executed in 1.24.2. If `STATIC_TENSORS_PREFETCHED_ACT_IN_SRAM` worked, **all activations** would leave DRAM — a much larger prize than any single tensor. | Call it behind a flag on a small graph and check `maxRange.size` and `inSram` counts against the slicer's. |
 | 4 | **Whether production model weights actually land in SRAM.** They are persistent parameters (§7.3.1's *run A*), but production MoE weights are **produced by the fp4→fp8 dequant**, which is arithmetic — so they are *structurally* placeable (a **derived** inference, not a measurement). §7.3.1's construction finding then decides it: a single `bmm` places, per-expert GEMMs plus a `cat` does not. So this is **plausible but unproven**, and it depends on how the model builds the graph. | `inSram: true` gating on the **real** engine graph, per layer, with the construction named. |
 | 5 | **How much of the 48 MiB a real decode step can hold.** The aux route caps at ~10 MiB per tensor and the slicer's own budget is ~47.5 MB, but what fraction a production graph can *use* before fragmentation binds is unmeasured. | Sweep `SRAM_SLICER_MAX_CAPACITY_BYTES` on a real graph and read the placement the slicer achieves at each cap. |
@@ -633,8 +657,8 @@ this table is the raw mapping.)
    elementwise pass, not a view.
 6. **Observe, do not request.** Gate on `inSram: true` and on `maxRange.size`; treat a 0-byte
    `graph_compiler.log` as a capture failure; interleave the arms.
-7. **What it is worth: ~15–25 % on min iteration time, and the distributions OVERLAP** — a real
-   effect, not a hard separation. **It does not transfer to the dequant span, where it is 7.9 %
-   slower** (§7.6.1). The noise floor is workload-dependent; re-measure it per graph.
+7. **SRAM should be significantly faster than HBM for a compute engine, and we have not demonstrated
+   it.** The A/Bs we have are small-n, gated on racy log reads, with overlapping arms — so **no
+   speedup is quoted**, and §7.6.1 is what a valid measurement must satisfy.
 8. **A return code is not a measurement, and here it costs a card.** `synMemCopyAsync` accepts any
    address and faults asynchronously.
