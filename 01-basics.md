@@ -372,7 +372,7 @@ tied to any particular implementation.
 | level | size | scope | basis |
 |---|---|---|---|
 | **HBM2E** | **96 GiB per HPU** | per card | **MEASURED** |
-| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — MME/DMA staging | **source read** |
+| **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — compiler-scheduled slicing of MME operands (**[chapter 7](07-sram.md)**) | **source read** |
 | **TPC local memory** | **1 KB scalar + 80 KB vector** | **per TPC core, private** | **ASSUMED** (vendor documentation) |
 | **L1 / L2 data cache** | — | **there is none** | **ASSUMED** (vendor documentation) |
 
@@ -434,6 +434,10 @@ overview and the whitepaper pages return the same three levels and never a cache
 > must be **engineered** — tiled into local memory, or staged through SRAM — or it does not
 > happen. That is the single most important consequence of this section for a bandwidth model, and
 > it is why the figures in §1.6 are *stream* bandwidths rather than cache-resident ones.
+
+**This section establishes the level and its size. The operating manual for it is
+[chapter 7](07-sram.md)** — what actually reaches SRAM, what decides placement, how to observe it,
+what it is worth, and the routes to it that are closed.
 
 ---
 

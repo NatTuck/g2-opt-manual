@@ -106,6 +106,15 @@ collective if it is **aligned across the ranks that take part** — tested again
 
 ---
 
+**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot address it from your
+own code.** Placement is decided by **graph structure** — a tensor needs a real *compute* producer (a
+view does not qualify) — not by any request you can make. Every obvious route to it is closed and most
+fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
+appears to work. **Observe, do not request** — and read the chapter before you plan around it. On a
+batched MME workload it is worth **~20 % on min iteration time**. → *[Chapter 7](07-sram.md)*
+
+---
+
 **Tagging convention** (used throughout): **MEASURED** / **ASSUMED** / **INFERRED** /
 **UNKNOWN**. See `README.md`. The numbers above are from one workload on one box — treat the
 *shape* of each fact as general to Gaudi 2 and the specific figures as that workload's.
