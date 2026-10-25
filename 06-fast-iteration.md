@@ -274,6 +274,48 @@ of something, because per-iteration noise averages out over the repetitions.
 
 ---
 
+### 6.3.3 When the span is on a batch path, audit the `== 1` gates first
+
+**The highest-yield structural finding in this workflow, and it is not a span at all.**
+
+A decoder that has a fast **single-request** path and a separate **multi-request** path will, over
+time, accumulate specialisations on the single-request side that the batch side never receives. Ours
+had three, and **all three were `== 1` tests on a performance path**:
+
+| gate | consequence |
+|---|---|
+| `tokens == 1` → a 6-row expert kernel instead of the width-generic one | **+70 launches, ~909 µs** |
+| `value.shape[0] == 1` → one packed MLA op instead of three | **~1.07 ms** |
+| a per-selection layout cache that only the single-row path effectively shared | **3.8–4.2 ms of span** |
+
+**The tell is that the gate sits on a *compute* path and its justification is a *shape*, not a
+capability.** `shape[0] == 1` on a kernel whose only real difference is scalar → vector scale, where a
+vector is a **strict generalisation** of a scalar, is a gate written for the one-row case and never
+generalised.
+
+**⇒ A standing audit, and it is cheaper than any one of the fixes it finds:** enumerate every
+`shape[0] == 1`, `tokens == 1`, `numel() == 1`, `batch == 1`, `size(0) == 1` on a performance path and
+classify each as
+
+- **capability** — the kernel genuinely requires it (a fixed SRAM or weight layout), or
+- **accident** — written for the single-request case, never generalised —
+
+then rank by cost. **In our case three of the four largest levers were instances of it.**
+
+**Two rules for the classification, both learned the hard way:**
+
+1. **Never call a gate an accident without reading the kernel it guards.** A wrong verdict becomes a
+   **silent correctness bug**.
+2. **Reconcile attribution across instruments before editing.** Ours had the recipe's own node names
+   naming one kernel and the torch trace naming another for the **same call** — and that
+   **disagreement was the finding**, not a nuisance to resolve.
+
+**⇒ It is also the systematic form of the right question for a batch path.** Not *"what is slow
+here"*, but **"what does the single-request path not pay for, and why does the batch path still pay
+it?"**
+
+---
+
 ## 6.4 The conceptual task: an optimal rewrite against a ceiling
 
 Once the span is chosen, the job is **not** "make it faster". That has no target and no stopping
@@ -455,6 +497,22 @@ A capture missing the attention buffers is short by exactly the persistent, sect
 and the diff says so. **A capture that matches the recipe's own tensor table cannot be missing an
 input** — that is the strongest statement available, and it is cheap.
 
+### 6.5.2 A span whose body runs at CAPTURE time cannot be sampled per step
+
+Some spans do not run where you think. If the Python body executes during `torch.compile` **tracing**
+— a preamble that computes index tensors, say — then a per-step capture yields **fake tensors rather
+than values**, and samples can only come from **distinct capture events**. A harness that captures per
+step and expects per-step data will silently compare fakes.
+
+**When the span is pure host arithmetic on index tensors, do not build a device harness for it at
+all.** Capture only the **inputs**, and re-run the body **eagerly in the harness**. That makes the
+harness **CPU-only** — and a CPU-only harness for a 30.5 % span (§3.6.4) is worth more than a device
+harness for it: it runs in milliseconds, needs no card, and iterates as fast as you can edit.
+
+**This chapter does not otherwise suggest CPU-only as an option, and it should.** "Is this span host
+work or device work?" is the first question to ask about a span, because the answer decides whether
+the harness needs the engine at all.
+
 ---
 
 ## 6.6 Step 3b — build the correctness gate
@@ -479,6 +537,170 @@ the result. State the tier and the number, then run.
 the ordered-integer key differs per format. Use a per-format instrument, not a generic
 `abs(a-b) < tol`.
 
+### 6.6.1 The gate must run the region the engine runs
+
+**An eager harness measures a different program, not a cheaper version of the same one.** This
+project has measured that gap at **400×** — an expert kernel at **29 ms eager against 0.356 ms
+compiled** — so an eager number is **not a lower bound** on the compiled number and cannot stand in
+for it. Worse, and this is the defect that motivated this subsection: **an eager pass says nothing
+about whether the compiled path exists at all.**
+
+The case. A change to a `torch.compile`d decode path was gated by a **bit-exact CPU harness that
+called the layout function directly**. **All 38 cases passed.** The change keyed a cache on
+`id(tensor)`, and after that was fixed, on `base[0] is selected`. The first site is **uncompilable**;
+the second is worse — it compiles and is **silently arbitrary**. **Every engine run of that tree died
+in the batch path before producing a number**, and the eager gate never noticed.
+
+```
+torch._dynamo.exc.Unsupported: Comparison on compile-time-only id or hash value
+```
+
+**Four statements, and the fourth is the one people skip:**
+
+1. **Identity is a host-side property. A traced tensor does not have one.** No cache inside a traced
+   region may be keyed on `id(tensor)`, on `tensor is x`, or on a dict/set membership test over a
+   tensor. Key on something the tracer can see as a **constant** — an `int`, a `str`, a layer index, a
+   geometry id computed from config at construction — and **thread it in as an argument**.
+2. **The `id()` crash is the lucky case, and it is conditional.** It fires when the tensor is
+   **produced inside** the traced region. `id()` of a **passed-in** tensor does **not** raise — so a
+   negative control built that way passes on the buggy construct and proves nothing. *(Verified
+   independently on torch 2.13, CPU-only: an in-region `id()` used in a **comparison** raises
+   `Comparison on compile-time-only id or hash value`; the same `id()` used as a **dict key or
+   membership test** raises `Reconstruction of FakeIdVariable`. **Which message you get depends on
+   how the id is USED, not on where the cache lives** — so do not teach the message, teach the
+   construct.)*
+3. **An identity test that does not crash is not therefore correct.** `base[0] is selected` traces
+   **silently**, and on that build its compiled result *matched* the eager branch — because dynamo
+   reuses its wrapper object across calls, so `is` compared `True` by accident. **Under dynamo such a
+   test is not reliably `False`, it is arbitrary:** the value depends on wrapper identity and call
+   ordering. That is strictly worse than the crash — invisible to every eager gate, wrong but
+   plausible, and **no traceback to follow**. **A reader who learns only "identity tests crash" will
+   not go looking for the silent one.**
+4. **So the gate must run the region the engine runs.** A correctness gate on a compiled span needs
+   **(a)** the function under `torch.compile` with the **engine's own dynamic-shape config**,
+   **(b)** a **pre-warm that actually executes the compiled graph**, so a dynamo `Unsupported` raises
+   *in the harness*, and **(c)** the bit-exact comparison made **against the compiled output**. Eager
+   output may be compared too, but it is the weaker arm and must not be the only one.
+
+**Pre-warm is not "call it twice".** With `dynamic=True` dynamo traces once static and once dynamic,
+so the second call **re-traces by design**; **three** calls were needed before the graph count stopped
+moving. And the evidence that the compiled path ran must come from **dynamo's own counters**
+(`unique_graphs`, `calls_captured`) — **not** from a counter mutated inside the body, because that
+mutation is itself a side effect dynamo re-traces on, and it defeats the cache it was meant to
+observe. Assert: the final call captures **no new graph and no new calls**.
+
+**Validate the negative control, or you have no gate.** A control that *passes* on the buggy construct
+is indistinguishable from a gate that works — ours passed on its first attempt. The control must be
+run against the **pre-fix** code and must **fail there, for the reason you claim, with the message you
+expect**.
+
+> **And when a region will not compile, first ask whether the assertion is telling you the truth.** The
+> third blocker in the same span was a `TORCH_CHECK` in a custom op's meta function. The tempting fix —
+> relax the check to concrete sizes only, or shadow it with a lenient `register_fake` — would have
+> turned a loud wrong-shape bug into a **silently wrong decode**. The check was right: the caller
+> passed a length tensor with one entry where the query had two rows. **A compile failure is a
+> symptom; relaxing the assertion that raised it treats the symptom.** The tell is arithmetic you can
+> do by hand from the operands in the error — `q = (2,16,512)`, `length = (1,)`, and the check wants
+> `{q.size(0)}`. **If the numbers disagree, the bug is upstream of the compiler.** Do not relax an
+> assertion you have not first shown to be wrong.
+
+### 6.6.2 No tensor cache inside a traced region — a hit is a baked constant
+
+**The sharpest correctness trap in this chapter, and it is invisible to every gate that does not
+execute the compiled region.**
+
+A dict entry **written on one call and read on a later call inside a traced region is a graph
+constant.** Measured, `backend="eager"`, `dynamic=True`, `fullgraph=True`, CPU only:
+
+```python
+CACHE = {}
+def cached(x):
+    hit = CACHE.get("k")
+    if hit is not None:
+        return hit * 2          # <- on a HIT this is a baked constant
+    CACHE["k"] = x + 1
+    return CACHE["k"] * 2
+```
+
+| call | result | |
+|---|---|---|
+| write-then-read **within one call** | `22.0` / `202.0` for inputs 10 / 100 | follows the data |
+| read on a **hit**, across calls | `2.0` / `2.0` for inputs 10 / 100 | **the input is ignored** |
+
+**The hit is what bakes.** And the hazard is worse than two calls: put **two uses of the same cached
+helper inside one traced region** and the *second* use reads what the first wrote, during the same
+trace. Measured — a region calling `inner(x) + inner(x + 1000.0)`:
+
+| clear point | `outer(10)` | `outer(20)` | correct |
+|---|---:|---:|---|
+| **none** | 44.0 | **44.0** | 2044 / 2084 — input ignored **entirely**, across calls |
+| **top of the traced region** | 44.0 | **84.0** | still wrong — the **in-trace** reuse survives |
+| **top of each use** | **2044.0** | **2084.0** | correct |
+
+**So "clear the cache at the top of the traced body" does not make it safe** — a per-*region* clear
+fixes the cross-call staleness and leaves the reuse **inside** the trace. The mechanism is that the
+clear executes **once per trace**, at trace time, while the hit lands on a **later use in the same
+trace**. Only a per-use clear, or no cache at all, is safe.
+
+**Rules:**
+
+1. **No cache of tensors may live inside a traced region.** Share work by **threading tensors between
+   callers as graph arguments** — the way a hidden state or a selection tensor is already threaded —
+   never through a dict.
+2. **A per-region clear is not a fix** (the table above). Do not adopt one as a safety measure.
+3. **The symptom is not a crash.** In the production case a row layout built at one batch size was
+   returned for another batch's data, and the shape assertion two layers down is what caught it —
+   which is an argument for **keeping** such assertions, not relaxing them (§6.6.1).
+4. **Phrase the rule as a property of the tracer, not of this model:** a Python-level container
+   consulted inside a traced region is a source of **constants**, not of values.
+
+> **The corollary that cost the most: a bit-exact gate on self-consistent inputs cannot detect a
+> mechanism error.** The gate for this change verified that the shared layout equalled a freshly
+> computed one — true, and irrelevant, because on a hit the value was a baked constant. **Both sides of
+> that comparison were self-consistent.** The only case that finds this class is **same shape,
+> different data**: compile once, call twice with different *values*, and compare each result against
+> the reference. That is a **required case class** for any gate on a span that reads state, memoises or
+> caches — not an anecdote, and not something a larger matrix of self-consistent inputs can substitute
+> for. It is a property of the **inputs**, not of the assertion.
+
+[`examples/06-workflow/traced_state_gate.py`](examples/06-workflow/traced_state_gate.py) is this
+section as a runnable, CPU-only gate with a `--selftest` that fails on the buggy construct.
+
+### 6.6.3 A green gate is evidence about its case matrix, not about the code
+
+**Three times in one day a gate passed on code that could not run, and each time the assertion was
+fine. The defect was always what the gate never tried:**
+
+| gate | passed | what it could not see |
+|---|---|---|
+| eager bit-exact, 38 cases | on **uncompilable** code | the region is traced; nothing compiled it |
+| compiled arm, 38 + 4 cases | on a cache with **no lifetime** | every case built *and* consumed at one batch |
+| `source/`-grep for `id(` | cleanly, on the tree that then died | the construct was not textual |
+
+**The last one is the important one, because it is the cheap check everyone reaches for.** A
+mechanical backstop — walk the AST of the run's own `source/` snapshot and reject `id(...)` and any
+non-`None` identity test inside the traced function — is **necessary but not sufficient**. **Not a
+grep:** a docstring that *describes* `id(tensor)` is not a construct, and `x is None` is legitimate; a
+textual version produced **19 false positives on a correct tree**, which is how a backstop gets
+switched off. And even a correct AST check catches **only the textual class** — an op whose meta
+asserts a shape the caller gets wrong is not a textual defect and **no grep can see it. The only thing
+that catches that class is executing the compiled region.**
+
+**Two corollaries:**
+
+1. **A gate's inputs must include the inconsistent ones.** Every row-layout case built its layout and
+   consumed it at the **same** batch, so a **cross-geometry reuse** was invisible — and the bug's
+   trigger was precisely a pair of inconsistent steps. **Ask what state can differ between the two
+   calls.**
+2. **"Passes" is a statement about the matrix.** A gate is not strengthened by more assertions on the
+   same inputs; it is strengthened by **a case the bug would fail**. The cheap way to find one is to
+   **write the negative control first** and check it fails on the pre-fix code — which is how the
+   `id()`-vs-`is` distinction was found, after a first control that passed on the bug.
+
+**State the matrix in terms of the transitions the production path can actually take** — geometry
+changes, cache reuse across geometries, first-use vs steady state — **not in terms of input
+variety.** Bit-exactness over the wrong cases is worth nothing.
+
 ---
 
 ## 6.7 Step 4 — check the harness is a proxy
@@ -502,6 +724,27 @@ different shapes, a different fusion, an extra cast — and then gets optimised 
 **If the proxy check fails, do not tune the harness until it agrees.** Either fix the harness's
 fidelity, or accept that this span needs a full run and pick a different one. A harness that has been
 tuned into agreement is measuring itself.
+
+### 6.7.1 The check needs a protocol, not just a comparison
+
+Two failures this section's comparison caught but did not warn about, both from building a single-op
+harness for a real model:
+
+**1. Eager is not merely slower — it ranks differently.** The same op measured **29–31 ms eager** and
+**0.356 ms compiled** (`hpu_backend`, `fullgraph=True`, `dynamic=False`) — a **400×** difference — and
+the eager ranking was ordered by **launch cost, not device time**. **Any harness that calls an op
+without compiling it is measuring launch overhead**, so a comparison across variants taken eagerly can
+be confidently, orderedly, wrong (§6.6.1).
+
+**2. Position in the process dominates when more than two variants share it.** A 4-variant sweep
+reported the production selection as **2.3× slower** than an alternative. The same A/B run **in both
+orders, two variants per process**, came back **equal** — 0.308 / 0.306 ms and 0.308 / 0.317 ms. The
+first variant pays the **cold ~130 MiB weight read**, and later ones inherit a different cache and
+compile state.
+
+**⇒ Add to the proxy check: two variants per process, both orders, quote min and median together.**
+Without it a multi-way sweep produces confident, ordered, wrong rankings — **and it looks like
+diligence.**
 
 ---
 
