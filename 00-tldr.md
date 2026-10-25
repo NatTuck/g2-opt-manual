@@ -115,6 +115,6 @@ batched MME workload it is worth **~20 % on min iteration time**. → *[Chapter 
 
 ---
 
-**Tagging convention** (used throughout): **MEASURED** / **ASSUMED** / **INFERRED** /
+**Tagging convention** (used throughout): **MEASURED** / **source read** / **ASSUMED** / **INFERRED** /
 **UNKNOWN**. See `README.md`. The numbers above are from one workload on one box — treat the
 *shape* of each fact as general to Gaudi 2 and the specific figures as that workload's.

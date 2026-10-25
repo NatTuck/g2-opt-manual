@@ -52,7 +52,7 @@ order is how you end up optimising a term that is not the largest one.
 | 4 | **Get the quantization formats right at load time.** | Format bugs are silent, and one class of them is unrecoverable. | §3.4 |
 | 5 | **Get the graph structure right: few regions, no dataflow-edge surprises, watch the specialization count.** | Graph breaks and specialization both cost, and they are hard to retrofit. | §3.5 |
 | 6 | **Only then price optimisations, in `merged` (device occupancy).** | Summed kernel time is not the quantity that moves the wall. | §3.6 |
-| 7 | **Keep a dead-end register** so nobody re-walks a closed path. | §3.8 — ours is 13 entries long. | §3.8 |
+| 7 | **Keep a dead-end register** so nobody re-walks a closed path. | §3.8 — ours is 15 entries long. | §3.8 |
 
 ### 3.0.1 The method: replace SPANS, not kernels
 
@@ -1831,9 +1831,8 @@ pass-level message text (`Graph optimization failed! Got SynapseException: {}` i
 the snapshot is not. **The `n_aa` decode is INFERRED, not source-read:** it matches that snapshot's
 generator format exactly (and the name is identical on all four ranks and across repeats, as a
 per-graph counter starting at zero would be), but `NameBuilder` is a header-only class, so there is
-no symbol in the shipped binary to confirm it against. *(A vendor-source enumeration of the 1.24.2
-throw sites would settle it; our attempt to consult one returned HTTP 503 during this work, so that
-is "could not consult", not "no evidence".)*
+no symbol in the shipped binary to confirm it against. *(A vendor-source enumeration of the 1.24.2 throw sites would settle it; **we could not obtain one
+during this work**, so that is "could not consult", not "no evidence".)*
 
 **And do not over-generalise this caveat.** The dump-directory `synStatus 26` failures elsewhere in
 this manual — Chapter 2 §2.10 trap 1 and Chapter 1 §1.11 — are **not** in this class: they rest on
@@ -2627,8 +2626,8 @@ Two facts hold at once, and a reader needs both:
 - **Many tiny integer nodes are numerous and expensive.** On a parallel port's **bs = 2** arm
   (81 recipes, 14.30 ms attributed), one family of integer layout arithmetic — `ge_i32` 609 µs,
   `div_mod_i32` 599, `where_i32` 542, `cast_i64_to_i32` 493, `less_i32` 446, `and_i8` 431,
-  `constant_i64` 306, `add_i32` 213, `gather_elements` 114 — totals **4,356 µs, 30.5 % of the
-  attributed step**: the **largest single term** on that arm. Each node is **1–3 µs**, so the family
+  `constant_i64` 306, `add_i32` 213, `gather_elements` 114 — the **nine largest** members total **3,753 µs**, and the family totals
+  **4,356 µs, 30.5 % of the attributed step**: the **largest single term** on that arm. Each node is **1–3 µs**, so the family
   is invisible in any per-node ranking and in TPC lane-time, yet together it dominates. In one
   2-layer attention recipe, 78 integer TPC nodes cost ~124 µs of 182 µs per execution.
 
@@ -3448,13 +3447,13 @@ as valuable as the wins.**
 | 6 | **"Avoid custom ops" as a heuristic** | **Refuted by the model's own op.** Three arms held customness fixed and flipped the outcome purely on **submission count**: custom op → 0.2217 at 1 submission; custom op → 0.0000 at 2; native op → 0.4179 at 1. The discriminator is the submission count. | **MEASURED** |
 | 7 | **Region coalescing alone** | Grouping 4 layers into one compiled unit **moved no operational count** — the *parameter*, not the region boundary, sets the instance count. | **MEASURED** |
 | 8 | **Launch count / sync count / recipe count as the lever** | r² 0.15 / 0.195 / 0.066, **all with the wrong sign**. | **MEASURED** |
-| 9 | **Reaching the 48 MiB SRAM from your own code** | Every route is closed. `synDeviceMalloc` at an SRAM address returns **`synSuccess` and relocates to DRAM**; `MEMORY_ATTRIBUTE_SRAM` is `// currently not supported`; a TPC kernel **cannot name the address** (32-bit pointers — a 64-bit constant cast to a pointer compiles to `ld_l`/`st_l`, i.e. **local memory**, and *appears to work*); `AuxTensor.sramAlloc` is a **dead field with no readers**. Placement is the compiler's decision, not yours. **Chapter 7** is the whole map. | **MEASURED** |
-| 10 | **A node-count census as a cost model** | Metadata nodes (`Reshape`, `logical_slice_fwd`, `Split`, `Concatenate`, …) are numerous and **absent from the device trace**; conversely a family of 1–3 µs integer nodes can be **30 % of a step** while never reaching a per-node ranking. Node counts have **no device-time implication in either direction** — rank by **engine identity × count × mean duration**. §3.6.4. | **MEASURED** |
 | 9 | **Optimising for "the step is launch/serialization-bound"** | **Two readings exist, and they point at opposite levers — so name both.** *(i) **launch/serialization-bound**: device idle ~80 %, host busy through most of it, ~573 graph launches and ~1048 host syncs per step.* *(ii) **device-occupancy-bound**: the step is ~76 % device-occupancy and the wall tracks device busy.* **These describe different CODE STATES, not two measurements of one** — the 573/1048 numbers are a 2026-09-19/20 `with_stack=True` state ~3× slower than the current one, and the launch/sync/recipe **counts** fail to predict the wall on the current corpus (wrong sign, r² ≤ 0.2) while `merged` fits at r² 0.9999. A later archived fit re-tests the launch-side model directly and **refutes it again** (`Archive/by-date/2026-10-11/node_law/`: wall = k × node-executions gives R² **0.346** through the origin with a per-run `k` spread of **171 %**, against wall = 21.703 + 0.99713 × `merged` at R² **0.99995**). **⇒ Do not optimise for launch count.** But if you are on a code state with the *other* symptom, the other reading is the right one — check which regime you are in before choosing a lever. | **MEASURED** |
 | 10 | **`torch.stack([a, a], dim=-1)` — the same tensor twice** | Costs **22,532 µs vs 301 µs** for two *distinct* tensors — **75×** — on a 50 MB output. It silently destroyed a component benchmark (read 22,500 µs inside a 4,300 µs whole-op measurement). | **MEASURED** |
 | 11 | **Profiling with CPU activity enabled** | Inflates the trace's host span **~3×** and collapsed a queue-depth metric from 23.3 to 1.67, manufacturing a false empty queue. **Use HPU-activity-only profiling.** | **MEASURED** |
 | 12 | **`**`-globbing a dump directory** | Silently **skips the hidden `.graph_dumps/`** directory — one recon saw **24 of 1,141** files on its first pass. Use `os.walk`/`find`. | **MEASURED** |
 | 13 | **Counting "device ops" as a work-unit count** | A device event is a **replication count** — one event per (launch × TPC/DMA engine) — so kernel events ÷ recipe launches was **544 / 569 / 971** across three traces. **Not even a fixed multiple.** | **MEASURED** |
+| 14 | **Reaching the 48 MiB SRAM from your own code** | Every route is closed. `synDeviceMalloc` at an SRAM address returns **`synSuccess` and relocates to DRAM**; `MEMORY_ATTRIBUTE_SRAM` is `// currently not supported`; a TPC kernel **cannot name the address** (32-bit pointers — a 64-bit constant cast to a pointer compiles to `ld_l`/`st_l`, i.e. **local memory**, and *appears to work*); `AuxTensor.sramAlloc` is a **dead field with no readers**. Placement is the compiler's decision, not yours. **Chapter 7** is the whole map. | **MEASURED** |
+| 15 | **A node-count census as a cost model** | Metadata nodes (`Reshape`, `logical_slice_fwd`, `Split`, `Concatenate`, …) are numerous and **absent from the device trace**; conversely a family of 1–3 µs integer nodes can be **30 % of a step** while never reaching a per-node ranking. Node counts have **no device-time implication in either direction** — rank by **engine identity × count × mean duration**. §3.6.4. | **MEASURED** |
 
 ---
 
@@ -3733,7 +3732,7 @@ consults this register to find out what we do *not* know gets a complete answer.
     env_var_type=boolean)`, and it works — it is the same variable item 26 above is about. Upstream
     vLLM core cannot contain a plugin's knob, so **the zero count is a property of where the grep
     ran, not of the build.** Grep the plugin tree (`vllm_gaudi/`) for `env_var=`, and check the
-    **product default** rather than the absence of the name. This is item 24 in a new costume, and it
+    **product default** rather than the absence of the name. This is item 23 in a new costume, and it
     is worth its own item because the wrong conclusion here is *reassuring* — "the switch does
     nothing, so dynamic shapes are not the problem" — and it retires a live hypothesis without
     testing it. *(The knob's definition site: `vllm_gaudi/extension/features.py`; the consumer:

@@ -625,7 +625,7 @@ def cached(x):
 | call | result | |
 |---|---|---|
 | write-then-read **within one call** | `22.0` / `202.0` for inputs 10 / 100 | follows the data |
-| read on a **hit**, across calls | `2.0` / `2.0` for inputs 10 / 100 | **the input is ignored** |
+| read on a **hit**, after a trace call with `0.0` | `2.0` / `2.0` for inputs 10 / 100 | **the input is ignored** |
 
 **The hit is what bakes.** And the hazard is worse than two calls: put **two uses of the same cached
 helper inside one traced region** and the *second* use reads what the first wrote, during the same
@@ -854,20 +854,12 @@ skipping it is not a wrong number but an endless loop.
 | 2 | **How far a harness can drift before the proxy check matters.** The check compares recipe count, node mix, op counts and union, but no threshold on any of them is calibrated. | Two harnesses of the same span at deliberately different fidelity, and the point at which their speedups diverge. |
 | 3 | **The cost of a faithful multi-card harness** for a span containing a collective — measured only as "expensive", not as a number. | Build one for a collective-bearing span and time the rebuild cycle. |
 | 4 | **Whether a captured span reproduces the in-situ data distribution.** A capture is one sample; a span whose cost depends on data (routed-expert patterns, sparsity) may be unrepresentative. | Compare harness union across several captures against the in-situ union across several steps. |
-| 4a | **No span has yet been *rewritten* against a declared floor.** §6.2.2 now does the first half on
-real numbers — floor declared, measured value attributed, gap quantified at **2.5×** — but the rewrite
-itself has not been attempted and no harness exists for that span. So "the floor was reached" has no
-worked instance anywhere in this manual. | Build the harness for §6.2.2's span (§6.5–6.7), rewrite it
-(§6.4), and report the achieved/floor ratio — including the case where the floor turns out to be wrong
-(§6.4.5). |
-| 4b | **Which of three explanations owns the 2.5× gap in §6.2.2** — a static expert count read where
-fewer are routed (§3.1.1), bandwidth not reached at these tile sizes (§3.2.1), or scaffolding around
-the GEMMs (the same span's prefill recipe carries 1,024 `MoeMultiplexer` nodes). | The rewrite, plus a
-per-node byte/op accounting of the decode recipe against the 1.132 GB/token the floor assumes. |
+| 4a | **No span has yet been *rewritten* against a declared floor.** §6.2.2 now does the first half on real numbers — floor declared, measured value attributed, gap quantified at **2.5×** — but the rewrite itself has not been attempted and no harness exists for that span. So "the floor was reached" has no worked instance anywhere in this manual. | Build the harness for §6.2.2's span (§6.5–6.7), rewrite it (§6.4), and report the achieved/floor ratio — including the case where the floor turns out to be wrong (§6.4.5). |
+| 4b | **Which of three explanations owns the 2.5× gap in §6.2.2** — a static expert count read where fewer are routed (§3.1.1), bandwidth not reached at these tile sizes (§3.2.1), or scaffolding around the GEMMs (the same span's prefill recipe carries 1,024 `MoeMultiplexer` nodes). | The rewrite, plus a per-node byte/op accounting of the decode recipe against the 1.132 GB/token the floor assumes. |
 | 5 | **The correctness-gate tier for a span that ends in a reduction over experts.** Bit-exactness is unavailable once routing changes; what bound is defensible is not established here. | A ulp histogram across a set of realistic routing patterns, with the bound declared first. |
 
 ---
 
-**Tagging convention** as throughout: **MEASURED** / **ASSUMED** / **INFERRED** / **UNKNOWN** — see
+**Tagging convention** as throughout: **MEASURED** / **source read** / **ASSUMED** / **INFERRED** / **UNKNOWN** — see
 `README.md`. The load-time figure is from one run on one box; the seriality and wall-fit figures are
 chapter 3's, quoted with their caveats.

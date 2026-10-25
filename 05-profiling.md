@@ -303,7 +303,7 @@ has device events and no region spans is unattributable; say so and stop.
 
 ## 5.7 Four traps that cost runs
 
-**5.7.1 An export bug on this build, and a second one that we suspected and then RETRACTED.**
+### 5.7.1 An export bug on this build, and a second one that we suspected and then RETRACTED.
 (a) **MEASURED, reproducible, reported upstream** (`HabanaAI/gaudi-pytorch-bridge` issue 23):
 `tensorboard_trace_handler` raises `TypeError: takes 2 positional arguments but 3 were given` —
 torch 2.13 calls `export_chrome_trace(path, metadata)` while the Habana shim at
@@ -331,12 +331,14 @@ If you *do* see `output_json.cpp: Failed to open … No such file or directory` 
 `json.exception.parse_error … empty input`, check first that the output **directory** still exists —
 that is the cause we could reproduce, and it is a property of the environment, not the library.
 
-**5.7.2 The dumps land in a dot-directory.** `DUMP_POST_GRAPHS=<dir>` writes to
+### 5.7.2 The dumps land in a dot-directory.
+`DUMP_POST_GRAPHS=<dir>` writes to
 `<dir>/.graph_dumps/`, so a non-recursive `listdir` reports **0 files** while the dumps sit one level
 down, and `glob("**")` **skips hidden directories entirely**. Use `os.walk`. This is not hypothetical:
 the first version of `attribute_chain.py` reported "0 recipes" against a directory holding 6.
 
-**5.7.3 Sum versus union flips the answer.** On a 30-line program, summing per-engine durations made
+### 5.7.3 Sum versus union flips the answer.
+On a 30-line program, summing per-engine durations made
 a matmul block look DMA-bound (**DMA 0.673 ms > MME 0.595**); the unions give the correct **MME 0.152
 > DMA 0.107**. The cause is per-TPC replication — 400 DMA events against 160 MME events. §2.9 rule 1,
 reproduced end to end.
@@ -358,7 +360,8 @@ unexplained, and states that the three do not sum to 100 % because they are unio
 tells you a table is missing a third of the step. So it has to be right, and it has to be reported
 rather than implied.
 
-**5.7.4 With a multiprocess engine, nothing HPU-side may run in the parent.** Three instances, all
+### 5.7.4 With a multiprocess engine, nothing HPU-side may run in the parent.
+Three instances, all
 measured, all the same root cause — the `EngineCore` child owns the device and the parent has no HPU
 context:
 
