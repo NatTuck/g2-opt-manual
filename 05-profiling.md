@@ -62,6 +62,16 @@ Attributing device events to regions by timestamp containment therefore fails �
 outside. The object to attribute is the launch (`launch_recipe`), which runs on the same thread as
 the region annotation.
 
+**And a host-side annotation can be silently dead on this profiler.** `torch.autograd._profiler_enabled()`
+stays **`False`** when the profiler is the HPU light activity profiler
+(`register_habana_light_activity_profiler`, `PT_PYTORCH_PROFILER_USE_KINETO=1`), so a span helper
+**gated on it returns a no-op and appears in no trace** — while unconditional
+`torch.profiler.record_function` spans around it appear normally. Measured: `v41::native_replay_submit`
+was gated this way and **never emitted**, while `v41::prefill::*` and `v41::verify_and_commit::*` did.
+**Use the engine's own "annotations enabled" flag, not the torch predicate — and always assert the
+span actually appears in the trace before you rely on it.** An annotation you never checked is an
+instrument you do not have. **MEASURED**
+
 ### 5.2.2 The one leg with no key at all: region → recipe
 
 `launch_recipe` carries **no args** — no handle, no id. `LaunchRecipe` (the runtime-thread
@@ -116,6 +126,41 @@ that this needed cmake 3.31.6 was wrong** — the flag was the cause, and 4.4.x 
 
 **On a stock, unpatched installation this leg is still unavailable**, so `attribute_chain.py` keeps
 its fallbacks and still refuses (`AMBIGUOUS`) rather than guessing.
+
+---
+
+### 5.2.3 The device event's own name may be an ORDINAL, not a name
+
+The chain above resolves a *launch* to a region. There is a second question — **which graph node is
+this device interval?** — and on a real model the obvious answer fails for most intervals: generic TPC
+kernels appear in the trace only as **`TPC_SPU_START_TO_SPU_HALT <N>`**. A name lookup on that finds
+nothing, and the conclusion *"99 % of device time is in unnamed kernels"* is then an **artifact of the
+lookup, not a property of the step.**
+
+**`<N>` is resolvable.** It is the index of the node within **that recipe's own TPC node list ordered
+by `exec_order_idx`** — and the `.post.json` dump carries everything needed, per node: `engine`,
+`guid`, `exec_order_idx`, `num_of_ROIs`, `tpc_working_engines`.
+
+**The validity test is what makes it a check rather than a guess:**
+
+```
+num_of_ROIs × len(tpc_working_engines)  ==  the interval count observed in the trace
+```
+
+Two independently verified mappings:
+
+| recipe | ordinal | node | cross-check |
+|---|---|---|---|
+| 64431 | 19 | `custom_deepseek_v41_index_scores_gaudi2` | `tpc_working_engines = [24]`; trace shows **24 intervals × 179.5 µs** per execution |
+| 64431 | 93 | `selected_kv_vector_scales` | `num_of_ROIs = 3`, `engines = [24,24,24]`; trace shows **72 intervals** per execution |
+
+**MEASURED** (a parallel port's bs = 2 arm). Once resolved, **every** device interval in the step has
+a named graph node and a code path — node names carry `L_self/layers/N/<torch-op>/…`.
+
+> **⇒ Any profiling recipe that reports a large "unattributed" share should be suspected of this
+> lookup failure first**, before it is read as a property of the workload. The 89.4 % attribution in
+> §5.8.1 is a *Qwen* figure on a *1:1* mapping; it does not transfer to a model whose TPC work is
+> dominated by generic kernels.
 
 ---
 
@@ -406,6 +451,16 @@ recipe_cache  = RecipeHit {cache_hash: n}, RecipeMiss {cache_hash: n}
 lookup. `recipe_cache` keys on the **cache hash** (the `.recipe` filename in the cache directory),
 which is a third identifier space. `stats()` returns a **list of pairs**, not a dict.
 
+> **⚠ A recipe's identity is NOT its graph name, and the difference bites on a cache hit.**
+> `GraphExec::m_graph_name` is the **lowering's** name — `parent_graph_name` with `_fx`→`_jit` plus
+> `"_" + recipe_id` — and **on a recipe-cache hit the recipe keeps the name it was first compiled
+> under.** So the name in the trace and the name a fresh compile would produce **diverge**, and a
+> join built on dump names **resolves only the recipes that were compiled fresh in that run**. The
+> SDK dump filename is `syn(name) + "_" + graph_index + "_" + <process compile counter>`, and that
+> **counter is not a recipe id**. **The only object that knows a recipe's real identity is its
+> `recipe_handle`** — so if a join goes missing on a warm cache and works cold, this is why.
+> **source read** (a parallel port's bridge).
+
 ---
 
 ## 5.9 What this chapter does not establish
@@ -413,7 +468,7 @@ which is a third identifier space. `stats()` returns a **list of pairs**, not a 
 | # | open | what would settle it |
 |---|---|---|
 | 1 | ~~**A key for region → recipe.**~~ **CLOSED on a patched bridge, OPEN on stock.** Two small edits make it a key join — verified on a three-block program **and on a 40-layer MoE** (§5.8.1). On a stock installation it is still a pairing that fails on a real model. | — **done** on the patched bridge. The stock path stays open, and is why the fallbacks remain in the tool. |
-| 1a | **The one-to-many case is untested on a real model.** §5.8.1's run was 1:1 — 23 compile ids, 23 recipes; no compile id launched more than one recipe and no recipe was shared. The tool supports both, but a 1:1 run cannot distinguish *handled* from *hidden*. | A second run at a different batch size or context length, where specialisation should diverge, plus a check that the shape-of-mapping block reports it. |
+| ~~1a~~ | ~~**The one-to-many case is untested on a real model.** §5.8.1's run was 1:1.~~ **CLOSED — RESOLVED 2026-10-24, and the 1:1 run was the unrepresentative one.** On a parallel port's DSv4.1-Flash at **bs = 1 / 2 / 3**: **70 / 70 / 63 compile ids**, of which **3 / 2 / 1 compile ids carried more than one recipe**, and **1 / 1 / 0 recipes were shared by more than one compile id**. So the mapping is **not 1:1**, it **varies with batch size**, and Qwen's 23-ids-to-23-recipes (§5.8.1) is a property of that run, not of the chain. **The tool handles both directions — but quote the shape of the mapping with every result**, because a 1:1 run cannot distinguish *handled* from *hidden*. | — **done.** What remains open is 1c (the chain on this model, from our own arm). |
 | 1b | **33 compile ids, 23 mapped** in §5.8.1 — the other 10 launched no recipe the tool matched. | Per-compile-id inspection of those 10: the compile metric (§5.8.2) plus the dump set should say whether they compiled nothing, compiled to a recipe the dumper missed, or ran only eager work. |
 | 1c | **The chain has not been run on DeepSeek V4 Flash** — the port this manual is mostly about. Qwen proves the mechanism; it does not prove it on the model that matters here. | The same run shape as §5.8.1, on DSv4, at a batch size where its 121 compile ids and 110 recipes actually diverge. |
 | 2 | **Whether the compile-time metric can carry the compile id.** `graph_compilation.recipe` carries the graph name and duration, not the compile id. | Read the metric per compile — reset and re-read around a single region — and check whether a compile id is derivable; or ask the vendor. |
