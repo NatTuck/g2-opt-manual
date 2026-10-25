@@ -1,7 +1,7 @@
 # Chapter 7 — The on-die SRAM
 
-**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot address it from your
-own code.** Those three statements are the whole chapter, and they are not in tension: SRAM placement
+**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot place a tensor in it
+from your own code.** Those three statements are the whole chapter, and they are not in tension: SRAM placement
 is a decision the graph compiler makes, on criteria that are mostly about **graph structure**, and
 the useful work is to make your tensors *eligible* and then **verify what it did** rather than to
 request a buffer.
@@ -30,23 +30,31 @@ rather than how they are moved.
 
 ## 7.1 What it is: one 48 MiB pool, immediately below DRAM
 
-The aperture is a **raw device address range**, and it sits directly below DRAM in the same "driver
-device map" address space that `synDeviceMalloc` hands out. Read from the device at runtime via
-`synDeviceGetAttribute` — no guessing:
+The aperture is a **raw device address range** in the same "driver device map" address space that
+`synDeviceMalloc` hands out. Read from the device at runtime via `synDeviceGetAttribute`:
 
 ```
 SRAM_BASE_ADDRESS      = 0x1000fffffd000000
 SRAM_SIZE              = 50331648        (48 MiB, exactly)
-DRAM_BASE_ADDRESS      = 0x1001001800000000
 TPC_ENABLED_MASK       = 0xffffff        (24 TPCs)
 ADDRESS_ALIGNMENT_SIZE = 128
 CLK_RATE               = 1650 MHz
 MAX_RMW_SIZE           = 16777216
 ```
 
-**MEASURED.** The arithmetic closes exactly: `SRAM_BASE + 48 MiB = 0x1001000000000000`, which is
-`DRAM_PHYS_BASE`. **A one-byte overrun at the top walks into DRAM, and the 384 MiB between SRAM's end
-and `DRAM_BASE` is an unmapped hole** — copying into it faults the card (§7.7).
+**MEASURED.** The arithmetic closes exactly, and it closes against the **driver's** constant rather
+than against every address the runtime reports: `SRAM_BASE + 48 MiB = 0x1001000000000000`, which is
+`DRAM_PHYS_BASE` in the public header cited below. **A one-byte overrun at the top walks into DRAM**,
+and copying past the aperture faults the card (§7.7) — that fault is measured, and it is the reason
+the bounds rule exists.
+
+> **⚠ There are two different "DRAM base" numbers, and they are not interchangeable.**
+> `synDeviceGetAttribute` reports a `DRAM_BASE_ADDRESS` of `0x1001001800000000`; the **physical** base
+> in the driver header is `0x1001000000000000`. They are different constants from different spaces,
+> and **subtracting one from the other does not give a hole** — an earlier revision of this chapter
+> did exactly that and published a "384 MiB hole" that matches neither figure. What is *measured* is
+> narrower and sufficient for the safety rule: **copies past the aperture fault the device.** The size
+> of any unmapped gap between them is **UNKNOWN** here.
 
 The base and size are also in the public driver:
 
@@ -55,8 +63,10 @@ The base and size are also in the public driver:
   move between releases; check the symbol, not the line. This is the same citation §1.5 uses for the
   48 MiB figure.
 
-**Reserved low.** `SCAL_RESERVED_SRAM_SIZE_H6 = 0x800` (2 KiB) and the HCL reservation (320 KiB) come
-off the top of the budget before anything else. In practice **the graph compiler places the first
+**Reserved low.** The HCL reservation (320 KiB) and the per-graph non-bundle reservation (§7.2.2) come off the top of
+the budget. The 2 KiB SCAL reservation (`SCAL_RESERVED_SRAM_SIZE_H6 = 0x800`) is **inside** the
+HAL's SRAM size rather than subtracted again — the measured budget identity in §7.2.2 has no term
+for it, which is how this was caught. In practice **the graph compiler places the first
 tensor it puts in SRAM at `SRAM_BASE + 0x80000`** (512 KiB) — **MEASURED**, and stable across
 unrelated graphs. **An address scan that finds values at exactly `SRAM_BASE + 0x80000` has found a
 real placement, not a coincidence**; an audit that reports "SRAM is in use" from one such hit alone
@@ -103,9 +113,9 @@ and the compiler *contains* a complete SRAM memory-strategy optimizer —
 fragmentation and prefetch-buffer sizing.
 
 **Nothing calls it.** Its only call site is inside its own file, and its header is included by no
-other file in the tree. **The memory-strategy optimizer is orphaned dead code.** **source read**
-(1.16-era snapshot). Most likely the static-tensor *prefetch* path is Gaudi 1-era and was never
-validated on Gaudi 2.
+other file in the tree. **The memory-strategy optimizer is orphaned dead code in the 1.16-era tree we read** — it was not
+checked against the 1.24.2 binary. **source read.** Most likely the static-tensor *prefetch* path is
+Gaudi 1-era and was never validated on Gaudi 2 — that is the source's own guess, and it is **open**.
 
 **The live one.** `passes/sram_management/` — **18,074 lines** across ~90 files — is a different
 system and it *does* run. Its entry point is `SRAMSlicingManager::sliceGraph()`, which is gated on one
@@ -186,9 +196,11 @@ ENABLE_EXPERIMENTAL_FLAGS=true SRAM_SLICER_MAX_CAPACITY_BYTES=46137344   # 44 Mi
 ```
 
 **MEASURED:** with `=0`, `inSram: true` drops **3 → 0** on the same graph and the `EPOCH_ALLOC`
-"Allocate N Tensors in Sram" lines drop 2 → 1. Note `synConfigurationSet` is **context-dependent** —
-in a bare torch-hpu process it returns `synInvalidArgument` for these, and the env path is silently
-ignored unless experimental flags are on. Set them in the **engine's** process.
+"Allocate N Tensors in Sram" lines drop 2 → 1. Note `synConfigurationSet` is **context-dependent**: **without** experimental flags it returns
+`synInvalidArgument` and the env path is silently ignored; **with** them it works at runtime (rc = 0,
+exact readback) — but the capacity is **latched before the first compile**, so a runtime change does
+not affect a graph compiled afterwards in the same process (§7.5.3). Set it in the environment, and
+give each arm its own process.
 
 ### 7.2.4 `ALL_IN_DRAM` is the default mode — and it does not mean nothing is in SRAM
 
@@ -197,10 +209,13 @@ The `ALL_IN_DRAM` default (§7.2.1) invites the conclusion *"therefore no ordina
 default *allocation strategy*; specific tensor classes are placed in SRAM regardless of mode, by the
 `setTensorInSram()` call sites and by the live slicer.
 
-An empirical scan of the engine's own recipe cache refutes it directly: **31 % of that port's decode
+An empirical scan of the engine's own recipe cache refutes it directly: **≥ 31 % of that port's decode
 recipes already contain SRAM-window tensor addresses** (92 of 299, 13 distinct offsets, up to
-`+25.31 MiB`). **MEASURED.** We can confirm the same class of evidence here: **72 of our own archived
-post-graph dumps carry `"allocation": "SRAM"`** on at least one tensor.
+`+25.31 MiB`). **MEASURED**, and the fraction is a **lower bound**: a serialized recipe stores **one** SRAM base at
+a fixed offset and encodes per-node placement as base-relative patch data, so an absolute-address
+scan of a recipe **under-reports**. The same class of evidence exists here — **32 of our own archived
+post-graph dumps carry `"allocation": "SRAM"`** (plus 40 more in working scratch, which is
+disposable and will not survive a cleanup). Re-runnable: `rg -l '"allocation"\s*:\s*"SRAM"'`.
 
 So SRAM **is** in use in production decode graphs — for **small scratch tensors at 0.3–1 MiB scale,
 not for activations or weight tiles.** That is the honest reading, and it is a statement about
@@ -256,11 +271,27 @@ nothing**.
 > eager mode therefore says nothing about SRAM slicing**; an experiment that produced five GC lines
 > and zero `SRAM_SLICE` lines did so because each op compiled to a one-node graph.
 
+**⇒ Placement is a property of the graph's CONSTRUCTION, not of its shapes.** This is the one that
+silently costs you the whole lever. The same logical span, the same shapes, built two ways:
+
+| construction | what the slicer does |
+|---|---|
+| a single `bmm` | bundles it and **places the tile** — 6 slices, 2 buffers, epoch 13,117,440 (26.3 % of `maxRange`) |
+| **6 per-expert GEMMs plus a `cat`** | picks the `5120x1` *activation* as master operand (`numberOfUsesA: 2`, `numberOfUsesB: 1`) and **gives up**: `Cannot slice master operand 15 on dim 2 - too small` → `No slicing dims were found` → `Allocate 0 Tensors in Sram, epoch size: 0` |
+
+**The second graph still runs — just from HBM, silently, with no error.** So **"placement is proven"
+must be re-gated on the exact graph every time**, and a span that looks equivalent to one that was
+placed can lose placement entirely.
+
+**⇒ For a real port that makes this an audit, not a footnote:** if the MoE path expands a batch GEMM
+into per-expert GEMMs plus a `cat`, it will **not** get SRAM placement even though the same shapes do
+when built as a single `bmm`. **Check the construction, not the shape.** **MEASURED**
+
 ### 7.3.2 A TPC's aux tensor: the one route you can drive directly
 
 `AuxTensor.sramAlloc` is documented as *"This flag instruct GC to allocate the aux tensor in SRAM
-memory"* and is a **dead field** — one declaration, no readers anywhere, and three GUIDs differing
-only in that bit produce an **identical** recipe address. **Do not use it.**
+memory"* and is a **dead field** — one declaration, no readers anywhere, and three GUIDs differing only in
+`(sramAlloc, noInit)` produced an **identical** recipe address. **Do not use it.**
 
 What actually decides aux placement is whether the buffer has data, and its size:
 
@@ -390,12 +421,23 @@ The binary also carries a metrics line worth grepping for:
 *"Metrics : SRAM Capacity : {}[MB], MME Utilization : {}, HBM Bandwidth: {}[GB/s], SB Reuse : {},
 Double-Buffer : {}"*.
 
-> **⚠ A 0-byte `graph_compiler.log` is a capture failure, not a result.** Every
-> `graph_compiler.log` in one batch of archived runs was **0 bytes** — GC logging was simply off — and
-> a zero-byte log is indistinguishable from "the slicer did nothing". A worker in this project read a
-> failed `cp` as "no placement" and briefly concluded placement was **nondeterministic**. It is
-> deterministic. **Print the log's size in the harness and compare it against the copied file.** GC may
-> also write to a *separate* file (`GRAPH_COMPILER_SEPARATE_LOG_FILE`).
+> **⚠ The compiler is ASYNCHRONOUS, and the log is truncated twice — two independent ways to read
+> silence as a result.**
+>
+> 1. **`torch.hpu.synchronize()` returns while the graph compiler is still working.** Its placement
+>    lines land **seconds later** (measured: TPC-binary extraction at 04:32:54, `SRAM_SOL_GEN` at
+>    04:32:58, against a synchronise that returned in 0.2 s). Reading `graph_compiler.log` straight
+>    after the first call is therefore **a race, and it is usually lost**. **Poll until the log's
+>    delta contains `epoch size:`** — or the slicer's explicit give-up line `No slicing dims were
+>    found` — before reporting anything.
+> 2. **The log is truncated at process start and again at exit**, so a shell `cp` taken after the
+>    process ends reliably captures **0 bytes**. That is the real mechanism behind "every log in this
+>    batch was empty", and it is **not** the same as "logging was off". **Read the log in-process**,
+>    and print its size in the harness so a failed capture is visible as a failed capture.
+>
+> **Every placement reading in the campaign behind this chapter was exposed to (1)**, including
+> readings reported as facts. Treat any placement number not gated on a completed log delta as
+> provisional. GC may also write to a *separate* file (`GRAPH_COMPILER_SEPARATE_LOG_FILE`).
 
 ### 7.5.2 The gates that make an A/B an A/B
 
@@ -408,50 +450,105 @@ Three gates, and an arm that fails any of them is not the arm you think it is:
 
 ### 7.5.3 Interleave the arms
 
-`A,B,A,B` — not `A,A,B,B`. Sequential blocks confound drift with effect. This project's own first
-attempt at the SRAM measurement produced a confident **12.9 % "slower"** result that was inside a
-noise floor it had not yet measured.
+`A,B,A,B` — not `A,A,B,B`. Sequential blocks confound drift with effect.
+
+**But the interleaving has to be at PROCESS level, and that is not obvious.**
+`synConfigurationSet` for the capacity knob **does** work at runtime — rc = 0, exact readback,
+accepts `0` / `4194304` / `33554432` / `UINT64_MAX` — yet **it does not change placement for a graph
+compiled afterwards in the same process**: compile #1 at the default and compile #2 with the capacity
+set to `0` both report `inSram: true`. **The capacity is latched before the first compile**, so an
+**in-process A/B is dead** and the two arms must be separate processes. Set the knob in the
+environment and give each arm its own process.
+
+**And interleaving does not replace measuring the floor.** This project's own first attempt *was*
+interleaved — `A,B,A,B`, two rounds — and still produced a confident **12.9 % "slower"** result. The
+error was not the ordering; it was that **no noise floor had been measured yet**. Ordering removes
+drift; only a floor tells you whether the delta is real.
 
 ---
 
 ## 7.6 What it is worth
 
-**The claim to carry, stated so it can be defended:** *SRAM placement of an MME weight operand lowered
-min iteration time in every one of 25 run-pairings, typically by ~20 %, with a worst-case margin of
-2 %.* **MEASURED**
+**The claim to carry, stated so it can be defended:** *SRAM placement of an MME weight operand
+lowers min iteration time on a batched MME GEMM, typically by **~15–25 %**. The effect is real, but
+it is **not a hard separation**.* **MEASURED** (a parallel port; artifacts unpublished)
 
-The evidence, 5 repeats per arm at 50 iterations, same graph, same work, only placement differing
-(gated on `inSram: true`):
+The evidence — **10 gated runs per arm** at 50 iterations, interleaved, same graph, same work, only
+placement differing, **pooled across 20 runs**:
 
-| arm | min µs across 5 runs | mean | range |
+| arm | min µs range | CV |
+|---|---|---|
+| **SRAM** | **353.0 – 423.4** | ~7 % |
+| **control** (slicing off) | **411.3 – 1096.3** | ~50 % |
+
+**Typical min improvement is ~15–25 %, and the pooled extremes OVERLAP** — the best control run beat
+the worst SRAM run. So this is **a real effect, not a hard separation**; on median the distributions
+overlap in some pairings and separate in others. *(An earlier, smaller sample — 5 runs per arm —
+showed no overlap on min at all. The larger sample does not support that, which is why the smaller
+one is not quoted here.)*
+
+> **Do not quote a single percentage as a floor.** "~24 %" was one pairing in the small sample and
+> "~20 %" was that sample's typical; the larger sample's typical is **~15–25 %**, and its worst
+> pairing sits inside the overlap. **Quote the range, and say the distributions overlap.**
+
+**Budget pressure is real, and the case that matters was exercised.** The test weight was **47.2 MB**
+against a **~47.25 MB** budget — it fits **only** by 3-way slicing with double buffering (epoch
+40.0 MB), and placement did not degrade. That is the configuration worth knowing about: a tile that
+*just* fits.
+
+**An unexplained finding, and it may be the real value.** The control arm is **heavy-tailed** — CV
+50 % against SRAM's 7 % — with two outliers of 560 µs and 1096 µs across 20 control runs while SRAM
+never left 353–423 µs. If that tail is intrinsic, SRAM's benefit is partly the **removal of
+occasional 2–3× slow iterations**, which would matter far more for tail latency than for the mean.
+**Not established.**
+
+**The instrument matters, and two things about it were learned the hard way:**
+
+- **`torch.hpu.Event(enable_timing=True)` works and has `elapsed_time()`.** Recording events around
+  the call and synchronising afterwards cut the spread enough to resolve a delta; **wall-clock around
+  `synchronize()` did not.**
+- **Repeating identical work inside a compiled region does not raise the timed unit.** `--repeat 4`
+  gave 351 µs and `--repeat 8` gave 345 µs — identical — because `torch.compile` CSEs the copies.
+  To raise the timed unit you must **vary** the work, not duplicate it.
+
+**And the floor is workload-dependent — re-measure it per graph.** On a 2.1 ms workload it was ±3 %
+on min; on this 0.4 ms one it is **~10 %** for the SRAM arm and **~30 %** for the control. **A floor
+carried across graphs is not a floor.**
+
+### 7.6.1 The negative result: none of this transfers to the dequant span
+
+**Read this before planning around SRAM, because it closes the obvious next idea.**
+
+The same A/B, run on the **fused fp4→fp8 dequant span** — the span that actually materialises the
+expert weights — both arms gated (`inSram: true` = 3 vs 0):
+
+| arm | min µs (5 runs) | mean | range |
 |---|---|---|---|
-| **SRAM** | 398.27, 363.43, 403.19, 395.74, 393.97 | **390.9** | 363.4–403.2 (10.2 %) |
-| **OFF** | 475.25, 477.79, 411.34, 522.42, 560.58 | **489.5** | 411.3–560.6 (30.5 %) |
+| **SRAM** | 316.88, 327.65, 304.22, 302.94, 297.81 | **309.90** | 297.8–327.7 |
+| **control** | 284.31, 319.89, 295.34, 255.58, 280.62 | **287.15** | 255.6–319.9 |
 
-**SRAM's maximum min (403.19) is below OFF's minimum min (411.34)** — the distributions **do not
-overlap on min**. On **median** they **do** overlap (409.65–504.22 vs 466.76–564.05), so **the effect
-is visible on min only**.
+**SRAM is 7.9 % SLOWER on mean min, and the ranges overlap.** The delta is inside the control's own
+floor **and it is the wrong sign**; medians are not resolvable either — one outlier flips the sign
+between 6.2 % faster and 12.2 % slower.
 
-> **Do not quote 24 % as a floor.** 24 % was one pairing; it is a **typical** result, not a bound, and
-> n = 5 per arm is small for a floor estimate. The worst-case margin across the 25 pairings is **2 %**.
+**The best explanation, and it is derived rather than measured:** that span is dominated by the
+dequant **compute**, not by HBM traffic on the tile, so relocating the tile removes little and adds
+slicing and double-buffer overhead. The arithmetic agrees — writing 37.50 MB at 873 GB/s is ~43 µs
+and reading it at 1,889 GB/s ~20 µs, i.e. **~63 µs of a ~300 µs span: roughly 21 % traffic, 79 %
+compute.** There is no large traffic win to collect.
 
-**Three caveats, all of which cut against over-reading this:**
+> **⇒ The consequence, plainly: avoiding HBM materialisation of the fp8 tile is NOT the lever for that
+> span. The dequant compute is.** The ~15–25 % above was measured on a `mul`-producer bf16 GEMM
+> graph; **it does not transfer**, and a reader who carries it over will spend a week on a span where
+> the effect has the wrong sign.
 
-- **The floor is workload-dependent — re-measure it per graph.** An earlier ±3 % min / ±13 % median
-  floor was measured on a 2.1 ms graph and **does not transfer** to this 0.4 ms one. Here it is ~10 %
-  on min for the SRAM arm and ~30 % for the OFF arm; the OFF arm is markedly noisier, and one outlier
-  suggests its range understates it.
-- **The delta is diluted, so the isolated benefit is larger, not smaller.** The producer that makes the
-  weight placeable costs a ~47 MB read+write pass that **both** arms pay.
-- **One cleanly-gated round, not two.** In round 1 the SRAM arm showed `inSram: true` = **1** rather
-  than 2, so the weight may not have been placed; the result rests on the round where the gate read 2.
-
-**A negative result worth keeping, because it is the failure mode.** An earlier A/B showed **no**
-measurable benefit — 1.0 % faster on min, inside the floor — and the reason was **the graph, not
-SRAM**: it regenerated its 47 MB weight with `torch.randn` *inside* the compiled region every
-iteration, so the timed region was dominated by weight generation and the saving on the weight *read*
-was diluted below resolution. **The instrument was fine; the graph was wrong.** The fix was a
-producer chain that costs nothing — which is also the production-relevant shape.
+**A second negative result, about method.** An earlier A/B showed **no** measurable benefit — 1.0 %
+faster on min, inside the floor — and the reason was **the graph, not SRAM**: it regenerated its
+47 MB weight with `torch.randn` *inside* the compiled region every iteration, so the timed region was
+dominated by weight generation and the saving on the weight *read* was diluted below resolution.
+**The instrument was fine; the graph was wrong.** The fix was a producer chain that costs nothing
+*extra* — one elementwise pass, not a view, since a view does not qualify (§7.3.1) — which is also
+the production-relevant shape.
 
 ---
 
@@ -461,7 +558,8 @@ producer chain that costs nothing — which is also the production-relevant shap
 transaction, and an unmapped destination surfaces **asynchronously as a DFA**.
 
 **MEASURED — we did this.** A read-only sweep that walked past `SRAM_BASE + SRAM_SIZE` into the
-384 MiB hole, plus a read of a raw DRAM-window address outside any allocation, produced two DFAs.
+unmapped space above the aperture, plus a read of a raw DRAM-window address outside any allocation,
+produced two DFAs.
 Uncorrected events went **3 → 450**; the device dropped to 0 °C / 50 W / Perf N/A, then recovered to
 Operational but **required a hard reset** (`hl-smi -r -i <pci-bus-id>`) to clear the counters.
 
@@ -508,27 +606,35 @@ this table is the raw mapping.)
 | 1 | **Whether the MME can read SRAM at the hardware level.** The compiler evidence is strong (`m_mmeBundles`, and `flatten_mme` propagating SRAM onto MME operands), and §7.6's result is consistent with it — but a clean isolated MME-from-SRAM bandwidth test has not been run. | A kernel pair differing only in operand placement, with `inSram: true` gated, at a size large enough to be bandwidth-bound. |
 | 2 | **Whether SRAM is actually faster than HBM for a compute engine, as a bandwidth figure.** Unmeasured. The one per-TPC number on record (1.24 GB/s SRAM vs 1.02 GB/s DRAM, 1.21×) came from a single TPC doing scalar accesses with index-space parallelism held at 1 — **not a bandwidth figure**. Host DMA into SRAM is PCIe-bound at ~19 GB/s and says nothing. | Keep the kernel body fixed and vary TPC parallelism; report GB/s per engine, not an aggregate. |
 | 3 | **Whether the orphaned memory-strategy optimizer works on Gaudi 2.** It has never executed in 1.24.2. If `STATIC_TENSORS_PREFETCHED_ACT_IN_SRAM` worked, **all activations** would leave DRAM — a much larger prize than any single tensor. | Call it behind a flag on a small graph and check `maxRange.size` and `inSram` counts against the slicer's. |
-| 4 | **Whether production model weights actually land in SRAM.** Model weights are persistent parameters — structurally §7.3.1's *run A* — so it is **not established**. Real graphs do carry other producer chains (dequant, reshape, transpose), and SRAM addresses appear in 31 % of that port's recipes, so it remains **plausible but unproven**. | `inSram: true` gating on the **real** engine graph, per layer, with the producer chain named. |
+| 4 | **Whether production model weights actually land in SRAM.** They are persistent parameters (§7.3.1's *run A*), but production MoE weights are **produced by the fp4→fp8 dequant**, which is arithmetic — so they are *structurally* placeable (a **derived** inference, not a measurement). §7.3.1's construction finding then decides it: a single `bmm` places, per-expert GEMMs plus a `cat` does not. So this is **plausible but unproven**, and it depends on how the model builds the graph. | `inSram: true` gating on the **real** engine graph, per layer, with the construction named. |
 | 5 | **How much of the 48 MiB a real decode step can hold.** The aux route caps at ~10 MiB per tensor and the slicer's own budget is ~47.5 MB, but what fraction a production graph can *use* before fragmentation binds is unmeasured. | Sweep `SRAM_SLICER_MAX_CAPACITY_BYTES` on a real graph and read the placement the slicer achieves at each cap. |
+| 6 | **Why the control arm is heavy-tailed.** CV 50 % against SRAM's 7 %, with two 2–3× outliers in 20 runs (§7.6). If intrinsic, part of SRAM's value is **tail removal** rather than mean improvement — which is a different and possibly larger claim. | More control runs and a distribution test rather than a range comparison; then a **p99 step** measurement rather than min. |
+| 7 | **The n256 dequant path is unmeasured — it is currently unrunnable in the harness.** Its signature is `(ids, q16, s16, lookup, bool normal)` with **no channel tensor**; after that argument was fixed it fails *"V4.1 prepared MXFP4 requires contiguous inference inputs with matching dtype/device"*, not yet diagnosed. Note the n256 tile, unlike `prepared`, **has a token dimension** and would scale with batch. | Diagnose that check, then measure the n256 tile at BS = 1 and 2. |
 
 ---
 
 ## What to carry forward
 
-1. **SRAM is 48 MiB at `0x1000fffffd000000`, immediately below DRAM, one pool shared by 24 TPCs and
-   4 MMEs.** The 384 MiB above it is an unmapped hole that faults the card.
-2. **You cannot address it.** `synDeviceMalloc` relocates, the attribute is unsupported, a TPC has
-   32-bit pointers (a 64-bit address compiles to a *local* access and appears to work), and
-   `AuxTensor.sramAlloc` is dead. **Placement is the compiler's decision.**
+1. **SRAM is 48 MiB at `0x1000fffffd000000`, one pool shared by 24 TPCs and 4 MMEs**, and
+   `SRAM_BASE + 48 MiB` is the driver's `DRAM_PHYS_BASE`. **Copying past the aperture faults the
+   card** — that is the measured fact; the size of any gap above it is UNKNOWN.
+2. **You cannot place a tensor in it.** `synDeviceMalloc` relocates, the attribute is unsupported,
+   a TPC has 32-bit pointers (a 64-bit address compiles to a *local* access and appears to work), and
+   `AuxTensor.sramAlloc` is dead. **Placement is the compiler's decision** — but a **host DMA into the
+   aperture** and a **TPC writing through an aux tensor** are both verified working (§7.3.2), which is
+   how you *populate* or *observe* it, not how you place a tensor.
 3. **The live slicer is `passes/sram_management/`, and it runs on every multi-node graph.** It is
-   not the orphaned `optimize_memory_strategy` optimizer, which is dead code.
-4. **`ALL_IN_DRAM` is the default allocation *mode* and does not mean nothing is in SRAM** — 31 % of
-   one port's decode recipes carry SRAM-window addresses.
+   not the orphaned `optimize_memory_strategy` optimizer, which is dead code **in the 1.16 tree we
+   read**.
+4. **`ALL_IN_DRAM` is the default allocation *mode* and does not mean nothing is in SRAM** — ≥ 31 %
+   of one port's decode recipes carry SRAM-window addresses.
 5. **Eligibility is graph structure: a tensor needs a real compute producer.** A view does not
-   qualify; an elementwise op does. **Give a weight a producer that costs nothing.**
+   qualify; an elementwise op does. **Give a weight a producer that costs nothing *extra*** — one
+   elementwise pass, not a view.
 6. **Observe, do not request.** Gate on `inSram: true` and on `maxRange.size`; treat a 0-byte
    `graph_compiler.log` as a capture failure; interleave the arms.
-7. **What it is worth: ~20 % on min iteration time, in 25 of 25 pairings, worst case 2 %** — and
-   **24 % is a typical pairing, not a floor.** The noise floor is workload-dependent.
+7. **What it is worth: ~15–25 % on min iteration time, and the distributions OVERLAP** — a real
+   effect, not a hard separation. **It does not transfer to the dequant span, where it is 7.9 %
+   slower** (§7.6.1). The noise floor is workload-dependent; re-measure it per graph.
 8. **A return code is not a measurement, and here it costs a card.** `synMemCopyAsync` accepts any
    address and faults asynchronously.
