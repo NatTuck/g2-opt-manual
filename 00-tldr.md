@@ -106,10 +106,10 @@ collective if it is **aligned across the ranks that take part** — tested again
 
 ---
 
-**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot address it from your
-own code.** Placement is decided by **graph structure** — a tensor needs a real *compute* producer (a
-view does not qualify) — not by any request you can make. Every obvious route to it is closed and most
-fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
+**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot place a tensor in it
+from your own code.** Placement is decided by **graph structure** — a tensor needs a real *compute*
+producer (a view does not qualify) — not by any request you can make. Every obvious route to *placing*
+one is closed, and most fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
 appears to work. **Observe, do not request** — and read the chapter before you plan around it. **It
 should be significantly faster than HBM for a compute engine; we have not yet demonstrated it**, so
 the chapter quotes no speedup — it quotes how to put bytes there yourself and how to prove what the
