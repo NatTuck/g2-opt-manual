@@ -480,9 +480,9 @@ Everything above is **bs = 1**. The obvious next move — raise the batch, read 
 and serve N tokens — is right in form and much weaker in degree on a MoE, and the reason is worth
 stating before someone plans around it.
 
-**The conclusion holds; the mechanism most people reach for does not.** Both halves were measured on
-a parallel port of this model, and the second half refutes a mechanism this section previously
-carried.
+**The conclusion holds; the mechanism most people reach for does not.** Both the conclusion and its
+replacement were measured on a parallel port of this model, and the second refutes a mechanism this
+section previously carried.
 
 **What the cost is a function of: the compiled bucket, not the routed-expert set.** A decode step is
 compiled per batch bucket, and its cost is a **step function of the bucket** — flat in the number of
@@ -492,8 +492,8 @@ real rows inside it:
 |---|---|---|---|
 | step time, ms | **10.4** | **25.9** | **32.5** |
 
-Fitted per bucket, the residual rms is **0.11** (max 0.15); fitted as an affine function of rows it
-is **3.95**. And **n = 3 and n = 4 are both bucket 4 and cost the same** — +33 % of the rows for
+Fitted per bucket, the residual rms is **0.11 ms** (max 0.15); fitted as an affine function of rows
+it is **3.95 ms**. And **n = 3 and n = 4 are both bucket 4 and cost the same** — +33 % of the rows for
 −0.9 % of the time. **Rows inside a bucket are free.** **MEASURED** (a parallel port's serving arm,
 TP4×PP1, buckets 1/2/4, 96–128 generated tokens per cohort, median of two cohorts).
 
