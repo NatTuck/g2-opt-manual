@@ -401,11 +401,14 @@ is sourced too.
 > **(b)** Building on an unverified number *before* checking it would still have been wrong, even
 > though it would have happened to work. The habit is what is being taught, not the outcome.
 
-**There is no L1/L2 cache.** This is a *positive* finding, not a gap. The documented memory
-hierarchy is **HBM2E → 48 MiB shared SRAM → per-TPC local memory**, with **no hardware-managed
-cache level between them**. The vendor architecture page names three subsystems (compute, memory,
-networking) and two compute engines (MME + TPC); searches of the documentation, the architecture
-overview and the whitepaper pages return the same three levels and never a cache.
+**The 48 MiB SRAM is the only on-die memory between HBM and per-TPC local memory — there is no
+separate L1/L2 cache.** This is a *positive* finding, not a gap, and it is read off the vendor's
+architecture diagram, which draws exactly three levels — **HBM2E → 48 MiB shared SRAM → per-TPC local
+memory** — with **no cache level between them**. The same page names three subsystems (compute,
+memory, networking) and two compute-engine families (MME + TPC). **source read** (the vendor's
+architecture diagram). *(The same diagram is wrong about the MME count — it labels the block "2×MME"
+where the driver headers and the trace say 4, §1.1 — so it is cited here for the memory hierarchy it
+draws, not for engine counts.)*
 
 **What the TPC does have is *local memory*, and it is a scratchpad, not a cache:**
 

@@ -378,7 +378,41 @@ process.** Any change that exposes SRAM placement must enforce the capacity itse
 
 ---
 
-## 7.4 The routes that do not work — do not spend time on them
+### 7.3.5 What there is to place: the fp8 dequant tile
+
+The candidate tensor this topic keeps returning to is the fp8 tile the fp4→fp8 dequant materialises
+for the MoE experts. Its size belongs on the page, because **"would it even fit?" is answerable
+without a device.**
+
+The op's output formula is `{6, q.size(2)/32, q.size(1)*128}`, and both prepared checkpoints resolve
+to the same totals:
+
+| | gate+up | down | per layer |
+|---|---|---|---|
+| fp8 tile | **37.50 MB** | **18.75 MB** | **56.25 MB** |
+
+- **Per decode step** (40 MoE layers): **2.20 GB** materialised.
+- **Against the ~47.25 MB budget** (§7.2.2): gate+up (37.50 MB) **fits**, and down (18.75 MB)
+  **fits**. Both together do not, but they are sequential anyway — so **each tile is individually
+  placeable with roughly 10 MB of headroom.**
+- **Two premises worth correcting, because both are easy to get wrong.** The prepared op's **dim0 is
+  the 6 routed experts; there is no token dimension**, so **BS = 2 does not double the tile.** And the
+  prepared op is **top-6 only** (its contract requires `ids.size(1) == 6`), so an `experts 12`
+  variation is **invalid**, not merely slow. *(Only the `n256` variant has `slots = tokens × experts`
+  and would scale with batch — and that variant is currently unrunnable in the harness, §7.8.)*
+
+**MEASURED / source read** — checkpoint safetensors headers plus the op's own output formula. *(The
+in-code fastpath guard still tests `(384, 18, 163840)` / `(384, 40, 36864)`, which matches neither
+checkpoint. It is a stale guard, not a size oracle.)*
+
+> **What this does *not* give you is a time.** Summed write+read for 2.20 GB at 873 / 1,889 GB/s is
+> ~3.7 ms, and that figure is **summed work** — the recoverable amount is the un-overlapped part of
+> the union, and it has to be measured (§2.9 rule 1). **Capacity is what this section answers; cost is
+> §7.6's, and it is open.**
+
+---
+
+## 7.4 The routes that do not work — and one nobody has tried
 
 Each of these was tried and refused. Two of them **fail silently**, which is why they are here.
 
@@ -534,7 +568,7 @@ exists specifically to slice MME operands so they fit in SRAM, and `flatten_mme`
 placement onto MME operands (§7.2.1). **ASSUMED** — design intent and source read, not a measurement.
 
 **Why we cannot price it.** The A/B experiments behind this chapter do not resolve the effect, and
-each of the following is independently disqualifying:
+and any one of these is enough on its own to stop us quoting a number:
 
 - **The sample is small and the arms overlap.** Five to ten gated runs per arm, and the pooled ranges
   of the SRAM and control arms **overlap** — the best control run beat the worst SRAM run. A direction
