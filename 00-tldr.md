@@ -111,11 +111,12 @@ from your own code.** Placement is decided by **graph structure** — a tensor n
 producer (a view does not qualify) — not by any request you can make. Every obvious route to *placing*
 one is closed, and most fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
 appears to work. **Observe, do not request** — and read the chapter before you plan around it. **And it
-does read measurably faster than HBM — 1.18× at the best configuration, 10.2 % with non-overlapping
-distributions at a smaller one — but only by that much, because the TPC array caps out around
-2.3–2.4 TB/s: at 2,338 GB/s over 24 TPCs it is the engines, not the memory, that bind.** So the speedup
-is real and small, and the route to the pool's actual bandwidth is an engine with more appetite (the
-MME), which the compiler cannot yet feed from SRAM without a staging copy. → *[Chapter 7](07-sram.md)*
+does read measurably faster than HBM — 10.2 % at 4 MB with non-overlapping distributions, 1.18× at the
+highest rate we saw (32 MB, one rep against the best of three) — but only by that much: both arms land
+within ~10 % of the same ~2.3–2.4 TB/s per-core band, which points at the engines rather than the memory
+as the binding constraint (INFERRED — one SRAM point cannot settle it).** So the gain is real and small,
+and the route to the pool's actual bandwidth is an engine with more appetite (the MME), which the
+compiler cannot yet feed from SRAM without a staging copy. → *[Chapter 7](07-sram.md)*
 
 ---
 
