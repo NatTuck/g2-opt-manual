@@ -110,10 +110,12 @@ collective if it is **aligned across the ranks that take part** — tested again
 from your own code.** Placement is decided by **graph structure** — a tensor needs a real *compute*
 producer (a view does not qualify) — not by any request you can make. Every obvious route to *placing*
 one is closed, and most fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
-appears to work. **Observe, do not request** — and read the chapter before you plan around it. **It
-should be significantly faster than HBM for a compute engine; we have not yet demonstrated it**, so
-the chapter quotes no speedup — it quotes how to put bytes there yourself and how to prove what the
-compiler placed. → *[Chapter 7](07-sram.md)*
+appears to work. **Observe, do not request** — and read the chapter before you plan around it. **And it
+does read measurably faster than HBM — 1.18× at the best configuration, 10.2 % with non-overlapping
+distributions at a smaller one — but only by that much, because the TPC array caps out around
+2.3–2.4 TB/s: at 2,338 GB/s over 24 TPCs it is the engines, not the memory, that bind.** So the speedup
+is real and small, and the route to the pool's actual bandwidth is an engine with more appetite (the
+MME), which the compiler cannot yet feed from SRAM without a staging copy. → *[Chapter 7](07-sram.md)*
 
 ---
 
