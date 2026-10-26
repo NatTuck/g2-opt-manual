@@ -459,6 +459,11 @@ to save you from a wrong answer.
 | TPC `memcpy_u8` D2D copy | 1,014 / 1,704 / 1,888 GB/s | 64 / 256 / 1024 MB | **MEASURED** |
 | single DMA node, C++ bench | **2,023 GB/s** *(1,646 retracted — see below)* | 512 MiB operand, flat 1-D (2-D control agrees to 0.03 %) | **MEASURED** |
 
+> **The 2,147 GB/s row is the HBM-fed TPC stream envelope.** An **SRAM-fed** TPC read reaches
+> **2,338 GB/s** at 512 MB read ([§7.6](07-sram.md)) — **MEASURED** — so 2,147 GB/s bounds a stream
+> *from HBM*, not a stream from anywhere. **What caps the SRAM-fed stream at 2,338 GB/s is not
+> established**: the array's own limit and SRAM's supply to a TPC are both consistent with one point.
+
 ### The DMA engine is a two-regime curve
 
 | size | DMA engine | vs the TPC stream envelope (2,147) |

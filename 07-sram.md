@@ -9,8 +9,9 @@ request a buffer.
 This chapter is worth reading before you plan anything that assumes SRAM, because **every obvious
 route to it is closed and most of them fail without an error** (§7.4). It is also worth reading if you
 have already decided SRAM is irrelevant: **it reads measurably faster than HBM on the TPC path —
-1.18× at the best configuration, 10.2 % with non-overlapping distributions at a smaller one — and the
-gap is small because the TPC array, not the memory, is the binding constraint** (§7.6). It is still the
+10.2 % with non-overlapping distributions at 4 MB, and 1.18× at the highest rate we saw (32 MB, one rep
+against the best of three) — and the gain is small because both arms land within ~10 % of the same
+per-core band, which points at the TPC array rather than the memory (INFERRED)** (§7.6). It is still the
 only lever in this manual that changes *where bytes live* rather than how they are moved, and the
 chapter gives you the two ways to put bytes there yourself (§7.3.2) and the ladder for proving what the
 compiler placed (§7.5.4).
@@ -103,9 +104,11 @@ explains.
 **That negative has since been tested, and it moved by 1.4 %.** The one **SRAM-resident** arm measured
 since (§7.6) reaches **2,338 GB/s = 95.4 % of spec** — above the old 2,306 GB/s ceiling, and still
 below spec. §4.1.2's independent HBM-side measurement brackets it too: six well-packed TPC arms sit
-dead flat at **2.26–2.43 TB/s**. **The size of that move is the finding**: the ceiling is the **TPC
-array's**, not the memory's, so putting the bytes in SRAM buys a per cent or two at the array's limit
-rather than the multiple the two memories' specifications would imply.
+dead flat at **2.26–2.43 TB/s**. **MEASURED.** **The size of that move is the finding**: it points at the
+**TPC array**, not the memory, as what limits a TPC read — so putting the bytes in SRAM buys a per cent
+or two at that limit rather than the multiple the two memories' specifications would imply. **That last
+step is INFERRED rather than measured** — one SRAM point inside an HBM-fed band does not distinguish the
+array's cap from SRAM's own supply to a TPC (§7.6).
 
 ---
 
@@ -336,7 +339,7 @@ only in `(sramAlloc, noInit)` produced an **identical** recipe address. **Do not
 What actually decides aux placement is whether the buffer has data, and its size:
 
 ```
-pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB)   => SRAM
+pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB by default)   => SRAM
 ```
 
 `noInit` controls **initialisation**, not placement. **MEASURED**, same ELF and same glue, only
@@ -348,6 +351,13 @@ pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB)   =>
 | 1 MiB | SRAM `0x1000fffffd080000` | 256 B |
 | 12 MiB | **no SRAM address** | 25,166,080 B |
 
+**The DRAM arm's workspace has a computable size, and that is what makes it a usable gate: `2 × the
+buffer + 256 B`.** The 12 MiB row above is `2 × 12 MiB + 256 B` **exactly**, and the 64 MB fallback
+further down is `2 × 64 MiB + 256 B` **exactly** — **MEASURED**, two independent witnesses to the same
+rule. So a 4 MiB buffer should show **8,388,864 B** and a 32 MB buffer **67,109,120 B**. **Check the
+number you observe against the one your own buffer predicts** — a remembered figure from someone else's
+run is not a gate.
+
 So at the **default** the usable ceiling is **~10 MiB per aux tensor** — *per tensor, not per node* —
 against a 48 MiB aperture shared with every TPC and every concurrent kernel.
 
@@ -355,8 +365,9 @@ against a 48 MiB aperture shared with every TPC and every concurrent kernel.
 `GCFG_SCRATCHPAD_SRAM_MAX_SIZE` *is* that ~10 MiB, so raising it moves the gate: with it set to 48 MB,
 a **32 MB** aux lands in SRAM (workspace **256 B**, §7.6). What binds next is the **48 MiB aperture**
 itself, and it binds **silently** — a **64 MB** aux exceeds it and falls back to the DRAM workspace
-**in the arm you believe is the SRAM arm**, with `workspace = 134,217,984 B` as the only evidence.
-**Read the workspace size, not the intent.**
+**in the arm you believe is the SRAM arm**, with `workspace = 134,217,984 B` as the only evidence
+(`2 × 64 MiB + 256 B`, exactly the rule above). **Read the workspace size, not the intent.**
+**MEASURED.**
 
 **And it works end to end. MEASURED:** the aux tensor lands at `0x1000fffffd080000` inside the
 aperture, the kernel writes `0x5A5A1234` **through its descriptor**, and the host DMAs those exact
@@ -364,10 +375,11 @@ bytes back from that address. Reproduced **3x**. Host -> SRAM -> compute engine,
 nodes in one graph, each with its own 4 KiB SRAM aux, get addresses `SRAM+0x80000` and `SRAM+0x81000`
 — delta exactly `0x1000`, each signature found exactly once. **No collision.**
 
-**What this buys, stated plainly:** a declared **scratch buffer** up to ~10 MiB. It is **not** a way
-to hold model weights, and it is **not** a way to place a tensor. It is how you get a small hot buffer
-somewhere you can prove, and it is one of the instruments for proving that the compiler's own
-placement is real (§7.5.4).
+**What this buys, stated plainly:** a declared **scratch buffer** up to the **default ~10 MiB**, or as
+large as `GCFG_SCRATCHPAD_SRAM_MAX_SIZE` allows (§7.6 used **32 MB**). It is **not** a way to hold model
+weights, and it is **not** a way to place a tensor. It is how you get a small hot buffer somewhere you
+can prove, and it is one of the instruments for proving that the compiler's own placement is real
+(§7.5.4).
 
 **And the neighbouring header comment is wrong too:** `auxiliaryTensorNr` is documented as *"will be
 set by GC to MAX_AUX_NUM"* and arrives as **0** on first instantiation. A glue that treats it as a
@@ -536,9 +548,10 @@ Four gates, and an arm that fails any of them is not the arm you think it is:
 2. **`maxRange.size` identical across arms.** If the clamp did not take effect, any timing under it
    is meaningless (§7.2.3).
 3. **`hl-smi` uncorrected-event count before and after** (§7.7).
-4. **The graph's `workspace_size`, when the arm is supposed to materialise a DRAM copy.** A gate that
-   cannot be read the wrong way: **256 B** means nothing was materialised, **92,274,944 B** means a
-   DRAM copy was allocated (§7.6). It is also what catches a tile that silently fell back.
+4. **The graph's `workspace_size`, when the arm is supposed to materialise a DRAM copy.** A gate whose
+   expected value is arithmetic: **256 B** means nothing was materialised, **`2 × buffer + 256 B`**
+   means a DRAM copy was allocated (§7.3.2 derives the rule, §7.6 applies it). It is also what catches a
+   tile that silently fell back.
 
 ### 7.5.3 Interleave the arms
 
@@ -573,16 +586,16 @@ worth nothing. There is a ladder of instruments; each proves something different
 | post-graph dump `"allocation": "SRAM"` | a tensor is section-backed in SRAM | a **graph-node** fact, not runtime occupancy — and it needs a cold cache, since a hit builds no graph |
 | a scan of the recipe for 64-bit values inside `[SRAM_BASE, SRAM_BASE + 48 MiB)` | a recipe carries SRAM addresses | **under-reports**: one base at a fixed offset, with per-node placement as base-relative patch data |
 | **`synRecipeSerialize`** → scan the written file for in-window 64-bit values | the aux tensor's **actual device address** | the check that separates real placement from a silent fallback — one in-window value at a fixed offset here, none in the DRAM window |
-| **the graph's `workspace_size`** — 256 B against 92,274,944 B | whether the compiler **materialised a DRAM copy** of the buffer | it is a **graph-object** field, so it appears in only a minority of dump files (224 of 21,763 in one census, [§3.6.6](03-porting.md)); read it for *the* graph that ran, and prefer it to any count of placement lines |
+| **the graph's `workspace_size`** — 256 B against `2 × buffer + 256 B` | whether the compiler **materialised a DRAM copy** of the buffer | it is a **graph-object** field, so it appears in only a minority of dump files (224 of 21,763 in one census, [§3.6.6](03-porting.md)); read it for *the* graph that ran, and prefer it to any count of placement lines |
 | **a runtime signature scan** — write a known pattern into the aperture and DMA it back | the aperture is real and yours to populate | needs `synHostMalloc` staging; a plain heap buffer returns 34 and tells you nothing (§7.3.2) |
-| re-gating `inSram` on the **exact graph** | *this* graph placed, not one that looked equivalent | construction decides placement, not shape (§7.3.1) |
+| re-gating the placement line for the operand under test on the **exact graph** | *this* graph placed *that* tensor, not one that looked equivalent | construction decides placement, not shape (§7.3.1); and a **count** of `inSram: true` lines is not the gate (§7.5.2) |
 
 **The principle under all of them, and it is the transferable part:** *require a property the wrong
 explanation cannot produce.* An address inside the aperture. A byte-exact host DMA match. `st_g`
 rather than `st_l` in a TPC listing. A fault that the alternative explanation would also have produced
 proves nothing.
 
-## 7.6 What it is worth — measured, and why it is only 1.18×
+## 7.6 What it is worth — measured, and why the gain is small
 
 **This section used to take a position instead of quoting a number:**
 
@@ -590,7 +603,7 @@ proves nothing.
 > yet demonstrated that.**
 
 **That is out of date. It has been demonstrated on the TPC path**, and this section states the size of
-the effect and — the more useful half — why the effect is small.
+the effect and — the more useful half — what can and cannot be said about why the gain is small.
 
 **The measurement, and the conditions that decide what it means.** One **custom TPC kernel**
 (`sram_bw_gaudi2`), built with `tpc-clang` on the same glue and entry-point pattern as `fp4_dequant`,
@@ -601,43 +614,67 @@ buffer is in SRAM, at 1 MiB the compiler sends it to the DRAM workspace instead.
 size comparison, and **not** the knob whose unsigned-underflow trap §7.2.3 warns about — that one is
 `GCFG_SET_SRAM_SIZE`; and neither arm is gated on the knob's name, only on the workspace size below.)*
 
-**The placement gate is the workspace size, and it is unambiguous** — read on every run:
+**The placement gate is the workspace size, and its expected value is computable — which is what makes
+it unbreakable.** Nothing materialised is **256 B**; a DRAM copy is **2 × the buffer + 256 B**, the rule
+§7.3.2 derives from two independent buffers. So the gate is arithmetic you can check for *your* buffer:
 
-| arm | workspace | what it means |
+| arm | workspace, expected | what it means |
 |---|---|---|
 | SRAM | **256 B** | nothing materialised; the buffer is in the aperture |
-| DRAM | **92,274,944 B** | the compiler allocated a DRAM copy of the same buffer |
+| DRAM | **2 × the buffer + 256 B** — 4 MB → 8,388,864 B, 32 MB → 67,109,120 B | the compiler allocated a DRAM copy of the buffer |
+
+**One loose end, stated rather than smoothed over.** The DRAM gate recorded in the source run behind
+these rates reads **92,274,944 B**, which by that rule is `2 × 44 MiB + 256 B` — a **44 MiB** buffer.
+**Neither of the two configurations tabulated below is 44 MiB**, so that figure is not this
+measurement's gate, and which run it belongs to has not been recovered: treat its configuration as
+**UNKNOWN**. It does not weaken either arm — the SRAM arm's **256 B** proves nothing was materialised,
+and any non-trivial DRAM workspace proves a copy was — but it is exactly the hazard `README.md` names,
+a figure that recomputes to something plausible and therefore reads as right.
 
 | configuration | SRAM | DRAM | ratio |
 |---|---|---|---|
-| **32 MB × 16 nodes = 512 MB read** (best rate) | **2,338 GB/s** | **1,974 GB/s** | **1.18×** |
 | **4 MB × 16 nodes = 64 MB read** | **1,141.7 GB/s** (1154.6 / 1123.7 / 1146.8) | **1,036.4 GB/s** (1046.1 / 1032.2 / 1031.0) | **+10.2 %** |
+| **32 MB × 16 nodes = 512 MB read** (highest rate) | **2,338 GB/s** | **1,974 GB/s** | **1.18×** |
 
-**The 4 MB row is the one that carries the direction.** Three reps per arm, and the distributions do
-not overlap: SRAM's **minimum** (1,123.7) is above DRAM's **maximum** (1,046.1). A confirmation run
-gave 1,151.6 against 1,022.8 — **12.6 %**.
+**MEASURED** — same box, one process per arm, gate read on every run. *(The per-config workspace values
+are the ones the rule predicts, 8,388,864 B and 67,109,120 B; the source record's DRAM value is the
+44 MiB one flagged above, so the numbers to reproduce are the rates and the SRAM arm's 256 B.)*
 
-**The 32 MB row is the best configuration, and it is weaker evidence than its precision suggests.** It
-is **one rep per arm**, and the DRAM arm alone spanned **1,573–1,974 GB/s across three identical runs**
-— so 1.18× is **best-vs-best**, and that arm's own spread is wider than the effect it is being used to
-show. Quote it as the configuration that reaches the highest rate, not as an independent confirmation.
-The two rows are also **different kernel versions** (8 accumulators at 4 MB, 16 at 32 MB), so they are
-two A/Bs, not a size sweep of one.
+**The 4 MB row is the one that carries the direction, and it is the headline.** Three reps per arm, and
+the distributions do not overlap: SRAM's **minimum** (1,123.7) is above DRAM's **maximum** (1,046.1). A
+confirmation run gave 1,151.6 against 1,022.8 — **12.6 %**.
 
-**Why the gap is small — and this is the part to carry away.** `DUMP_POST_GRAPHS` reports
-**`tpc_working_engines: [24,24,24]` on all 16 nodes**: the full TPC array is engaged, in both arms.
+**The 32 MB row is the highest rate we saw, and it is weaker evidence than its precision suggests.** It
+is **one SRAM rep against the best of three DRAM runs**, and the DRAM arm alone spanned **1,573–1,974
+GB/s across those three identical runs** — so 1.18× is **best-vs-best**, and that arm's own spread is
+wider than the effect it is being used to show. That comparison is **conservative for SRAM** (its single
+rep against DRAM's best), and it is still not an effect size: quote it as the configuration that reaches
+the highest rate. The two rows are also **different kernel versions** (8 accumulators at 4 MB, 16 at
+32 MB), so they are two A/Bs, not a size sweep of one.
+
+**Why the gap is small — and the honest answer is that we can say where each arm lands, not fully
+why.** `DUMP_POST_GRAPHS` reports **`tpc_working_engines: [24,24,24]` on all 16 nodes**: the full TPC
+array is **engaged**, in both arms. **Engaged is not saturated** — that field counts working engines,
+and it is not a bandwidth measurement.
 
 | | aggregate | per core (÷ 24 TPCs) | against the measured ceilings |
 |---|---|---|---|
-| SRAM arm | 2,338 GB/s | **97.4 GB/s** | **+9 %** on §1.6's 89.5 GB/s-per-core stream envelope |
-| DRAM arm | 1,974 GB/s | **82.3 GB/s** | **−8 %** on it; **87 %** of §4.1.2's 2.26 TB/s memory floor; 81 % of the 2,450 GB/s spec |
+| SRAM arm | 2,338 GB/s | **97.4 GB/s** | **+9 %** on §1.6's 89.5 GB/s-per-core stream envelope; **103 %** of §4.1.2's 2.26 TB/s floor |
+| DRAM arm | 1,974 GB/s | **82.3 GB/s** | **−8 %** on §1.6's envelope; **87 %** of §4.1.2's 2.26 TB/s floor, i.e. **~13 % below** it; 81 % of the 2,450 GB/s spec |
 
-**Both arms are within ~10 % of the same per-core ceiling, and that ceiling belongs to the array.**
-§4.1.2 measures the same cap from the **HBM** side — six well-packed TPC arms dead flat at
-**2.26–2.43 TB/s** — so ~2.3–2.4 TB/s is what 24 TPCs consume *whatever the bytes come from*. The DRAM
-arm cannot reach it, because HBM supply holds it 8 % short; the SRAM arm sits **on** it. That leaves
-only ~10 % of room between the two arms for SRAM to win in, which is the whole explanation for a ratio
-the specifications (2.45 TB/s against an on-die pool) would suggest should be far larger.
+**Where each arm lands, with no mechanism attached.** The SRAM arm's 2,338 GB/s is **inside** §4.1.2's
+**HBM-fed** band of 2.26–2.43 TB/s. The DRAM arm's 1,974 GB/s is **~13 % below that band's floor**. **Why
+a DRAM-resident read of this kernel falls short of a rate that HBM demonstrably supplies in §4.1.2 is
+NOT established** — and it cannot be a supply limit, because §4.1.2's six arms are themselves HBM-fed
+and they exceed this arm. The distance between the two arms here is **~18 %** (97.4 against 82.3 GB/s
+per core), which is the room SRAM had to win in at this configuration.
+
+**⚠ "The engines bind, not the memory" is INFERRED, not measured, and one point cannot separate the two
+explanations that fit it.** What is measured is that **one** SRAM point (2,338 GB/s) lands inside a band
+measured **from HBM**. That is equally consistent with **(i)** the TPC array capping at ~2.3–2.4 TB/s
+and **(ii)** SRAM's own supply to a TPC happening to be ~2.3–2.4 TB/s. **Nothing in this measurement
+distinguishes them**; the discriminating test is §7.8 item 2(b) — push the SRAM arm past the array's
+rate, or use an engine with more appetite per core.
 
 *(The per-core column in the table above is a division of the aggregate by the 24 TPCs in
 `TPC_ENABLED_MASK` (§7.1); the same division on §1.6's **2,147 GB/s** aggregate gives **89.5 GB/s per
@@ -645,18 +682,19 @@ core**. §1.6 quotes the aggregate — the per-core form is spelled out here bec
 comparison to the array a comparison.)*
 
 > **The honest framing, in one sentence.** *This is a real, repeatable SRAM advantage over HBM on the
-> TPC path — 1.18× at 32 MB, 10.2 % at 4 MB with non-overlapping distributions — and it is small
-> because the TPC array caps out around 2.3–2.4 TB/s: **the memory is not the limit, the engines
-> are**.*
+> TPC path — **+10.2 % at 4 MB with non-overlapping distributions, and 1.18× at the highest rate we saw
+> (32 MB, one rep against the best of three)** — and it is small because both arms land within ~10 % of
+> the same per-core band, ~2.3–2.4 TB/s, which **points at** the array rather than the memory as the
+> binding constraint (**INFERRED**, above — one measurement does not settle it).*
 
 **Reaching SRAM's own bandwidth needs an engine with more appetite, and that engine is the MME.** The
 design intent is explicit — the vendor's architecture page says the SRAM has *"sufficient bandwidth to
 allow MME, TPC, DMAs and RDMA NICs to operate in parallel"* — and the compiler is built for it
 (`m_mmeBundles` slices MME operands to fit SRAM; `flatten_mme` propagates SRAM placement onto them,
 §7.2.1). **ASSUMED** for the design-intent quote, **source read** for the passes. **What stops it is the
-compiler, not the silicon:** an MME operand marked `inSram: true` with `Num of slices: 1` does **not**
-shrink the workspace, so that placement **adds a staging copy rather than replacing one**. That is §7.8
-item 1, and it is the open half of the question.
+compiler, not the silicon — MEASURED:** an MME operand marked `inSram: true` with `Num of slices: 1`
+does **not** shrink the workspace, so that placement **adds a staging copy rather than replacing one**.
+That is §7.8 item 1, and it is the open half of the question.
 
 **The levers that produced these numbers, in the order they paid** — kernel-level, and transferable to
 any TPC kernel that streams:
@@ -688,8 +726,8 @@ could not distinguish memories at all. **A null from a slow kernel is a null abo
 **What this measurement does not establish, stated so it is not built on:**
 
 - **Nothing about the MME path.** This is a TPC result; §7.8 item 1 is untouched by it.
-- **Nothing about SRAM's bandwidth above the TPC ceiling.** 2,338 GB/s is where our instrument stopped
-  because the **array** stopped, not where the pool stopped.
+- **Nothing about SRAM's bandwidth above the TPC band.** 2,338 GB/s is where our **instrument** stopped
+  — whether that is the array's cap or SRAM's own supply to a TPC is not separated by one point (§7.6).
 - **The harness's own per-rep overhead is not measured**, so the two ratios are **lower bounds** on
   anything: a fixed additive overhead depresses both arms and compresses the ratio (§7.6.1 item 4).
 - **Nothing about a production span.** This is a standalone kernel, not a span A/B, so it does not price
@@ -741,17 +779,18 @@ admired:
 | item | §7.6's measurement |
 |---|---|
 | 1, one process per arm | **met** — separate process per `SCRATCHPAD_SRAM_MAX_SIZE` value |
-| 2, process-level interleave and a floor for *this* workload | **met, and it is what limits the 32 MB figure** — three identical DRAM runs spanned **1,573–1,974 GB/s**, a **25 %** spread that is wider than that row's own 18 % ratio |
-| 3, gate on a completed log delta | **exceeded** — the gate is a **byte value in the graph dump** (workspace 256 B against 92,274,944 B), not a race with an asynchronous log |
-| 4, time with `torch.hpu.Event` | **UNKNOWN, and it is the item to check before reusing these numbers** — this is a C++ Synapse harness, so it has no `torch.hpu.Event`; §1.6 records exactly this trap (a per-repetition `launch → sync` read as a device time: bench median 622.1 µs against a device union of 530.5 µs). The per-rep host overhead of *this* harness was not measured. **If it is non-zero it depresses both arms equally and therefore compresses the ratio**, so 1.18× / 10.2 % are lower bounds rather than inflated |
+| 2, process-level interleave and a floor for *this* workload | **partly met — and the floor is what fails** — a floor was measured and it is **larger than the 32 MB effect** (three identical DRAM runs spanned **1,573–1,974 GB/s**, a **25 %** spread against that row's 18 % ratio), which is why that row is a **rate** and not an effect size; **process-level `A,B,A,B` interleaving is not evidenced** by anything we have |
+| 3, gate on a completed log delta | **exceeded** — the gate is a **byte value in the graph dump** (256 B against `2 × buffer + 256 B`), not a race with an asynchronous log |
+| 4, time with `torch.hpu.Event` | **UNKNOWN, and it is the item to check before reusing these numbers** — this is a C++ Synapse harness, so it has no `torch.hpu.Event`; §1.6 records exactly this trap (a per-repetition `launch → sync` read as a device time: bench median 622.1 µs against a device union of 530.5 µs). The per-rep host overhead of *this* harness was not measured. **If it is non-zero it depresses both arms equally and therefore compresses the ratio**, so 10.2 % / 1.18× are lower bounds rather than inflated |
 | 5, vary the work rather than repeat it | **met** — the work was varied (buffer size, and later kernel form) rather than the timed unit being raised by repetition; where reps exist they are reported as a distribution |
-| 6, min and median together, distributions not single pairs | **met for the 4 MB pair** (three reps, non-overlapping); **explicitly not met for 32 MB**, which is flagged as best-vs-best |
+| 6, min and median together, distributions not single pairs | **met for the 4 MB pair** (three reps, non-overlapping); **explicitly not met for 32 MB**, which is flagged as one SRAM rep against the best of three DRAM runs |
 | 7, re-gate on the exact graph | **met** — one kernel, one graph per arm, gated every run |
 
 **The rule that follows is the general one: a measurement is only as good as its weakest item, and
-naming which item it is makes the number usable.** Here six of the seven are met or exceeded, item 4 is
-**UNKNOWN**, and the consequence is stated rather than assumed: the **4 MB** figure is usable as an
-effect size at its stated scope, and the **32 MB** figure is usable as a *rate*, not as an effect size.
+naming which item it is makes the number usable.** Here **four and a half of the seven** are met or
+exceeded, item 2 is **partly met**, item 4 is **UNKNOWN**, and the consequence is stated rather than
+assumed: the **4 MB** figure is usable as an effect size at its stated scope, and the **32 MB** figure
+is usable as a *rate*, not as an effect size.
 
 ## 7.7 Safety: how to brick a card, and how not to
 
@@ -805,7 +844,7 @@ this table is the raw mapping.)
 | # | open | what would settle it |
 |---|---|---|
 | 1 | **Whether the MME can read SRAM at the hardware level.** The compiler evidence is strong (`m_mmeBundles`, and `flatten_mme` propagating SRAM onto MME operands) — but a clean isolated MME-from-SRAM bandwidth test has not been run, and §7.6 is a **TPC** result that does not bear on it. What §7.6 does add is the compiler half: an MME operand marked `inSram: true` with `Num of slices: 1` does **not** shrink the workspace, so the placement adds a staging copy rather than replacing one. | A kernel pair differing only in operand placement, with `inSram: true` gated, at a size large enough to be bandwidth-bound — **and the workspace shrinking in the SRAM arm**, which is the part that has never been observed. |
-| 2 | **Whether SRAM is faster than HBM for a compute engine, and by how much — PARTLY ANSWERED on the TPC path (§7.6).** **MEASURED:** **1.18×** at 32 MB × 16 (2,338 against 1,974 GB/s, one rep per arm, best-vs-best) and **+10.2 %** at 4 MB × 16 with three reps per arm and **non-overlapping** distributions, gated on the graph's workspace size (256 B against 92,274,944 B). The old per-TPC figure (1.24 GB/s SRAM against 1.02 GB/s DRAM, 1.21×) came from a single TPC doing scalar accesses with index-space parallelism held at 1 — **not a bandwidth figure**, and superseded as a bandwidth statement. (Host DMA into SRAM is PCIe-bound at ~19 GB/s and says nothing about the pool either.) **Still open: (a) the MME path**, the only engine with the appetite to reach the pool's bandwidth, where the compiler adds a staging copy rather than replacing one (item 1); **and (b) SRAM's bandwidth above the TPC ceiling** — 2,338 GB/s is where the array stopped (97.4 GB/s per core against §1.6's 89.5 envelope), not where the pool stopped. | **(a)** an MME arm reading an SRAM-resident operand with the **workspace shrinking**; **(b)** an engine faster per core than a TPC — which is (a) again — or a TPC kernel past ~2.4 TB/s aggregate, which nothing in this project has reached. |
+| 2 | **Whether SRAM is faster than HBM for a compute engine, and by how much — PARTLY ANSWERED on the TPC path (§7.6).** **MEASURED:** **+10.2 %** at 4 MB × 16 with three reps per arm and **non-overlapping** distributions (SRAM min 1,123.7 above DRAM max 1,046.1), and **1.18×** at 32 MB × 16 (2,338 against 1,974 GB/s — **one SRAM rep against the best of three DRAM runs**, so best-vs-best), both gated on the graph's `workspace_size`. The old per-TPC figure (1.24 GB/s SRAM against 1.02 GB/s DRAM, 1.21×) came from a single TPC doing scalar accesses with index-space parallelism held at 1 — **not a bandwidth figure**, and superseded as a bandwidth statement. (Host DMA into SRAM is PCIe-bound at ~19 GB/s and says nothing about the pool either.) **Still open: (a) the MME path**, the only engine with the appetite to reach the pool's bandwidth, where the compiler adds a staging copy rather than replacing one (item 1); **and (b) which constraint binds above ~2.3–2.4 TB/s** — one SRAM point landing inside an HBM-fed band cannot separate "the array caps here" from "SRAM's supply to a TPC happens to be here" (§7.6), and 2,338 GB/s is where our instrument stopped, not where the pool stopped. | **(a)** an MME arm reading an SRAM-resident operand with the **workspace shrinking**; **(b)** the discriminating test for the binding constraint — a TPC kernel pushed **past** ~2.4 TB/s aggregate (which nothing in this project has reached), or an engine with more appetite per core, which is (a) again. |
 | 3 | **Whether the orphaned memory-strategy optimizer works on Gaudi 2.** It has never executed in 1.24.2. If `STATIC_TENSORS_PREFETCHED_ACT_IN_SRAM` worked, **all activations** would leave DRAM — a much larger prize than any single tensor. | Call it behind a flag on a small graph and check `maxRange.size` and `inSram` counts against the slicer's. |
 | 4 | **Whether production model weights actually land in SRAM.** They are persistent parameters (§7.3.1's *run A*), but production MoE weights are **produced by the fp4→fp8 dequant**, which is arithmetic — so they are *structurally* placeable (a **derived** inference, not a measurement). §7.3.1's construction finding then decides it: a single `bmm` places, per-expert GEMMs plus a `cat` does not. So this is **plausible but unproven**, and it depends on how the model builds the graph. | `inSram: true` gating on the **real** engine graph, per layer, with the construction named. |
 | 5 | **How much of the 48 MiB a real decode step can hold.** The aux route caps at **~10 MiB per tensor at the default knob** (and is raiseable — §7.3.2 puts a 32 MB aux in SRAM), the slicer's budget is ~47.5 MB, and §7.3.5 shows the one tile class we can size fits with ~10 MB of headroom — but what fraction a *production* graph can use before fragmentation binds is unmeasured. | Sweep `SRAM_SLICER_MAX_CAPACITY_BYTES` on a real graph and read the placement the slicer achieves at each cap. |
@@ -832,14 +871,18 @@ this table is the raw mapping.)
 5. **Eligibility is graph structure: a tensor needs a real compute producer.** A view does not
    qualify; an elementwise op does. **Give a weight a producer that costs nothing *extra*** — one
    elementwise pass, not a view.
-6. **Observe, do not request.** Gate on `inSram: true` and on `maxRange.size`; treat a 0-byte
-   `graph_compiler.log` as a capture failure; interleave the arms.
-7. **SRAM reads measurably faster than HBM on the TPC path — 1.18× at 32 MB, 10.2 % at 4 MB with
-   non-overlapping distributions — and the gap is small because the TPC array, not the memory, is the
-   binding constraint.** 2,338 GB/s over 24 TPCs is **97.4 GB/s per core** against §1.6's **89.5 GB/s
-   per core** envelope, and the array caps at **~2.3–2.4 TB/s whatever the bytes come from** (§7.6,
-   §4.1.2). Reaching the pool's own bandwidth needs the **MME**, which the compiler cannot currently
-   feed from SRAM without adding a staging copy. **§7.6.1 is what a *span-level* measurement still has
+6. **Observe, do not request.** Gate on the placement line for the operand under test, on
+   `maxRange.size`, and — for an aux arm — on `workspace_size` against `2 × buffer + 256 B`; treat a
+   0-byte `graph_compiler.log` as a capture failure; interleave the arms.
+7. **SRAM reads measurably faster than HBM on the TPC path — +10.2 % at 4 MB with non-overlapping
+   distributions, and 1.18× at the highest rate we saw (32 MB, one rep against the best of three) —
+   and the gain is small because both arms land within ~10 % of the same per-core band, ~2.3–2.4 TB/s.**
+   2,338 GB/s over 24 TPCs is **97.4 GB/s per core** against §1.6's **89.5 GB/s per core** envelope, and
+   §4.1.2 measures the same band from the **HBM** side. That **points at** the array rather than the
+   memory as the binding constraint — **INFERRED, not measured**: one SRAM point inside an HBM-fed band
+   cannot separate "the array caps here" from "SRAM's supply to a TPC happens to be here" (§7.6).
+   Reaching the pool's own bandwidth needs the **MME**, which the compiler cannot currently feed from
+   SRAM without adding a staging copy. **§7.6.1 is what a *span-level* measurement still has
    to satisfy** — this one is a kernel, not a span.
 8. **A return code is not a measurement, and here it costs a card.** `synMemCopyAsync` accepts any
    address and faults asynchronously.
