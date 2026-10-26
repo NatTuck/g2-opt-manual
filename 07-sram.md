@@ -351,12 +351,17 @@ pData == nullptr  AND  write-space < GCFG_SCRATCHPAD_SRAM_MAX_SIZE (10 MiB by de
 | 1 MiB | SRAM `0x1000fffffd080000` | 256 B |
 | 12 MiB | **no SRAM address** | 25,166,080 B |
 
-**The DRAM arm's workspace has a computable size, and that is what makes it a usable gate: `2 × the
+**In a graph with a *single* aux tensor, the DRAM arm's workspace has a computable size: `2 × the
 buffer + 256 B`.** The 12 MiB row above is `2 × 12 MiB + 256 B` **exactly**, and the 64 MB fallback
-further down is `2 × 64 MiB + 256 B` **exactly** — **MEASURED**, two independent witnesses to the same
-rule. So a 4 MiB buffer should show **8,388,864 B** and a 32 MB buffer **67,109,120 B**. **Check the
-number you observe against the one your own buffer predicts** — a remembered figure from someone else's
-run is not a gate.
+further down is `2 × 64 MiB + 256 B` **exactly** — **MEASURED**, two independent witnesses. So a lone
+4 MiB aux should show **8,388,864 B** and a lone 32 MB aux **67,109,120 B**.
+
+**Scope that before you use it as a gate, because it does not survive to a multi-node graph.** With N
+independent aux allocations in one graph the workspace is a **single pool**, not N × the per-tensor
+figure: the one case we have — **16 × 4 MB, DRAM arm** — reads **92,274,944 B** (88 MiB + 256 B), which
+is not `2 × 4 MiB + 256 B` (§7.6). So use the arithmetic for one aux, and for N aux use the
+**qualitative** form: **256 B means nothing was materialised; anything substantially larger means a DRAM
+copy was.** A remembered figure from someone else's run is not a gate either way.
 
 So at the **default** the usable ceiling is **~10 MiB per aux tensor** — *per tensor, not per node* —
 against a 48 MiB aperture shared with every TPC and every concurrent kernel.
@@ -548,10 +553,11 @@ Four gates, and an arm that fails any of them is not the arm you think it is:
 2. **`maxRange.size` identical across arms.** If the clamp did not take effect, any timing under it
    is meaningless (§7.2.3).
 3. **`hl-smi` uncorrected-event count before and after** (§7.7).
-4. **The graph's `workspace_size`, when the arm is supposed to materialise a DRAM copy.** A gate whose
-   expected value is arithmetic: **256 B** means nothing was materialised, **`2 × buffer + 256 B`**
-   means a DRAM copy was allocated (§7.3.2 derives the rule, §7.6 applies it). It is also what catches a
-   tile that silently fell back.
+4. **The graph's `workspace_size`, when the arm is supposed to materialise a DRAM copy.** **256 B** means
+   nothing was materialised; anything substantially larger means a DRAM copy was allocated. The expected
+   size is arithmetic only for a **single** aux tensor — `2 × buffer + 256 B` (§7.3.2) — because with N
+   aux allocations in one graph the workspace is one **pool** (§7.6's 16-node arm reads 92,274,944 B).
+   Either way it is also what catches a tile that silently fell back.
 
 ### 7.5.3 Interleave the arms
 
@@ -586,7 +592,7 @@ worth nothing. There is a ladder of instruments; each proves something different
 | post-graph dump `"allocation": "SRAM"` | a tensor is section-backed in SRAM | a **graph-node** fact, not runtime occupancy — and it needs a cold cache, since a hit builds no graph |
 | a scan of the recipe for 64-bit values inside `[SRAM_BASE, SRAM_BASE + 48 MiB)` | a recipe carries SRAM addresses | **under-reports**: one base at a fixed offset, with per-node placement as base-relative patch data |
 | **`synRecipeSerialize`** → scan the written file for in-window 64-bit values | the aux tensor's **actual device address** | the check that separates real placement from a silent fallback — one in-window value at a fixed offset here, none in the DRAM window |
-| **the graph's `workspace_size`** — 256 B against `2 × buffer + 256 B` | whether the compiler **materialised a DRAM copy** of the buffer | it is a **graph-object** field, so it appears in only a minority of dump files (224 of 21,763 in one census, [§3.6.6](03-porting.md)); read it for *the* graph that ran, and prefer it to any count of placement lines |
+| **the graph's `workspace_size`** — 256 B against a non-trivial value; `2 × buffer + 256 B` only for a **single** aux | whether the compiler **materialised a DRAM copy** of the buffer | it is a **graph-object** field, so it appears in only a minority of dump files (224 of 21,763 in one census, [§3.6.6](03-porting.md)); read it for *the* graph that ran, and prefer it to any count of placement lines |
 | **a runtime signature scan** — write a known pattern into the aperture and DMA it back | the aperture is real and yours to populate | needs `synHostMalloc` staging; a plain heap buffer returns 34 and tells you nothing (§7.3.2) |
 | re-gating the placement line for the operand under test on the **exact graph** | *this* graph placed *that* tensor, not one that looked equivalent | construction decides placement, not shape (§7.3.1); and a **count** of `inSram: true` lines is not the gate (§7.5.2) |
 
@@ -614,31 +620,32 @@ buffer is in SRAM, at 1 MiB the compiler sends it to the DRAM workspace instead.
 size comparison, and **not** the knob whose unsigned-underflow trap §7.2.3 warns about — that one is
 `GCFG_SET_SRAM_SIZE`; and neither arm is gated on the knob's name, only on the workspace size below.)*
 
-**The placement gate is the workspace size, and its expected value is computable — which is what makes
-it unbreakable.** Nothing materialised is **256 B**; a DRAM copy is **2 × the buffer + 256 B**, the rule
-§7.3.2 derives from two independent buffers. So the gate is arithmetic you can check for *your* buffer:
+**The placement gate is the workspace size.** **256 B** means nothing was materialised; a non-trivial
+workspace means a DRAM copy was allocated. **Both arms' values are observed, and the DRAM one is named to
+its configuration:**
 
-| arm | workspace, expected | what it means |
-|---|---|---|
-| SRAM | **256 B** | nothing materialised; the buffer is in the aperture |
-| DRAM | **2 × the buffer + 256 B** — 4 MB → 8,388,864 B, 32 MB → 67,109,120 B | the compiler allocated a DRAM copy of the buffer |
+| arm | workspace | configuration | what it means |
+|---|---|---|---|
+| SRAM | **256 B** | **4 MB × 16 nodes** (observed) — and definitionally the value for *any* aux that lands in SRAM | nothing materialised; the buffer is in the aperture |
+| DRAM | **92,274,944 B** (88 MiB + 256 B) | **4 MB × 16 nodes** | the compiler allocated a DRAM copy |
 
-**One loose end, stated rather than smoothed over.** The DRAM gate recorded in the source run behind
-these rates reads **92,274,944 B**, which by that rule is `2 × 44 MiB + 256 B` — a **44 MiB** buffer.
-**Neither of the two configurations tabulated below is 44 MiB**, so that figure is not this
-measurement's gate, and which run it belongs to has not been recovered: treat its configuration as
-**UNKNOWN**. It does not weaken either arm — the SRAM arm's **256 B** proves nothing was materialised,
-and any non-trivial DRAM workspace proves a copy was — but it is exactly the hazard `README.md` names,
-a figure that recomputes to something plausible and therefore reads as right.
+**Do not expect `2 × buffer + 256 B` here.** That rule is a **per-tensor accounting for a single-aux
+graph** (§7.3.2 — exact on a 12 MiB aux and on a 64 MB tile), and it **does not describe a 16-node arm**:
+with 16 independent aux allocations in one graph the workspace is one **pool**, which is why 16 × 4 MB
+reads 88 MiB + 256 B rather than 8 MiB + 256 B. So the gate has a **quantitative** form for one aux and a
+**qualitative** form here — 256 B against tens of MB — and a reader reproducing the 16-node configuration
+should expect the pool, not ~8.4 MB. *(The 32 MB × 16 arm's DRAM workspace value is not in the record
+behind this section.)*
 
 | configuration | SRAM | DRAM | ratio |
 |---|---|---|---|
 | **4 MB × 16 nodes = 64 MB read** | **1,141.7 GB/s** (1154.6 / 1123.7 / 1146.8) | **1,036.4 GB/s** (1046.1 / 1032.2 / 1031.0) | **+10.2 %** |
 | **32 MB × 16 nodes = 512 MB read** (highest rate) | **2,338 GB/s** | **1,974 GB/s** | **1.18×** |
 
-**MEASURED** — same box, one process per arm, gate read on every run. *(The per-config workspace values
-are the ones the rule predicts, 8,388,864 B and 67,109,120 B; the source record's DRAM value is the
-44 MiB one flagged above, so the numbers to reproduce are the rates and the SRAM arm's 256 B.)*
+**MEASURED** — same box, one process per arm, gate read on every run. *(The DRAM value is the one observed
+on the **4 MB × 16** arm. The **32 MB × 16** arm's DRAM workspace byte value is not in the record behind
+this section, so that row's gate is the qualitative one: an SRAM arm at 256 B against a non-trivial DRAM
+workspace.)*
 
 **The 4 MB row is the one that carries the direction, and it is the headline.** Three reps per arm, and
 the distributions do not overlap: SRAM's **minimum** (1,123.7) is above DRAM's **maximum** (1,046.1). A
@@ -780,7 +787,7 @@ admired:
 |---|---|
 | 1, one process per arm | **met** — separate process per `SCRATCHPAD_SRAM_MAX_SIZE` value |
 | 2, process-level interleave and a floor for *this* workload | **partly met — and the floor is what fails** — a floor was measured and it is **larger than the 32 MB effect** (three identical DRAM runs spanned **1,573–1,974 GB/s**, a **25 %** spread against that row's 18 % ratio), which is why that row is a **rate** and not an effect size; **process-level `A,B,A,B` interleaving is not evidenced** by anything we have |
-| 3, gate on a completed log delta | **exceeded** — the gate is a **byte value in the graph dump** (256 B against `2 × buffer + 256 B`), not a race with an asynchronous log |
+| 3, gate on a completed log delta | **exceeded** — the gate is a **byte value in the graph dump** (256 B against 92,274,944 B on the 4 MB × 16 arm), not a race with an asynchronous log |
 | 4, time with `torch.hpu.Event` | **UNKNOWN, and it is the item to check before reusing these numbers** — this is a C++ Synapse harness, so it has no `torch.hpu.Event`; §1.6 records exactly this trap (a per-repetition `launch → sync` read as a device time: bench median 622.1 µs against a device union of 530.5 µs). The per-rep host overhead of *this* harness was not measured. **If it is non-zero it depresses both arms equally and therefore compresses the ratio**, so 10.2 % / 1.18× are lower bounds rather than inflated |
 | 5, vary the work rather than repeat it | **met** — the work was varied (buffer size, and later kernel form) rather than the timed unit being raised by repetition; where reps exist they are reported as a distribution |
 | 6, min and median together, distributions not single pairs | **met for the 4 MB pair** (three reps, non-overlapping); **explicitly not met for 32 MB**, which is flagged as one SRAM rep against the best of three DRAM runs |
@@ -872,8 +879,10 @@ this table is the raw mapping.)
    qualify; an elementwise op does. **Give a weight a producer that costs nothing *extra*** — one
    elementwise pass, not a view.
 6. **Observe, do not request.** Gate on the placement line for the operand under test, on
-   `maxRange.size`, and — for an aux arm — on `workspace_size` against `2 × buffer + 256 B`; treat a
-   0-byte `graph_compiler.log` as a capture failure; interleave the arms.
+   `maxRange.size`, and — for an aux arm — on `workspace_size`: **256 B** means nothing was
+   materialised, anything substantially larger means a DRAM copy was (`2 × buffer + 256 B` predicts it
+   only for a **single** aux; a multi-node graph gets one pool, §7.3.2). Treat a 0-byte
+   `graph_compiler.log` as a capture failure; interleave the arms.
 7. **SRAM reads measurably faster than HBM on the TPC path — +10.2 % at 4 MB with non-overlapping
    distributions, and 1.18× at the highest rate we saw (32 MB, one rep against the best of three) —
    and the gain is small because both arms land within ~10 % of the same per-core band, ~2.3–2.4 TB/s.**
