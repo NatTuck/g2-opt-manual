@@ -952,8 +952,8 @@ Cited against the manual's own section numbers.
    comment *reproduces our measured envelope from a mechanism*, and it does so to within rounding —
    which is much stronger than either number alone. It also gives our §1.6 ceiling a *reason* (the
    load-port issue rate) where we currently state only a measurement. **THEY SAY** for the 4-cycles
-   figure; the agreement is the evidence. **Worth checking in the Grimoire** whether the TPC load port
-   is documented as 64 B/cycle, because if it is, §1.6 can say *why* the envelope is where it is.
+   figure; the agreement is the evidence. **Worth checking against a vendor source** whether the TPC load
+   port is documented as 64 B/cycle, because if it is, §1.6 can say *why* the envelope is where it is.
 
 7. **A genuinely new technique our manual has no section for: algebraic row-fusion of a multi-row
    recurrence.** `gdn_step_rows4.c` (§4.5) turns 4 sequential delta-rule steps into 2 passes over the
