@@ -1,22 +1,42 @@
-# REPLICATE — 1Cat-vLLM-Gaudi serving DeepSeek-V4.1-Flash on 4×Gaudi2
+# Replicating: 1Cat-vLLM-Gaudi serving DeepSeek-V4.1-Flash on 4×Gaudi2
 
-One ordered path from a **stock Habana 1.24.2 container** to **our measured numbers**.
-Written for someone who has the box and no context. Every command below is quoted from a
-script, a log or a running tree in this workspace — not reconstructed — and each is followed
+One ordered path from a **stock Habana 1.24.2 container** to the measured numbers in the
+companion report. Written for someone who has a 4-card Gaudi2 host and no context. Every command
+below is quoted from a script, a log or a running tree — not reconstructed — and each is followed
 by the file that proves it ran.
 
 | | |
 |---|---|
 | target | `NatTuck/1Cat-vLLM-Gaudi` @ `e2266e0`, serving `deepseek-ai/DeepSeek-V4.1-Flash` |
-| hardware | 4 × HL-225 (Gaudi2), one box, module ids `0,1,2,3` |
-| serving config | TP4 / PP1, 524,288-token window, prefix caching on, block 128, port 8021 |
-| status | **build, weights, boot and measurement all completed**; one required deviation (`MHC_RRMS_POST=0`) and one local correctness patch (halo tail) are described in §2.11 and §7. The two fusion flags are covered in §4.5: the arm that produced every number runs them at `0`, and the conformant alternative is documented there and is **not faster** |
-| companion docs | `INSTALL.md` (narrative install), `STATUS.md` (per-phase gate + every surprise), `measurements/*/FINDINGS.md` (per-cell results), `manifest.json` (every input with a hash) |
+| hardware | 4 × HL-225 (Gaudi2) on one host. Module ids are whatever the host reports; **this run used `0,1,2,3`** — derive yours, do not copy ours (§1.4) |
+| serving config | TP4 / PP1, 524,288-token window, prefix caching on, block 128, port `$PORT` (**8021 in this run**) |
+| status | build, weights, boot and measurement all completed; one required deviation (`MHC_RRMS_POST=0`) and one local correctness patch (halo tail) are described in §2.11 and §7. The two fusion flags are covered in §4.5: the arm that produced every number runs them at `0`, and the conformant alternative is documented there and is **not faster** |
+| companion docs | the report (`report.md`) for what the numbers mean; `INSTALL.md` (narrative install), `STATUS.md` (per-phase gate + every surprise), `measurements/*/FINDINGS.md` (per-cell results), `manifest.json` (every input with a hash) |
 
-**Reading note on `INSTALL.md`.** Its header block still says "Phases 2–9 are marked *NOT YET
-RUN*". That header is stale: the phases are written and their logs exist under `logs/`. The
-*content* of `INSTALL.md` is accurate where it agrees with `logs/` and `scripts/`; where it
-disagrees, this document follows the scripts and logs and says so (§2.7 is the one case).
+**What you substitute.** This document was written on one host and keeps its concrete values only
+where they are evidence. Four things are parameters, set once at the top of your shell:
+
+| parameter | meaning | value used here |
+|---|---|---|
+| `$CASE` | one workspace directory; every cache and every build lives inside it | `$HOME/work/cases/1cat` |
+| `$PORT` | the serving port | `8021` |
+| `$MODULES` | the module ids to serve on, comma-separated | `0,1,2,3` |
+| `$CHUNK` | `--max-num-batched-tokens` | `16384` |
+
+Anything below that shows a concrete value for one of these is showing what this run used, not
+what yours must be.
+
+**Paths that are provenance, not links.** This document cites `logs/…`, `measurements/…`,
+`scripts/…` and `notes/…` from the campaign's working tree. That tree is not published, so those
+are pointers into the record that produced each claim — not files you can open. Every number they
+support is reproduced in a table here, and the report (`report.md`) is the source of truth where
+the two overlap.
+
+
+**One general lesson from the campaign tree**, kept because it will bite anyone repeating this:
+a written procedure's header can be stale while its body is right. Where a document disagrees with
+the script or the log it describes, the script and the log win — and the disagreement gets written
+down, not smoothed.
 
 ---
 
@@ -43,18 +63,18 @@ labelled **UNVERIFIED** (§9) rather than smoothed.
 Nothing in §3–§6 is meaningful if §2 was built from different sources: the native library
 hashes are pinned into the runtime profile and verified by the entrypoint at load time.
 
-Work inside one workspace directory and keep every cache inside it. This install used
-`/home/nat/DeepseekFlash/cases/1cat` and calls it `$CASE`:
+Work inside one workspace directory and keep every cache inside it. Set `$CASE` to it:
 
 ```bash
-export CASE=/home/nat/DeepseekFlash/cases/1cat
+export CASE=$HOME/work/cases/1cat          # any directory you own; this run used one under $HOME
 mkdir -p "$CASE"/{logs,cache/wheels,cache/hf-meta,src,build,evidence,weights,locks,scripts,bin,profiles}
 ```
 
-Free space: the prepared weights are **342.23 GiB** on their own and the checkpoint is
-**475.25 GiB** in the HF cache. The phase-0 gate required **≥ 600 G** free in the workspace, and
-phase 7 re-checked the disk immediately before preparing (`logs/phase7-prepare-shards.log`:
-`free before: 706873442304 bytes` = 658 GiB, `free after: 357313908736 bytes` = 333 GiB).
+Free space is the first thing that fails. The prepared weights are **342.23 GiB** on their own and
+the checkpoint is **475.25 GiB** in the HF cache. The phase-0 gate required **≥ 600 G** free in the
+workspace, and phase 7 re-checked the disk immediately before preparing (in this run: 658 GiB free
+before, 333 GiB after).
+
 
 ---
 
@@ -136,8 +156,8 @@ PYTHONPATH=/usr/lib/habanalabs python3 -c "import sys;print(sys.path)"
 **(b) Another workspace's `vllm_gaudi` is on the system python's path.**
 `~/.local/lib/python3.12/site-packages` carries two editable finders
 (`__editable__.vllm_gaudi-0.24.0…finder`, `…0.24.0rc1.dev22+g6690c4604…finder`). A bare
-`python3 -c "import vllm_gaudi"` resolves into **another workspace's tree**
-(`/home/nat/Llms/src/vllm-gaudi/vllm_gaudi/__init__.py`, measured in
+`python3 -c "import vllm_gaudi"` resolves into **another workspace's tree** — on this host a
+checkout under the user's home outside the workspace (measured in
 `logs/phase3-venv-isolation.log`). §2.3's venv plus `PYTHONNOUSERSITE=1` removes the shadow;
 §2.10 asserts the resolved paths rather than trusting the import to succeed.
 
@@ -154,7 +174,8 @@ index, module_id, name, memory.used [MiB], utilization.aip [%]
 ```
 
 Reason and pin in **module ids** (`HABANA_VISIBLE_MODULES`, `HLS_MODULE_ID`), never in the
-`hl-smi` index. The module-id set here is the full `{0,1,2,3}`. `hl-smi -L` floods the
+`hl-smi` index. The module-id set is whatever the host reports — on the test host, the full
+`{0,1,2,3}`. `hl-smi -L` floods the
 terminal with log — use `--query-aip=...`.
 
 ### 1.5 The environment contract: `$CASE/env.sh`
@@ -174,7 +195,7 @@ It sets, and here is why each one is load-bearing:
 | `PYTHONNOUSERSITE` | `1` | §1.3(b) — the venv is `--system-site-packages`, so the user site is otherwise live |
 | `XDG_CACHE_HOME`, `PIP_CACHE_DIR`, `TORCHINDUCTOR_CACHE_DIR`, `TRITON_CACHE_DIR`, `HF_HOME`, `VLLM_CACHE_ROOT` | under `$CASE/cache` | caches stay in the workspace; `VLLM_CACHE_ROOT` is also the thing the cache-epoch rule clears (§5.2) |
 | `PT_HPU_RECIPE_CACHE_CONFIG` | `$CASE/cache/recipes,false,1024,false` | the HPU recipe cache; warm it once and a boot is ~20 min shorter |
-| `PATH` | `$VENV/bin:$CASE/bin:/opt/habanalabs/bin:$PATH` | **the only `cmake` on this box is a pip console script** (`/home/nat/.local/bin/cmake`, `from cmake import cmake`) which dies under `PYTHONNOUSERSITE=1`; `$CASE/bin/cmake` is a symlink to the real binary inside the package (`logs/phase5-cmake-wrapper-trap.log`) |
+| `PATH` | `$VENV/bin:$CASE/bin:/opt/habanalabs/bin:$PATH` | **the only `cmake` on a stock image may be a pip console script** (`~/.local/bin/cmake`, `from cmake import cmake`) which dies under `PYTHONNOUSERSITE=1`; `$CASE/bin/cmake` is a symlink to the real binary inside the package (`logs/phase5-cmake-wrapper-trap.log`) |
 | `LD_LIBRARY_PATH` | our synapse → our mme → our hcl → venv torch → `/usr/lib/habanalabs` | the bridge build dir must **not** be on this path (it would shadow the SDK) |
 | `VLLM_HPU_DSV41_MHC_RRMS_POST` | `0` | its operator ships in the additive bundle this install does not build; default is `1` and the entrypoint then raises `FileNotFoundError` (§7.1) |
 | `VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR` | `$CASE/build/dsv41-native/lib` | the entrypoint hash-verifies every `.so` against the build manifests before loading |
@@ -182,7 +203,7 @@ It sets, and here is why each one is load-bearing:
 Create the cmake shim once:
 
 ```bash
-ln -s /home/nat/.local/lib/python3.12/site-packages/cmake/data/bin/cmake "$CASE/bin/cmake"
+ln -s ~/.local/lib/python3.12/site-packages/cmake/data/bin/cmake "$CASE/bin/cmake"
 "$CASE/bin/cmake" --version    # -> cmake version 4.4.0
 ```
 
@@ -368,7 +389,7 @@ Observed: `get-pip.py` HTTP 200, 2,397,294 B, sha256
 
 | invocation | `import vllm_gaudi` resolves to |
 |---|---|
-| `venv/bin/python -c ...` | **`/home/nat/Llms/src/vllm-gaudi/vllm_gaudi/__init__.py`** ← another workspace |
+| `venv/bin/python -c ...` | **a checkout outside the workspace** (another workspace's editable install) |
 | `PYTHONNOUSERSITE=1 venv/bin/python -c ...` | not found (correct, pre-install) |
 
 **Set `PYTHONNOUSERSITE=1` in every invocation** (it is in `env.sh`). The container's
@@ -401,7 +422,7 @@ resolves to the first entry — but verify it (`logs/phase3-vendor-copy.log`):
 ```bash
 PYTHONNOUSERSITE=1 "$CASE/venv/bin/python" -c "
 import habana_frameworks.torch as ht, torch
-print(ht.__file__)      # must be .../cases/1cat/venv/lib/python3.12/site-packages/...
+print(ht.__file__)      # must be $CASE/venv/lib/python3.12/site-packages/...
 print(torch.__file__)   # .../usr/local/lib/python3.12/dist-packages/torch/...  (container)
 print(torch.hpu.device_count())"
 ```
@@ -813,14 +834,14 @@ Gate — assert, do not assume (`logs/phase6-gate-verify.log`):
 site.ENABLE_USER_SITE   : False
 PYTHONNOUSERSITE env    : 1
 ~/.local on sys.path    : False
-vllm      -> /home/nat/DeepseekFlash/cases/1cat/src/vllm/vllm/__init__.py
-vllm_gaudi-> /home/nat/DeepseekFlash/cases/1cat/src/1Cat-vLLM-Gaudi/vllm_gaudi/__init__.py
+vllm      -> $CASE/src/vllm/vllm/__init__.py
+vllm_gaudi-> $CASE/src/1Cat-vLLM-Gaudi/vllm_gaudi/__init__.py
 ```
 
 ```bash
 PYTHONNOUSERSITE=1 "$CASE/venv/bin/python" -c "
 import vllm, vllm_gaudi, site, sys
-for m in (vllm, vllm_gaudi): assert '/cases/1cat/' in m.__file__, m.__file__
+for m in (vllm, vllm_gaudi): assert '/cases/1cat/' in m.__file__, m.__file__   # or your $CASE
 assert site.ENABLE_USER_SITE is False and not any('.local' in p for p in sys.path)
 print('isolation OK')"
 ```
@@ -954,15 +975,15 @@ cd "$CASE/src/1Cat-vLLM-Gaudi"
 exec "$VENV/bin/python" tools/run_deepseek_v41.py \
   --lock-dir "$CASE/locks" \
   --runtime-profile "$CASE/profiles/verified-runtime-profile.json" \
-  --modules 0,1,2,3 \
-  --preferred-cpus "0-127" \
+  --modules "${MODULES:-0,1,2,3}" \
+  --preferred-cpus "${CPUS:-0-127}" \
   --min-host-available-gib 64 \
   "$CASE/evidence/run" -- \
   "$VENV/bin/python" -m vllm_gaudi.entrypoints.deepseek_v41 \
     "$CASE/weights/prepared" \
     --checkpoint-audit "$CASE/evidence/upstream-audit" \
     --host 127.0.0.1 \
-    --port 8021 \
+    --port "${PORT:-8021}" \
     --max-model-len 524288 \
     --max-num-seqs 16 \
     --max-num-batched-tokens 8192 \
@@ -1058,7 +1079,7 @@ keys. The 11 libraries are: our backend, plugin, 2_plugin, `_hccl_eager_C`, `lib
 TP2 ABI sidecar and the two native build manifests.
 
 **Layer 3 — NUMA.** CPU pools are *not* a profile field; they go through the launcher's
-`--preferred-cpus`. On this box node0 is `0-31,64-95` and node1 is `32-63,96-127`
+`--preferred-cpus`. On the test host node0 is `0-31,64-95` and node1 is `32-63,96-127`
 (`logs/phase8-runtime-profile.log`), and the drivers pass `0-127` and let the launcher's
 conflict policy place each rank (`evidence/run/process.json` → `modules[]` shows
 main/helper CPU assignments).
@@ -1078,7 +1099,7 @@ Verified here: both `d1de7877…`, byte-identical.
 ```json
 [".../venv/bin/python", "-m", "vllm_gaudi.entrypoints.deepseek_v41",
  ".../weights/prepared", "--checkpoint-audit", ".../evidence/upstream-audit",
- "--host", "127.0.0.1", "--port", "8021", "--max-model-len", "524288",
+ "--host", "127.0.0.1", "--port", os.environ.get("PORT", "8021"), "--max-model-len", "524288",
  "--max-num-seqs", "32", "--max-num-batched-tokens", "16384",
  "--block-size", "128", "--enable-prefix-caching"]
 ```
@@ -1467,7 +1488,16 @@ unexplained disagreement between the in-repo witness and our client.
 
 ## 6. The numbers to expect
 
-### 6.1 Headline
+**Two different things live in this section, and they are not interchangeable.**
+
+- **Gates** — a number that must hold for the measurement to be valid on *any* box: `cached_tokens
+  == 0` on an uncached cell, zero compiles inside the block, four modules held, the idle baseline
+  restored. These are universal and a failure invalidates the cell.
+- **Reference values** — what this run measured on this host at this config. They are one box's
+  result, they depend on the container generation and the card population, and **your numbers
+  will differ**. Compare ratios and shapes, not absolutes.
+
+### 6.1 Headline — reference values from this run
 
 | quantity | ours | file it comes from | recorded baseline | ratio |
 |---|---|---|---|---|
@@ -1639,9 +1669,9 @@ across those two files. Written up in `notes/halo-fix.md`.
 
 ```bash
 cd "$CASE/src/1Cat-vLLM-Gaudi"
-git apply --check /home/nat/DeepseekFlash/cases/1cat/notes/halo-fix.patch     # before applying
-git apply         /home/nat/DeepseekFlash/cases/1cat/notes/halo-fix.patch
-git apply --reverse --check /home/nat/DeepseekFlash/cases/1cat/notes/halo-fix.patch   # already-applied test
+git apply --check "$CASE/notes/halo-fix.patch"     # before applying
+git apply         "$CASE/notes/halo-fix.patch"
+git apply --reverse --check "$CASE/notes/halo-fix.patch"   # already-applied test
 ```
 
 **What it fixes.** `replicate_owned_tail`
@@ -1762,7 +1792,7 @@ make decode byte-identical — **not implemented, not measured**.
 | 4 | **The wo_a microbench is TP2/G4.** | `RuntimeError: wo_a requires prepared Gaudi2 FP8 [G,4096,1024]…` — which looks like a bad sidecar and is not. | The tool hardcodes 4 groups; a TP4 tree is G2. Fix `groups = 8 // tp_size`, pass the sidecar **directory** and the **sparse_attn** extension (§7.2). The sidecar itself passes every check `WoaFP8Sidecar` makes. |
 | 5 | **`tpc-llvm-objdump` / `gc_interface.h`.** | The kernel build refuses, or a tool is "present" in a path you did not check. | `which tpc-llvm-objdump` → `/usr/bin/tpc-llvm-objdump`; `gc_interface.h` is at **`/usr/lib/habanatools/include/`**, not under `/usr/lib/habanalabs`. Both verified in phase 0 (§1.1). |
 | 6 | **`PYTHONPATH=/root` container trap.** | `pip` dies with `PermissionError: [Errno 13] Permission denied: '/root'` **before** it reaches the network — reads like a network or index problem. | The image ships `PYTHONPATH=/root:/usr/lib/habanalabs/` and `/root` is 0700. Set `PYTHONPATH=/usr/lib/habanalabs` explicitly on every python and pip call (§1.3a). |
-| 7 | **`~/.local` editable finders.** | `import vllm_gaudi` silently resolves into `/home/nat/Llms/src/vllm-gaudi` — another workspace — and your edits appear to have no effect. | `--system-site-packages` re-enables the user site. Set `PYTHONNOUSERSITE=1`, assert `site.ENABLE_USER_SITE is False`, no `~/.local` on `sys.path`, and both packages resolving inside your own tree (§2.3, §2.10). |
+| 7 | **`~/.local` editable finders.** | `import vllm_gaudi` silently resolves into a tree outside your workspace and your edits appear to have no effect. | `--system-site-packages` re-enables the user site. Set `PYTHONNOUSERSITE=1`, assert `site.ENABLE_USER_SITE is False`, no `~/.local` on `sys.path`, and both packages resolving inside your own tree (§2.3, §2.10). |
 | 8 | **`max_num_seqs` is a start parameter.** | A cell table that varies it inside "one boot, one lifetime" — the cell cannot run. | It sizes the KV pool and the graph buckets at boot. A 16-vs-32 comparison needs **two boots**; `measurements/conformance1` skipped C3 for exactly this reason and said so. Same class: `--max-num-batched-tokens`, `VLLM_HPU_DSV41_PREFILL_COMPUTE_TOKENS`, chunk size. |
 
 Five more that cost a failed attempt each, worth having in front of you: `BUILD_ROOT_LATEST`
@@ -1770,7 +1800,7 @@ must be writable or `make` deletes the freshly linked `libhcl.so`; the bridge pi
 v1.24.1 *sources* rebased onto v1.24.2 (v1.24.1 cannot configure — no `habana_frameworks.mediapipe`);
 `--checkpoint-audit` is a **file** for the shard planner and a **directory** for the entrypoint;
 audit records are keyed by snapshot name while the runtime keys them by resolved basename
-(LFS oid); and the only `cmake` on the box is a pip console script that dies under
+(LFS oid); and the only `cmake` on a stock image may be a pip console script that dies under
 `PYTHONNOUSERSITE=1`.
 
 ---
@@ -1801,6 +1831,27 @@ been built** here, so its `-Werror` risk against `tpc-clang 2.7.33` is unknown; 
 retrospectively (§7.3); the PSI gate that `measurements/conformance1/method.md` gate 4 asks for
 was **not recorded** in any cell JSON; and `GPU KV cache size` varies per boot, so any single
 figure for it is an observation, not a property.
+
+---
+
+## 10. Porting this to another box
+
+The procedure is portable; the values are not. What to change, and what to expect to differ:
+
+| what | change | why |
+|---|---|---|
+| workspace | `$CASE` to your own directory | every cache, build and evidence path derives from it |
+| devices | derive module ids from the host (`/sys/class/accel/*/device/module_id`) and pass them as `$MODULES` | module ids are a property of the card population, and no monitoring tool's index is the module id (§1.4) |
+| CPU placement | `$CPUS` / `--preferred-cpus` to your host's cpuset | the NUMA layout in §4.3 is this host's |
+| port | `$PORT` | any free port; avoid a range a resident service uses |
+| disk | ≥ 600 GiB free for one prepared tree | the prepared tree is 342.23 GiB **for this checkpoint** |
+| container generation | a different torch/ABI means rebuilding the bridge, Synapse and HCL, not re-linking | the native runtime is built against a specific ABI, and the runtime profile pins the hashes |
+| build fixes | the two in §2.6/§2.7 are properties of **CMake 4 + this bridge pin**; a different pin may not need them | verify rather than apply blindly |
+
+What will legitimately differ: every rate in §6. The transferable results are the **shapes** —
+decode's flatness across context, the 1.75× between chunk 16,384 and 8,192 at a full-chunk length,
+the parameter-driven greedy penalty, and the batch collapse being a stall rather than a curve.
+What should *not* differ, and is a failure if it does: the gates in §5.3.
 
 ---
 

@@ -81,6 +81,16 @@ Chapter 5's three programs are the exception to "annotated sketch": they were **
 Gaudi 2 on 2026-10-21** and their outputs are archived, so the worked example in §5.8 is a
 measurement rather than a description.
 
+## Timings and field reports
+
+[`timings/`](timings/) holds end-to-end measurements of real serving stacks, kept separate from
+the chapters because they are reports rather than teaching material. Each directory carries its
+own provenance and says what it does not cover.
+
+| report | what it is |
+|---|---|
+| [`timings/ds41-flash-1cat/`](timings/ds41-flash-1cat/) | DeepSeek-V4.1-Flash on 4×Gaudi2 through the 1Cat vLLM fork: a measurement report and a from-scratch replication procedure, including two defects found on the way (a TP4 halo-tail crash for mid-length prompts, and an out-of-bounds fused decode kernel) |
+
 ## What this draft does not yet cover
 
 The outline in `AGENTS.md` is broader than what is written. Known gaps, so they are not
