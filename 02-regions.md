@@ -274,6 +274,16 @@ released when the bank reaches it. On the runtime side it is a queue-manager fen
 encoding is asymmetric: the TPC bank advances **32** per activation, MME/DMA/ROT advance **1**.
 **MEASURED.**
 
+**And the hardware counter behind that bank is 15 bits.** `gaudi2::sob_objs::reg_sob_obj` declares
+`val : 15`, and both masks that reach it — `DCORE0_SYNC_MNGR_OBJS_SOB_OBJ_VAL_MASK` and
+`GAUDI2_PKT_SHORT_VAL_SOB_SYNC_VAL_MASK` — are `0x7fff`, so a sync-object counter **wraps at
+32,768**. **source read** (vendor register structs; two independent copies agree). Combined with the
+measured ×32 step, a TPC bank wraps after **1,024 activations** — **INFERRED**, and **not tested**:
+we have not run a graph long enough to observe a wrap, so this is a hazard to know about rather than
+a measured failure mode. What a wrap does to a waiting monitor, and whether the runtime keeps its
+counters clear of it, is **UNKNOWN**. *(A `long_sob` mode exists in the same register and was not
+investigated.)*
+
 **The dependency is computed from byte ranges, so it is per (consumer, *overlapping byte-range*) and
 resolved to a producer activation** — not per node, and not per tensor. The consequence to carry is
 that **partial consumption is real, and the compiler arranges it.** In one observed recipe a TPC node

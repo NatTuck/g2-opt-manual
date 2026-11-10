@@ -31,6 +31,14 @@ choose at the call site** — the Synapse graph compiler assigns it during lower
 traces whose device events carry *different* device labels use the *identical* tid block. That is
 why the windows are reliable, and it is also why they are not a property of "device 0".
 
+**The compiler's own HAL agrees with these counts, in its own numbering.** `Gaudi2HalReader::getNumMmeEnginesOnDcore()`
+returns **1**, so four DCOREs give **4 MME engines** — the same number as the tid windows and the
+driver's `GAUDI2_NUM_MME`. Two neighbouring getters read differently and must not be confused with it:
+`getNumMmeEngines()` and `getNumMmeCoresPerEngine()` both return **2**, i.e. two *cores per engine*
+(eight cores in total), and `getNumTpcEnginesOnDcore()` returns **6** (⇒ 24 TPCs). **So "4 MME" is an
+engine count and "8" would be a core count** — and a claim of "24 MME cores" is the TPC count leaking
+into the MME row. **source read** (shipped 1.24.2 `libSynapse.so`).
+
 **MEASURED** — every device event also carries Synapse's own engine label in
 `args["HW event name"]`. Coverage is **98.85 %**, and it agrees with the tid windows on **100 %**
 of device work across **21.9 M events**. The 1.15 % without a label are exactly the host spans,
@@ -374,7 +382,9 @@ tied to any particular implementation.
 | **HBM2E** | **96 GiB per HPU** | per card | **MEASURED** |
 | **SRAM** | **48 MiB** (Gaudi 2) | on-die, **shared** — compiler-scheduled slicing of MME operands (**[chapter 7](07-sram.md)**) | **source read** |
 | **TPC local memory** | **1 KB scalar + 80 KB vector** | **per TPC core, private** | **ASSUMED** (vendor documentation) |
-| **L1 / L2 data cache** | — | **there is none** | **ASSUMED** (vendor documentation) |
+| **TPC instruction cache** | **64 KiB** | **per TPC core, private** | **source read** (shipped 1.24.2 `libSynapse.so`: `Gaudi2HalReader::getTPCICacheSize` returns `0x10000`) |
+| **TPC data cache** | **32 lines**; the line size is the 128 B alignment attribute, so **4 KiB if so** | **per TPC core, private** | **source read** (`getDCacheLineNr` = `0x20`) / **INFERRED** for the byte size |
+| **L1 / L2 data cache** | — | **there is none between HBM and SRAM** | **ASSUMED** (vendor documentation) |
 
 *(Rows tagged **ASSUMED** are taken from documentation or a vendor constant; where the number comes
 from a **named source file with a path and line** it is tagged **source read** instead, as the SRAM
@@ -402,7 +412,11 @@ is sourced too.
 > though it would have happened to work. The habit is what is being taught, not the outcome.
 
 **The 48 MiB SRAM is the only on-die memory between HBM and per-TPC local memory — there is no
-separate L1/L2 cache.** This is a *positive* finding, not a gap, and it is read off the vendor's
+separate L1/L2 cache.** **Read "no cache" as a statement about the hierarchy a tensor stream passes
+through, not about the TPC core:** each TPC does carry a small private **instruction cache (64 KiB)**
+and a **data cache (32 lines)** — `source read`, the table above — which serve code and short-lived
+local traffic. Neither caches HBM-resident tensor data, so the engineering consequence below is
+unchanged. This is a *positive* finding, not a gap, and it is read off the vendor's
 architecture diagram, which draws exactly three levels — **HBM2E → 48 MiB shared SRAM → per-TPC local
 memory** — with **no cache level between them**. The same page names three subsystems (compute,
 memory, networking) and two compute-engine families (MME + TPC). **source read** (the vendor's
@@ -614,6 +628,24 @@ when looking up Gaudi 2 bandwidth, it is wrong by three orders of magnitude, and
 datasheet* — the genre a reader trusts most. **If a bandwidth figure looks 1000× off, check the
 unit before you check the physics.**
 
+### The compiler's own planning constants — source read, and three different scopes
+
+The GC does not use the measured envelopes above; it carries hardcoded constants of its own, and
+**each is at a different scope**. Quoting one as a card-level bandwidth is the recurring error:
+
+| constant | value | scope |
+|---|---:|---|
+| `Gaudi2HalReader::getHbmBwGBps` | **1945 GB/s** | whole-card HBM — the GC's planning figure, 79.4 % of the 2,450 nominal |
+| `Gaudi2HalReader::getSramBwGBps` | **6554 GB/s** | the **SRAM pool** (see [§7](07-sram.md)) |
+| `Gaudi2HalReader::getDmaBwGBps` | **970 GB/s** | **per DMA engine**, not per card |
+| `Gaudi2HalReader::getNumDmaEngines` | **10** | the compiler's DMA engine count — a third numbering alongside the trace's 8 tids and the 5 HBM↔SRAM lanes (§1.2) |
+
+**source read** (shipped 1.24.2 `libSynapse.so`; each is a `mov $imm,%eax; ret` getter). These are
+**planning constants, not measurements**: the 1945 sits *below* the 2,147 GB/s TPC stream envelope we
+measured and *between* our two DMA points, and the 970 is per engine — so 10 × 970 says nothing about
+what a card can move. Use them to understand what the compiler is optimising *for*, never as a
+hardware figure.
+
 ---
 
 ## 1.7 The cost models — and their error signs
@@ -641,13 +673,22 @@ and the two we have looked at fail in **opposite** directions.
 `mov` immediates quoted and the `readelf -rW` vtable resolution to the MME cost model).* Note the
 implication: the general reader is **21 % high** against the real SoC clock.
 
-> **OPEN.** *If* the **TPC** cost model consumes that **general** reader rather than an
-> engine-specific one, it would be **~21 % optimistic**. **Whether it does is unchecked.** The
-> **DMA** model is **excluded** — a disassembly of it found **no clock call at all** — but the TPC
-> model's constructor is not exported, so which reader it is given is undetermined.
-> *What would settle it:* disassemble the TPC cost model and find which vtable slot supplies its
-> clock — the method that settled the MME's. *(Artifact:
-> `Archive/by-date/2026-10-11/synapse_cpp/GC_COST_MODEL_CLOCK.md` §10.)* **UNKNOWN / OPEN.**
+> **CLOSED 2026-11-07 — the TPC cost model does not use the general reader, and its clock is 1800 MHz
+> on Gaudi 2.** The TPC kernel cost model is **not in `libSynapse.so` at all**: `TPCNode::getCostModelResult`
+> calls `GetTpcProgramCostModelValuesV4`, imported from **`libTpcElfReader.so`**, and that library's
+> `CostModelNodeValueFull::getClockFrequency(DeviceId)` returns a hardcoded immediate per device —
+> **1800 MHz for GAUDI2**, 1800 for GAUDI3, and **1700 for GAUDI1 and for the default case**. So the
+> "21 %-high general reader" worry is **refuted for the cycle terms**: 1800 MHz is also what `hl-smi`
+> reports as `clocks.limit.tpc`, and it is *not* the 2000 MHz `Gaudi2HalReader` value above.
+> **source read** (shipped 1.24.2 `libTpcElfReader.so`, `getClockFrequency` @ `0x107030`; the
+> `getMaxNumCores` neighbour returns 24 for GAUDI2, cross-checking the device id mapping).
+>
+> **The new, smaller caveat is an internal inconsistency: the model's *bandwidth* terms are hard-wired
+> at 1700 MHz on every device.** `getBWE`, `getLoadBWE` and `getStoreBWE` each multiply by `0x6a4`
+> (`imul $0x6a4`) regardless of device, i.e. **5.6 % below** the 1800 MHz the cycle terms use on
+> Gaudi 2. A TPC estimate whose dominant term is bytes is therefore ~5.6 % pessimistic in time, and
+> one whose dominant term is cycles is right. **source read** (`0x106ea0` / `0x106f00` / `0x106f60`).
+> *(The **DMA** model remains **excluded** — its disassembly found **no clock call at all**.)*
 
 ### `dma_expected_duration` — a LOWER BOUND
 
@@ -686,8 +727,9 @@ above. The single figure is **replaced** by the size-dependent pair. **MEASURED*
 ### The TPC cost model
 
 The TPC side has a cost field (`tpc_tpc_cycles`) and a working-engine count
-(`tpc_working_engines`, e.g. `[24,24,24]`). **The clock it uses to convert cycles to time is
-UNKNOWN**, and the "general HAL reader is 21 % high" note above is the specific worry. *(Refined
+(`tpc_working_engines`, e.g. `[24,24,24]`). **Its clock is settled above** — 1800 MHz on Gaudi 2,
+with the bandwidth getters hard-wired at 1700 — **and what remains unobtainable is the *field
+itself*.** *(Refined
 2026-10-13; mechanism **corrected** the same day. The field is **gated**, not absent, and the gate is
 **two-part**: `DUMP_TPC_COST_MODEL_DATA=1` **and** `ENABLE_EXPERIMENTAL_FLAGS=1` — without the latter
 the config is **silently ignored** (libSynapse: *"is internal config. cannot be set without
@@ -714,12 +756,13 @@ predictable** from the glue's declared index space —
 14 of 14** dumped shapes, which is what makes it a cheap instrument you can trust
 ([Chapter 4 §4.1.4](04-execution-model.md)).)*
 
-**Be precise about which kind of unknown this is.** We tried to settle it by looking the clock up
-in the shipped cost-model libraries and **could not complete that check** — so *that route* is
-*"not checked"*, **not** *"checked and absent"*. §1.12 records the distinction explicitly, and it
-matters: a failed lookup must not be allowed to harden into a vendor statement. *What would settle
-it:* symbol access into the cost-model libraries, or the same disassembly method that settled the
-MME clock.
+**Be precise about which kind of unknown this is — and note that it is now the field, not the clock.**
+`tpc_tpc_cycles` is **gated** (above) and cannot be read out of a dump on this compiler, so the *cycle
+count* is unobtainable; the *clock that would convert it* is known (§1.7's closure note). The
+distinction §1.12 records still applies to the field: a route that could not be completed is
+*"not checked"*, **not** *"checked and absent"*. *What would settle the field:* a compiler whose
+kernel-cost gate is satisfiable, i.e. one whose `tpc-clang` accepts the `--kernel-cost` flag the gate
+names.
 
 > **If you are writing your own TPC kernel, the unit of cost is the VLIW *bundle*, not the
 > instruction** — an *issue group*, **not** the graph `bundle_index` sense of §1.3.
@@ -729,8 +772,9 @@ MME clock.
 
 > **Two cost models, same field family, different error signs.** The MME model is **accurate
 > (0.5 %)**; the DMA model is **optimistic, size-dependently (3–16 %)**; the TPC model's clock is
-> **unknown**. **Neither may be used as a neutral reference without saying which one you mean.**
-> **MEASURED**
+> **1800 MHz (cycles) against 1700 MHz (bytes) — 5.6 % apart on Gaudi 2, and the sign of the error
+> depends on which term dominates.** **Neither may be used as a neutral reference without saying
+> which one you mean.** **MEASURED / source read**
 
 ---
 
@@ -1025,8 +1069,8 @@ Stated here so the gaps are visible, and repeated inline above where they matter
 
 | # | UNKNOWN | status | what would settle it |
 |---|---|---|---|
-| 1 | **The TPC cost model's clock** | ⚠ **not successfully checked** — the symbol lookup did not complete on **any** attempt (timeouts), and a text search of the shipped libraries found nothing. **This is NOT "the answer is no".** | retry the symbol lookup on `TPCCostModel` / `getClockFreqMHz`; or disassemble the TPC cost model |
-| 2 | **Whether the TPC cost model uses the 21 %-high general HAL reader** | ⚠ **not successfully checked** (same cause). The **DMA** cost model is **excluded** — a disassembly found **no clock call in it at all** (`Archive/by-date/2026-10-11/synapse_cpp/GC_COST_MODEL_CLOCK.md` §10). | the same retry, or the same disassembly |
+| ~~1~~ | ~~**The TPC cost model's clock**~~ | **CLOSED — RESOLVED 2026-11-07.** The TPC kernel cost model lives in **`libTpcElfReader.so`**, not `libSynapse.so`; `CostModelNodeValueFull::getClockFrequency(DeviceId)` returns **1800 MHz for GAUDI2** (1700 for GAUDI1 and the default, 1800 for GAUDI3). The earlier symbol lookups failed because they searched the wrong library. **source read** (`0x107030`). Full statement: §1.7. | — **done** |
+| ~~2~~ | ~~**Whether the TPC cost model uses the 21 %-high general HAL reader**~~ | **CLOSED — RESOLVED 2026-11-07. NO — the cycle terms use 1800 MHz, not the 2000 MHz general reader.** The **bandwidth** getters (`getBWE`/`getLoadBWE`/`getStoreBWE`) are hard-wired at **1700 MHz** on every device, 5.6 % below the cycle clock on Gaudi 2 — a real internal inconsistency, now the caveat in §1.7. The **DMA** cost model remains excluded (no clock call at all). **source read.** | — **done** |
 | 3 | **The DMA driver's exact round-robin queue-selection rule** | open — the queue *families* are now documented (§1.2); the *rule* is not. Note the raw thunk path takes a **caller-supplied queue index**, so the round-robin we measured must be chosen **above** the driver | symbol access into the runtime library that assigns the queue |
 | 4 | **Which queue family tids `4073/4082/4083` belong to** | **supported, not settled** — a third family (NIC) exists (§1.2), which is consistent with our split; the **tid→queue mapping was not given** | the profiler's `thread_name` for those tids, against the queue-name table |
 | 5 | **Are the per-TPC AXI rate limiters programmed?** — `mmDCORE0_TPC0_CFG_RD_RATE_LIMIT` `0x400BDA8` / `WR_RATE_LIMIT` `0x400BDAC` exist; likewise the QMAN `HBW_RD_RATE_LIM_CFG_0/1` and `LBW_WR_RATE_LIM_CFG_0/1`. We found **no programmed values**. *(Source for those names and addresses, public and checkable: the upstream Linux kernel's habanalabs driver — `drivers/accel/habanalabs/include/gaudi2/asic_reg/dcore0_tpc0_cfg_regs.h:185,187` and `drivers/accel/habanalabs/include/gaudi2/asic_reg/dcore0_tpc0_qm_regs.h:1031-1037`, in current upstream `master`; line numbers move between kernel releases, so check the symbol, not the line.)* | **NEW, open.** If they *are* programmed they would cap per-TPC bandwidth and could explain part of the **2,147 GB/s measured vs 2,450 GB/s nominal** gap | read the registers on a live device, or find the firmware init sequence that writes them |
@@ -1038,10 +1082,12 @@ Stated here so the gaps are visible, and repeated inline above where they matter
 | 11 | **The measured graph count vs the O(N × buckets) prediction** — §1.4.3 states the arithmetic; we have not checked a real model's executed-graph count against it in this chapter's sources | open | count **distinct compiled graphs executed per step** on a real model and compare against `shapes × layer constants`. This is the check that turns §1.4.3 from an arithmetic into a diagnostic |
 | 12 | **Whether the module-id table also restricts the driver's unpinned choice** (§1.10). The binary analysis finds the PT-bridge's by-type function does not consult it, but that is **INFERRED**, not measured, the driver/thunk level is **not settled**, and the unset path is otherwise documented as "first free module". | open — the two-process arm we have (two unpinned processes, watching which modules they take) used the container's **full** table, so it cannot separate the table from the container's `--device` cgroup | a **discriminating** arm: a per-job `HABANA_VISIBLE_MODULES` that *excludes* a cgroup-exposed module, with **no** pin, watching which modules the two processes take (`hl-smi -Q index,module_id,memory.used -f csv,nounits`) |
 
-**Two kinds of negative, and they are not the same.** Items **1** and **2** are *"we could not
-complete the check"* — the lookup that would answer them failed, so they carry **no information
-either way** and must not be read as a vendor statement. The rest are *"we looked, and the answer
-is not in the sources we have"*.
+**Two kinds of negative, and they are not the same.** Items **1** and **2** were *"we could not
+complete the check"* — the lookup that would have answered them failed, so they carried **no
+information either way** and could not be read as a vendor statement. **Both are now closed (§1.7),
+and the lesson survives the closure:** what ended them was looking in a *different library* from the
+one we had been searching, which is what "we could not complete the check" had been telling us. The
+rest of the register is *"we looked, and the answer is not in the sources we have"*.
 
 **Collapsing those two is how a tool outage becomes a false finding** — and it is the same class of
 error as the UNKNOWN note at the top of this manual: a claim that was never checked acquires the
@@ -1061,7 +1107,8 @@ authority of one that was. When you record a negative, record **which kind** it 
    ~1,776 GB/s at 16–64 MB and ~2,025 at ≥256 MB. **Eager `torch.copy_` is TPC, not the DMA
    engine.**
 6. **The cost models have different error signs** — the MME model is accurate to 0.5 %; the DMA
-   model is a size-dependently optimistic lower bound; the TPC model's clock is unknown.
+   model is a size-dependently optimistic lower bound; the TPC model runs at **1800 MHz** for cycles
+   and **1700 MHz** for its bandwidth terms, so its error's sign depends on which term dominates.
 7. **A marker duration is not automatically an execution window.** Only TPC is a true start→halt
    span; the MME's inflation is cross-tid (so its union is usable); the DMA's is not.
 8. **Never quote a rate from an arm that failed its precondition.**

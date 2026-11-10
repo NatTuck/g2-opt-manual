@@ -632,6 +632,15 @@ slots, **fewer** bundles, **1.377× lower**. **MEASURED.** *(Artifact:
 > and a per-bundle decode cost are all consistent with these data, and **none is tested here**. The
 > *relationship* and the *causal variable* are measured; the **mechanism is not**, and it is not
 > guessed. **UNKNOWN.**
+>
+> **One of those candidates now has a bound, and it does not close the question.** The TPC has a
+> **64 KiB instruction cache** per core ([§1.5](01-basics.md), source read). The measured bodies span
+> **61 → 3,984 bundles**, which at the ~22 B/bundle this chapter measures is roughly **1.3 → 88 KB**
+> of code — so the largest arms **exceed** a 64 KiB i-cache while the small ones sit comfortably
+> inside it. That makes I-cache misses *possible* for the big bodies; it does not explain a smooth
+> sublinear law across the whole range, because the small bodies cannot be missing in the cache at
+> all. **INFERRED**; the cache's replacement policy and whether the TPC fetch path streams are both
+> unmeasured, and the discriminating arm is still the one item 12 names.
 
 **The trap this measurement had to get past: `dur_min` is not the node's cost.** Fitting the
 per-TPC duration instead of the node's span gives **negative** intercepts on the large bodies,

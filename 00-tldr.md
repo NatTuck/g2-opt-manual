@@ -1,125 +1,335 @@
 # Chapter 0 — TL;DR
 
-**Read this first.** If you take nothing else from this manual, take these six things. Each
-points at the chapter that develops it.
+**Read this first, before writing or judging any HPU code.** A rulebook, not a summary — each rule
+points at the chapter that develops it. **If this file disagrees with a chapter, the chapter wins; fix
+this file.** Only well-established numbers appear here (verified hardware constants; bandwidth figures
+consistent with spec less plausible overhead); one-experiment and one-workload figures stay in the
+chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one box).
+
+**Tags**: **MEASURED** / **source read** / **ASSUMED** / **INFERRED** / **UNKNOWN** — see
+[README](README.md). UNKNOWN means *we looked and did not find*; never fill it from general knowledge.
+
+---
+
+## Terms — the ones you cannot fudge
+
+| term | what it is |
+|---|---|
+| **region** | one dynamo-traced FX graph from a `torch.compile` region |
+| **node** | one op in that graph, carrying a **placement** (`hpu_cluster` or `eager`) |
+| **recipe** | one compiled binary — **one per maximal contiguous run of clusterable nodes** |
+| **submission** | one Synapse `Launch` — the only unit the scheduler co-schedules *within* |
+| **engine** | TPC (24 VLIW cores) · MME (4 matmul) · DMA (8 tids = 4 cores × 2 lanes, 5 carrying HBM↔SRAM traffic) — read the dump's `engine` field; **never infer from an op name** |
+| **bundle** | a VLIW issue group of ≤4 slots inside one TPC — **the TPC cost unit**; unrelated to a dump's `bundle_index` |
+| **`merged`** | union of all device-busy intervals in a step — the quantity the wall tracks |
+| **union / LOO** | a merged-interval duration (never a sum of events) / how much `merged` falls when a family's intervals vanish |
+
+An `eager`-placed node runs **outside** every recipe, splits the recipe run, and emits no
+`LaunchRecipe` — a recipe/handle count is not a submission count.
 
 ---
 
 ## The five facts that change how you write code
 
-**1. Everything is statically compiled — there are no dynamic shapes.**
-HPU bakes every tensor shape into the compiled graph; a `dynamic=True` request is forced to
-static compilation. **You cannot pass a dynamic slice bound or shape and have one graph serve
-several cases.** Design for a fixed shape set, and treat every new shape as a new program.
-→ *Chapter 1*
-
-**2. Integers are specialized exactly like shapes.**
-This is the one people do not expect. A Python `int` used in traced code — a layer index, a
-per-layer byte offset, a constant — becomes part of the **guard set**, and produces **a
-separate compiled graph per distinct value**, precisely as a new shape does. **There is no
-dynamic-argument escape hatch for ints.** If your code computes an offset from a loop index,
-you have written one program per iteration.
-→ *Chapter 1*
-
-**3. Therefore the graph count multiplies by layer × constant × shape.**
-An N-layer model is an **O(N × buckets)** specialization case **by construction, not by bug**.
-A 43-layer model is an O(10²)-graph model before anything is done wrong. Do not treat a large
-graph count as evidence of a mistake until you have checked it against this arithmetic.
-→ *Chapters 2 and 3*
-
-**4. A graph break costs twice.**
-A break splits the compiled program into **more regions**, which means **more graph launches**
-*and* **more host synchronizations** — and in this stack each launch blocks the host. So a
-break costs you once in the extra region and again in the launch/sync traffic around it.
-→ *Chapter 2*
-
-**5. Prefer fewer, larger regions — but verify the specialization count fell, and do not
-mistake coalescing for a fix.**
-Coalescing is a real lever, but it is **necessary and not sufficient**. A region is only the
-*unit inside which* one submission is possible — so you can coalesce successfully and still
-compile to several submissions. And a coalesced region spanning G layers **still needs G
-graphs** if it guards on each layer's int constants (fact 2). **Check both counts, and do not
-report "we coalesced" as "we fixed the overlap."**
-→ *Chapter 2*
+1. **Everything is statically compiled — there are no dynamic shapes.** A `dynamic=True` request is
+   forced to static compilation; every new shape is a new program. Design a fixed shape set. → *ch 1 §1.4*
+2. **Integers specialize exactly like shapes.** A Python `int` in traced code joins the guard set; each
+   new value compiles a new graph. There is no dynamic-argument escape hatch for ints; code computing an
+   offset from a loop index is one program per iteration. → *ch 1 §1.4*
+3. **The graph count multiplies: O(layers × constants × buckets) by construction, not by bug.** Check a
+   large count against this arithmetic before treating it as a defect; a coalesced region spanning G
+   layers still needs G graphs if it guards on per-layer ints. → *ch 1 §1.4, ch 2 §2.5*
+4. **A graph break costs twice** — it destroys in-submission overlap *and* adds host launch/sync traffic.
+   The overlap loss is the big charge; the host charge is a fraction of the host tail, not the lever.
+   → *ch 2 §2.5*
+5. **Prefer fewer, larger regions — necessary, not sufficient.** Verify after any coalescing change:
+   **submissions** (a region still compiles to several recipes if any node is not clusterable) and the
+   **specialization count** (it does not fall while the int guards remain). Coalescing alone has measured
+   *moved no operational count*. → *ch 2 §2.5*
 
 ---
 
 ## The one measurement rule that changes what you optimise
 
-**Price in device occupancy, not in summed work.**
-Measured: **925 ms of summed device work fits inside a 70.5 ms wall — 13.1× parallelism.** The
-wall tracks the **union** of device-occupied intervals, not the sum. **So reducing total device
-work buys you only its un-overlapped part**, and an optimisation that removes 34 % of kernel
-time can leave the wall flat. Before you optimise anything, ask what it removes from the
-**union**.
-→ *Chapter 2*
-
-**But the rule has two levels, and "never sum" is wrong on its own.** Union **within** a recipe;
-sum **across** recipes. Recipes execute sequentially, so the per-recipe unions **partition** the
-step exactly — on the reference arm, **110 recipes summing to 66.135 ms against `merged` = 66.1399**
-(0.007 %). What is illegal is summing **event** durations, which double-count. Summing recipe unions
-is the correct model, and it is what lets you price a span by its own union.
-→ *Chapter 2 §2.9 rule 1; chapter 3 §3.6.4*
-
----
+**Price in device occupancy — the union — not in summed work.** The wall tracks `merged` (R² ≈ 0.9999
+on the run corpus); summed device work exceeds `merged` by an order of magnitude on a decode step. Two
+levels: **union within a recipe, sum across recipes** — recipes are serial, so per-recipe unions
+partition the step exactly. A union is an occupancy, not a removal price: **removing work frees its
+leave-one-out, routinely far smaller than the removed family's own union.** → *ch 2 §2.9 rule 1, ch 3 §3.6*
 
 ## The one stale claim to watch for
 
-**A widely-repeated framing says a decode step is "launch/serialization-bound" with the device
-largely idle. On our measurements that framing is STALE, and the lever it implies is the wrong
-one.** Two competing models were fitted to the same archived runs:
-
-| model | R² | RMS residual |
-|---|---|---|
-| `wall = k × node-executions` (launch/node model) | **0.346** | **107.85 ms** |
-| `wall = a + b × merged` (occupancy model) | **0.999950** | **0.95 ms** |
-
-**The occupancy model wins by two orders of magnitude in residual**, so the step is
-**device-occupancy-bound and the lever is the union, not the launch count.** Independent notes
-reach the same conclusion. The launch model also has **no usable coefficient** — its per-run
-`k` varies by **171 % of its own mean**, so there is no stable µs-per-node to design against.
-Excluding the two outlier runs, occupancy still wins by ~5×.
-
-*(Provenance note, so a re-run is not a surprise: the launch figures come from one of three
-closely-related fits in the same artifact — rank-mean n=13, rank-0 n=13, rank-0 n=12 — giving
-R² 0.346 / 0.344 / 0.313. All three agree on the conclusion; 0.313 is the same result, not a
-contradiction.)*
-
-**And this reconciles an observation that otherwise looks like a contradiction.** Removing
-**34 % of kernel time** once left the step wall **flat**. Under the launch model that is a
-puzzle. Under the occupancy model it is exactly what you would expect — **removing summed work
-does not reduce the union.** The two facts are one fact.
-
-So: if you inherit a "launch-bound" claim, **check it against the union before acting on it.**
-The stale framing is the single most likely thing to send you optimising the wrong quantity.
-
-**And when you find a gap between the union and the wall, do not name it "communication" — count
-the holes.** Merge the device intervals, take the complement, and histogram the holes by width: the
-sub-50 µs ones are launch granularity and track **op count**, and a multi-millisecond hole is only a
-collective if it is **aligned across the ranks that take part** — tested against a null, because at
-~20,000 holes per step anything matches by chance. → *[Chapter 1 §1.8](01-basics.md)*,
-[`examples/01-basics/gap_histogram.py`](examples/01-basics/gap_histogram.py)
+**"A decode step is launch/serialization-bound" is stale on our measurements; the step is
+device-occupancy-bound and the lever is the union.** The occupancy model beats the launch model by ~2
+orders of magnitude in residual; the launch model's per-run coefficient varies by 171 % of its own mean.
+Removing a third of kernel time once left the wall flat. If you inherit a launch-bound claim, test it:
+hold launches, op counts and recipes fixed and change only device time. → *ch 2 §2.5.5*
 
 ---
 
-**And when you write your own TPC kernel, the unit of cost is the VLIW *bundle*, not the instruction** — a `{...}` group in a `tpc-clang -S` listing is a 4-slot issue bundle, the device retires one per cycle, and the shipping scheduler leaves 1.2–3.4× of bundle count on the table. → *[Chapter 4](04-execution-model.md)*
+## Non-negotiables — the obvious slowdowns
+
+- **All device work must be graph-compiled**, warmed at the exact shapes it will see, with **zero
+  compiles after warmup** (count `compileGraph` events — the Synapse level, not dynamo's). A rising
+  specialization count in steady state is cache-limit thrash; a count growing with steps is a per-call
+  recompile. Track standing metrics on every change: specialization count, submissions, syncs, wall,
+  `merged`. → *ch 2 §2.5, ch 3 §3.5/§3.10*
+- **Tensor data stays on the device — no D2H/H2D mid-computation, not even a little.** A `.item()` is a
+  graph break; `x.cpu().to('hpu')` round-trips bytes *and* splits the recipe. An arm allocating fresh
+  outputs every step is paced by the host allocator and looks host-bound — reuse buffers.
+  → *ch 1 §1.4, ch 2 §2.9 rule 7*
+- **Graph breaks and extra syncs are the structural cost to avoid** — but price them in `merged`, and
+  weigh a break first against the overlap it destroys.
 
 ---
 
-**The 48 MiB SRAM is real, the compiler already slices into it, and you cannot place a tensor in it
-from your own code.** Placement is decided by **graph structure** — a tensor needs a real *compute*
-producer (a view does not qualify) — not by any request you can make. Every obvious route to *placing*
-one is closed, and most fail **silently**: a TPC kernel that computes an SRAM address compiles to a *local-memory* access and
-appears to work. **Observe, do not request** — and read the chapter before you plan around it. **And it
-does read measurably faster than HBM — 10.2 % at 4 MB with non-overlapping distributions, 1.18× at the
-highest rate we saw (32 MB, one rep against the best of three) — but only by that much: both arms land
-within ~10 % of the same ~2.3–2.4 TB/s per-core band, which points at the engines rather than the memory
-as the binding constraint (INFERRED — one SRAM point cannot settle it).** So the gain is real and small,
-and the route to the pool's actual bandwidth is an engine with more appetite (the MME), which the
-compiler cannot yet feed from SRAM without a staging copy. → *[Chapter 7](07-sram.md)*
+## The overlap law → *ch 2 §2.2*
+
+Cross-engine overlap exists **iff all four hold** (missing any of the first three gives exactly
+`CROSS = 0.0000`): **(1)** the whole group in **one submission** (`Launch`/step == 1, same
+`recipeHandle`) — **(2)** on **different engines** — **(3)** with **no dataflow edge** (cross-engine →
+monitor wait; same-engine elementwise → fused, usually a win) — **(4)** at **comparable durations**
+(detectability: groups differing >~2× show nothing either way).
+
+- **Recipe boundaries are placement, not op identity.** Any node the shared-layer validator rejects is
+  placed `eager` and splits the run. Ops in the **`custom_op` namespace short-circuit** the validator
+  and cluster regardless; to co-schedule a hand-written TPC kernel, register it in the *existing*
+  `custom_op` library, keep its body edge-free to the other branches, duration-match, and **verify
+  placement** (`PRE_PARTITIONER` pass + trace) — never infer from the namespace. → *§2.3–2.4*
+- **Two HPU streams buy exactly zero overlap** — measured device-bound. Do not design around streams.
+  → *§2.12, ch 3 §3.8*
+- **MME ∥ TPC overlaps well; TPC ∥ DMA barely at all** — a shared-bottleneck effect, not dispatch order.
+  → *§2.6*
+- **Control the co-tenant.** A rate measured with an uncontrolled co-resident engine is a property of
+  that recipe context, not the hardware; the inflation is large and routine. Measure solo, then in
+  context. → *§2.7*
 
 ---
 
-**Tagging convention** (used throughout): **MEASURED** / **source read** / **ASSUMED** / **INFERRED** /
-**UNKNOWN**. See `README.md`. The numbers above are from one workload on one box — treat the
-*shape* of each fact as general to Gaudi 2 and the specific figures as that workload's.
+## Hardware pocket card → *ch 1*
+
+- **Engines:** 24 TPC (elementwise/reduce/gather/casts/softmax/custom kernels) · 4 MME (matmul only) ·
+  8 DMA tids, 5 carrying HBM↔SRAM traffic — **one transfer at a time per lane, lanes chosen per-transfer
+  round-robin; you cannot steer a copy**.
+- **Memory:** 96 GiB HBM per card · **48 MiB SRAM** (one shared pool; compiler-managed) · **no L1/L2
+  data cache between HBM and SRAM** — reuse must be engineered, it does not happen automatically · TPC
+  local memory 1 KB scalar + 80 KB vector per core, plus small private per-TPC caches (64 KiB
+  instruction, 32 data lines).
+- **Bandwidth is size- and engine-dependent; a figure without its size is not a figure** (all
+  **MEASURED**, ≥16 MB): TPC stream ≈ **2,147 GB/s** at ≥134 MB; DMA engine ≈ **1,776 GB/s** at 16–64 MB,
+  ≈ **2,025 GB/s** at ≥256 MB (nominal spec 2,450 GB/s). Below ~16 MB, small-tile GEMV work loses
+  bandwidth sharply — a TPC cliff, **not** a DMA curve (no DMA measurement exists there). Keep decode
+  weight tiles ≥ ~16 MB.
+- **Eager `torch.copy_` is a TPC kernel, not the DMA engine** — compiled, the same op does use DMA.
+  Check `args["HW event name"]`, not the op you called.
+- **Cost models have different error signs**: MME accurate (~0.5 %); DMA an optimistic lower bound,
+  worse at small sizes; the TPC kernel cost model runs at **1800 MHz** on Gaudi 2 with its bandwidth
+  terms hard-wired at **1700 MHz** (5.6 % apart, so the sign of its error depends on which term
+  dominates). `dma_expected_duration` in a dump is a model, not a measurement. Neither is a neutral
+  reference.
+- **Markers are not execution windows.** Only the TPC marker is a true start→halt span; MME and DMA
+  markers self-overlap heavily — build every duration as a per-node merged union, labelled with Synapse's
+  own `args["HW event name"]`, never a name heuristic. → *ch 1 §1.8, ch 2 §2.9 rules 2–3*
+
+---
+
+## Writing a TPC kernel → *ch 4*
+
+- **The cost currency is the VLIW bundle, not the instruction** — the device retires ~one bundle per
+  cycle (~0.556 ns at 1.8 GHz); one vector slot per bundle, so the floor is the vector-op count. Count
+  bundles (`--tpc-asm-format=2`), never lines or mnemonics.
+- **The shipping scheduler packs ~1 instruction per bundle.** `-mllvm --pre-RA-sched=vliw-td` on the
+  `tpc-clang` line in the kernel's `build.sh` cuts bundle counts substantially at equal or higher
+  instruction counts, bit-exact at kernel level — **model-level safety is NOT established**, and the flag
+  reaches only the kernels we compile.
+- **One 256-byte vector register; 256/128/64 lanes for 8/16/32-bit elements.** Cost is per register, so
+  per-element throughput is `i8/fp8 : bf16 : f32 = 4 : 2 : 1`. fp8 is native for logic/select/max, but an
+  fp8 **add is ~3 instructions** — price fp8 arithmetic.
+- **No wave, no warp, no occupancy: a TPC is single-context.** Only the asynchronous memory drain hides
+  latency, so intra-TPC time is `MAX(ALU, memory)`, not a sum. Expose independent work **inside the loop
+  body** (independent accumulators); a bigger `#pragma unroll` is *not* the lever and can be a loss.
+- **Read the listing, including operands** — a clean compile can emit the wrong access (`ld_l`/`st_l`
+  local instead of `ld_g`/`st_g` global), and an instruction count cannot tell a live op from a
+  dead-code-eliminated one. Compare `.text`, never `.o` md5. Per-launch overhead grows sublinearly with
+  bundle count, so small-shape microbenchmarks mostly measure the residue, not the kernel.
+
+---
+
+## Quantization landmines → *ch 3 §3.4*
+
+- **Device fp8 is `e4m3fn` codes, bias 7 (the default; the bias is selectable per op and is part of the
+  operand contract), max finite 240.** Bytes `0x78–0x7E` / `0xF8–0xFE` decode to ±inf/NaN — poison,
+  created at decode, **unrecoverable**. **CPU torch disagrees** (reads them as finite up to 448): fp8
+  reasoning from CPU behaviour computes the wrong poison set. Saturate at 240, not 448.
+- **The standard fix — fp8 weights ×0.5, fp32 scales ×2.0 — is safe only on host/checkpoint tensors**,
+  asserted structurally at load. On an HPU tensor the same expression is a no-op that preserves the
+  poison (`inf × 0.5 = inf`).
+- **e8m0 scale bytes: 255 is NaN** — raise at load, never substitute a value. Checkpoints store scales as
+  raw `uint8` exponent bytes more often than you expect; the loader must be dtype-aware.
+- **fp4 (MXFP4): fold the per-32 e8m0 scale into the fp8 exponent inside the dequant kernel** —
+  `fp8_gemm_v2` has no block-scale input and is **2-D only**, so a batched expert GEMM is G calls. The
+  fold is exact only within a bounded exponent range: guard at load with an assertion (zero runtime
+  cost) and know the kernel's exactness boundary. The vendor `mxfp4_fused_weights` op is a drop-in only
+  for a bf16-input, SILU-no-clamp, block-32, provably-in-range-scale model — **one out-of-range scale
+  NaNs the whole layer**, `block_size` is inert (fixed 32). Histogram your scales before choosing either
+  path.
+- **A green test is not evidence about the thing you think it tests**: a gate that cannot fail on the
+  unfixed code, or whose oracle is produced by the code under test, is decoration. Require RED on the
+  unfixed code first.
+
+---
+
+## Porting doctrine → *ch 3*
+
+- **Prefill and decode bind on different resources, and the doctrine inverts.** Decode at bs=1 is
+  **weight-read bound**: compute the byte floor from the config and checkpoint headers — *not* from a
+  trace — and check the largest term before optimising (in our port attention projections, not the MoE,
+  are largest). → *§3.1*
+- **Rank spans by removable bytes, not milliseconds.** `traffic amplification = port bytes ÷ model
+  bytes`; a span already at the bandwidth envelope has only traffic headroom, and a milliseconds-ranked
+  list hides exactly those spans. → *§3.1.4*
+- **Replace spans, not kernels** — pull the slow contiguous span out and write different code computing
+  the same result; validate per step by ulp histogram (there is **no ulp-based criterion across an
+  accumulation** — unfalsifiable; use paired-differential fidelity). A signature mismatch is evidence
+  about where you drew the boundary: widen the span. → *§3.0.1*
+- **The MoE path is six materialising stages**, not four — the easy ones to miss are the scale gather and
+  the `repeat_interleave` expand (a broadcast; even a stride-0 view materialises it).
+- **Batching a sparse model is a step function of the compiled bucket, ~flat in rows inside a bucket**
+  (the routed-expert-union mechanism is refuted by direct test). Crossing a bucket is what costs.
+  → *§3.1.5*
+- **Do not hide a mutation from the functionaliser.** A view-level ATen in-place write has a cheap
+  compiled path; the same write inside an opaque op declaring `Tensor(a!)` on a large buffer materialises
+  whole-buffer copies under `torch.compile`. → *§3.6.6*
+- **Read a harness's environment before quoting its numbers** — a harness that sets env flags measures a
+  configuration, not the product. → *§3.10*
+
+---
+
+## Profiling: identity is a run-time decision → *ch 5*
+
+- **Set `TORCH_TRACE` and `DUMP_POST_GRAPHS` before the run** (plus a cold recipe cache — a warm cache
+  yields an empty dump; `mkdir -p` the directory; per-rank directories under TP). A trace without them
+  can never be attributed to code and no analysis repairs it: **discard and re-run**.
+- **Collect CPU+HPU whenever you want attribution** — compile ids live in a CPU-side annotation; HPU-only
+  drops every region span. Device durations are unaffected by CPU collection; what it corrupts ~3× is the
+  host span and queue depth — the metrics that make a device-bound arm look host-bound.
+- **Attribute launches (`launch_recipe`), never device events, to regions** — device events are
+  asynchronous and mostly fall outside every host span. Key recipes by `recipeId`: `recipeName` is empty
+  on ~99.9 % of device events. On a stock bridge, region→recipe has no key at all (our fork adds one).
+- **Pre-flight every trace**: a stale `HABANA_PLUGINS_LIB_PATH` makes the profiler start fail *silently*,
+  yielding a trace with no device events that parses fine. Require `kernel` + `hpu_op` categories (and
+  `Torch-Compiled Region` spans for attribution) before reading anything.
+- **Declare the clip** for every per-step figure, and **gate the arm before quoting it** (≥2 ops
+  outstanding, ≥80 % device busy — otherwise INCONCLUSIVE, never a negative). **A zero count in a log is
+  a claim about the instrument first** — check whether the emitter is env-gated before reading "never
+  happened". → *§5.7*
+
+## The iteration workflow → *ch 6*
+
+A full model run costs minutes; a span harness costs seconds (~100×). **One attributed profile → pick a
+span at a recipe boundary → compute the floor and its binding regime first (bytes / FLOPs / launches),
+declared in writing → capture the span's bytes (inputs *and* state — KV cache, block tables, routing;
+audit against the recipe's own tensor table) → gate on correctness *running the compiled region* → check
+the harness is a proxy (recipe count, node mix, op counts, union vs. the profile) → iterate reading time,
+union, op count, launch count and busy fraction together → confirm in situ once per span.**
+
+- A span smaller than the harness's own overhead measures the harness; a whole decode step is a valid
+  span for *integration*, not exploration. Choose by share of the step, not by how cleanly a span
+  extracts.
+- **No tensor caches and no identity keys inside traced code** — a cache hit inside a traced region is a
+  baked constant (the input is silently ignored), and `id(tensor)` / `tensor is x` is either a crash or
+  *arbitrary* under dynamo. Thread tensors as graph arguments. A bit-exact gate on self-consistent
+  inputs cannot detect this: the required case class is **same shape, different data**. The negative
+  control must fail on the pre-fix code.
+- Eager is not a cheaper version of the compiled program — it is a different one (measured ~400×); a gate
+  that never executes the compiled path cannot see that the compiled path exists. A confirmation that
+  comes back flat is a result: the span was not on the critical path, or the change moved cost into the
+  host term.
+
+---
+
+## The SRAM → *ch 7*
+
+**You cannot place a tensor in SRAM from your own code — placement is the graph compiler's decision.**
+`synDeviceMalloc` at an SRAM address returns `synSuccess` and hands back DRAM; a TPC kernel has 32-bit
+pointers, so a hardcoded 64-bit address compiles to a *local-memory* access that appears to work and can
+fault the card asynchronously; `AuxTensor.sramAlloc` is a dead field.
+
+- **Eligibility is graph structure, not requests**: a tensor needs a *real compute producer* (a view does
+  not qualify; one elementwise pass does), and construction decides — a single `bmm` gets its tile sliced
+  into SRAM while per-expert GEMMs plus a `cat` silently get nothing, same shapes.
+- **Populate or observe**: host DMA into the aperture works if the staging buffer comes from
+  `synHostMalloc` (plain heap returns code 34 — a statement about the host side, not the device); a TPC
+  can read/write a data-free **aux tensor** placed in SRAM under the scratchpad knob.
+- **Observe, do not request**: gate on the placement line for the *specific operand*, on `maxRange.size`,
+  and on `workspace_size` (256 B = nothing materialised; more = a DRAM copy). The GC log is asynchronous
+  and truncated at process start — poll a completed log delta or trust nothing.
+- **What the pool is worth is OPEN.** One TPC-path experiment showed a real but small SRAM-over-HBM gain,
+  with both arms near the same per-core band — pointing (INFERRED) at the engines, not the memory, as the
+  binding constraint. Do not anchor future investigation on any point figure; the MME path and the
+  span-level A/B are unmeasured.
+- **Safety: `synMemCopyAsync` does not validate addresses — copying past the 48 MiB aperture faults the
+  card** (measured, DFA, hard reset required). Bound every sweep by `SRAM_BASE + SRAM_SIZE` read at
+  runtime; check uncorrected-error counters before and after.
+
+---
+
+## Devices, pinning, processes → *ch 3 §3.7*
+
+- **One card has four disagreeing numberings** (module id, `hl-smi` index, local torch index, display
+  row). Reason and pin in **module ids**; a module is acquired **exclusively** — a pin set must be a
+  partition, and a second requester of a held module fails loudly. `HLS_MODULE_ID` is the pin (read
+  lazily at acquire; settable after import but before the first HPU tensor); `torch.hpu.set_device(i)` as
+  the first HPU call writes it. **`HABANA_VISIBLE_DEVICES` set inside a container is inert** — the
+  container's device flags already chose the cards.
+- **No self-report API is reliable** (`current_device`, `tensor.device` all report 0); read the module-id
+  env var. Unset = unpinned, not module 0.
+- Concurrency between HPU jobs perturbs timing little, but **stagger launches ~2 s** (simultaneous starts
+  can lose a worker to the acquire race) and **never sample `hl-smi` during startup/teardown** (transient
+  full-memory readings).
+- `synStatus=8` and `synStatus 26` are **not diagnostic** — each arises from several causes. Retry, raise
+  the GC log level, and bisect with `synchronize()` markers behind a default-off flag (swept before
+  commit). Never `pkill -f` on a shared box.
+
+---
+
+## Dead ends — do not re-walk these → *ch 3 §3.8*
+
+Two HPU streams for overlap · region coalescing alone · launch/sync/recipe counts as the lever ·
+"remove the `cat`" · pre-dequantizing experts at load (HBM-blocked) · re-expressing a fused kernel in
+native torch ops · "avoid custom ops" as a heuristic · a node-count census as a cost model (metadata
+nodes are free on the device; 1–3 µs integer nodes can dominate — rank by engine × count × mean
+duration) · `torch.stack([a, a], dim=-1)` in a benchmark (the same tensor twice) · profiling with CPU
+activity when you need host/queue metrics · `**`-globbing `.graph_dumps` (hidden directory) · reaching
+SRAM from user code · treating a `dynamic=True` request as a fix · a detector whose allow-list excludes
+the default it must see.
+
+---
+
+## Measurement discipline — the short list → *ch 2 §2.9*
+
+1. **Durations are unions; never sum event durations.** Recipe unions may be summed (recipes are serial);
+   event durations may not. Sum per device, never across TP ranks.
+2. **A marker duration is not an execution window** — merge per node per tid first.
+3. **Never infer a mechanism from an identifier** — a name, guid, filename, or single record names
+   nothing. Parse structured strings by field; cross-tabulate your filters.
+4. **A result is overturned by adding a control, not a measurement** — a collinear corpus cannot be
+   separated by more fits. Prefer the arm that differs in exactly one dimension. Pre-commit a falsifier
+   for the claim the arm is about — and make sure the arm actually varies the quantity it is about.
+5. **A precondition failure is INCONCLUSIVE, never a negative** — the achieved rate tracks device busy.
+6. **Collect only the profiler activity you need** — CPU collection inflates host span ~3×; a host
+   blocking in the allocator looks host-bound.
+7. **Two counts differing by exactly the step / rank / layer count are one measurement at two
+   normalisations** — compare the moments, not the counts.
+8. **Two views of the same quantity are not two instruments** — name what each reading is a view of; an
+   instrument that overwrites its own evidence is not an instrument (artifact paths carry run identity).
+9. **State a number's derivation, not just the number** — a derivable figure can be re-checked in a
+   minute.
+
+---
+
+**Tagging convention** as throughout: **MEASURED** / **source read** / **ASSUMED** / **INFERRED** /
+**UNKNOWN** — see [README](README.md). The facts above are general to Gaudi 2 in *shape*; the quoted
+figures are from one measurement campaign (torch 2.13 / Habana 1.24.2, one 4-AIP box), the
+workload-specific ones **[DSv4F]**. Where a number matters to your decision, read the chapter and the
+conditions it was measured under — not this file.

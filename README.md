@@ -53,7 +53,7 @@ those in from general knowledge.**
 
 | # | chapter | ~lines | status |
 |---|---|---|---|
-| **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
+| **0** | **[TL;DR](00-tldr.md)** | ~300 | **read this first** — terms, the five facts, the measurement rule, and the rulebook for overlap, bandwidth, TPC kernels, quantization, porting, profiling, iteration, and SRAM |
 | 1 | [Gaudi/HPU Basics](01-basics.md) | ~1,000 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
 | 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |

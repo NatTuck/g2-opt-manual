@@ -15,10 +15,19 @@ how to program for Gaudi 2.
 
 There's no reason for large data files in this repo. Probably 100% code and readable text.
 
-## Broad Outline
+## TLDR File
 
-Sections:
+As we update the rest of the manual, we're going to maintain `00-tldr.md` as a token 
+efficent summary of the key ideas. This file must always include:
 
-- Gaudi/HPU Basics
-- How to optimize small programs / regions
-- How to port a large language model to HPU
+- A basic set of common terms and definions: lazy vs. eager vs. compiled, graphs vs. recipes,
+etc.
+- Strong and clear about the device / compiler programming model, how specialization works.
+- Strong statements about avoiding obvious slowdowns:
+  - All HPU code must be graph compiled.
+  - Tensor data must stay on the HPU once it's there, absolutely no device to host transfers
+    mid computation, not even a little bit.
+  - Graph breaks and syncs are the big cost to avoid.
+
+As changes are made to the manual, the tldr file should be kept up to date. It should stay as compact as it reasonably
+can be, never more than 10,000 tokens.
