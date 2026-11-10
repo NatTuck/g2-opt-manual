@@ -5,3 +5,4 @@ scratch/
 *.pt
 *.log
 __pycache__/
+.nest

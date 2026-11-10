@@ -101,6 +101,13 @@ On-die SRAM slower than off-die HBM is not credible, so a ceiling that never ris
 consistent with **nothing in that programme being SRAM-resident at a size that mattered** — which §7.2
 explains.
 
+**The compiler carries its own number for the pool, and it is much higher than anything measured:
+6,554 GB/s.** `Gaudi2HalReader::getSramBwGBps()` returns `0x199a` — a **planning constant, not a
+measurement**, and about **2.7×** the ~2.3–2.4 TB/s per-core band the TPC arms reach (§7.6, §4.1.2).
+Read it as the ceiling an engine with more appetite would be chasing — the MME — and not as a rate
+any TPC has achieved from the pool. **source read** (shipped 1.24.2 `libSynapse.so`; the same reader
+returns 1945 for HBM and 970 *per DMA engine*, §1.6).
+
 **That negative has since been tested, and it moved by 1.4 %.** The one **SRAM-resident** arm measured
 since (§7.6) reaches **2,338 GB/s = 95.4 % of spec** — above the old 2,306 GB/s ceiling, and still
 below spec. §4.1.2's independent HBM-side measurement brackets it too: six well-packed TPC arms sit

@@ -53,7 +53,7 @@ those in from general knowledge.**
 
 | # | chapter | ~lines | status |
 |---|---|---|---|
-| **0** | **[TL;DR](00-tldr.md)** | ~90 | **read this first** — the five facts that change how you write code, plus the one measurement rule that changes what you optimise |
+| **0** | **[TL;DR](00-tldr.md)** | ~300 | **read this first** — terms, the five facts, the measurement rule, and the rulebook for overlap, bandwidth, TPC kernels, quantization, porting, profiling, iteration, and SRAM |
 | 1 | [Gaudi/HPU Basics](01-basics.md) | ~1,000 | hardware model · engines · queues · compilation model · memory · bandwidth · cost models · markers · profiling · pinning |
 | 2 | [Optimizing small programs and regions](02-regions.md) | ~1,000 | overlap law · composition · recipe boundaries · region strategy · the lever · measurement discipline · dump instrument |
 | 3 | [Porting a large language model to HPU](03-porting.md) | ~3,700 | prefill vs decode · MoE · quantization · specialization · pinning · dead ends · defect case studies |
@@ -80,6 +80,16 @@ annotated sketches** that need a device; each says so in its header.
 Chapter 5's three programs are the exception to "annotated sketch": they were **run on a real
 Gaudi 2 on 2026-10-21** and their outputs are archived, so the worked example in §5.8 is a
 measurement rather than a description.
+
+## Timings and field reports
+
+[`timings/`](timings/) holds end-to-end measurements of real serving stacks, kept separate from
+the chapters because they are reports rather than teaching material. Each directory carries its
+own provenance and says what it does not cover.
+
+| report | what it is |
+|---|---|
+| [`timings/ds41-flash-1cat/`](timings/ds41-flash-1cat/) | DeepSeek-V4.1-Flash on 4×Gaudi2 through the 1Cat vLLM fork: a measurement report and a from-scratch replication procedure, including two defects found on the way (a TP4 halo-tail crash for mid-length prompts, and an out-of-bounds fused decode kernel) |
 
 ## What this draft does not yet cover
 
