@@ -540,7 +540,7 @@ the ordered-integer key differs per format. Use a per-format instrument, not a g
 ### 6.6.1 The gate must run the region the engine runs
 
 **An eager harness measures a different program, not a cheaper version of the same one.** This
-project has measured that gap at **400×** — an expert kernel at **29 ms eager against 0.356 ms
+project has measured that gap at **81×** — an expert kernel at **29 ms eager against 0.356 ms
 compiled** — so an eager number is **not a lower bound** on the compiled number and cannot stand in
 for it. Worse, and this is the defect that motivated this subsection: **an eager pass says nothing
 about whether the compiled path exists at all.**
@@ -731,8 +731,8 @@ Two failures this section's comparison caught but did not warn about, both from 
 harness for a real model:
 
 **1. Eager is not merely slower — it ranks differently.** The same op measured **29–31 ms eager** and
-**0.356 ms compiled** (`hpu_backend`, `fullgraph=True`, `dynamic=False`) — a **400×** difference — and
-the eager ranking was ordered by **launch cost, not device time**. **Any harness that calls an op
+**0.356 ms compiled** (`hpu_backend`, `fullgraph=True`, `dynamic=False`) — an **81–87×** difference —
+and the eager ranking was ordered by **launch cost, not device time**. **Any harness that calls an op
 without compiling it is measuring launch overhead**, so a comparison across variants taken eagerly can
 be confidently, orderedly, wrong (§6.6.1).
 
