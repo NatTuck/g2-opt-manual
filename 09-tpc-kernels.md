@@ -57,7 +57,7 @@ glue library **28,832 bytes**, torch extension **10,959,536 bytes**. **MEASURED*
 > `-fcoverage-compilation-dir=<cwd>` and `-fdebug-compilation-dir=<cwd>` — and the file grows in 16-byte
 > steps as the path gets longer. Measured over nine builds of the identical source:
 >
-> | length of the working directory | 20–23 | 24–31 | 32–39 | 40–47 | 48–55 | 56–63 |
+> | length of the working directory | ≤23 | 24–31 | 32–39 | 40–47 | 48–55 | 56–63 |
 > |---|---|---|---|---|---|---|
 > | device ELF, bytes | **14,480** (`0x3890`) | **14,496** (`0x38a0`) | **14,512** (`0x38b0`) | **14,528** (`0x38c0`) | **14,544** (`0x38d0`) | **14,560** (`0x38e0`) |
 >
@@ -535,6 +535,11 @@ not for the library.*
    spec, not on the machine code that implements it, so a fixed kernel runs the old binary until you clear
    the directory. **INFERRED** *(store and lookup use the same key expression — `hpu_recipe_cache.cpp:317`
    and `:354` — so an identical filename is a hit; the filename identity itself is measured above)*.
+   **Why the last step is inferred rather than measured:** a graph that actually *contains* this kernel
+   needs both libraries on `GC_KERNEL_PATH`, and an **enabled** disk cache rejects a colon list (consequence
+   4 below, abort at device init). The end-to-end experiment is therefore blocked by the very defect that
+   makes the hazard dangerous, not skipped for convenience. The cache *hit* itself has been measured with a
+   single-path list (`delete_on_init=false`: runs 2 and 3 leave the recipe's mtime untouched).
    **Guidance: maintain your own key — one cache directory per *(build, configuration)* pair, or set the
    second field (`delete_on_init`) to `true` and pay the recompile.** The environment blindness compounds
    it: a cache directory shared between two configurations silently mixes recipes built under different
@@ -862,7 +867,7 @@ container, with the command given.
 | compiler and stack versions | `tpc-clang` 2.7.33 (clang 14.0.5); `torch` 2.13.0a0+git2469d18; driver `1.24.2-52a555d`; fw `hl-gaudi2-1.24.0-fw-62.6.2-sec-11`; 2 × `HL-225` | measured — `tpc-clang --version`, `torch.__version__`, `hl-smi -L`, §9.3.1 |
 | three artifact sizes | ELF 14,480 B (`0x3890`); glue `.so` 28,832 B; extension 10,959,536 B | measured — `./build.sh` from a clean tree, §9.3.3. **Both path-dependent**: the ELF steps by 16 B every 8 characters of cwd, §9.1 |
 | exported glue symbols | **3 entry points** (14 defined dynamic symbols in total) | measured — `nm -D --defined-only`; entry points declared at `tpc_kernel_lib/src/entry_points.cpp:17,39,54`; the other 11 are the one class's methods, destructors, typeinfo and vtable, plus the 3 `_binary_*` |
-| ELF size path dependence | `-fcoverage-compilation-dir=` and `-fdebug-compilation-dir=` both carry the absolute cwd; cwd len 20–23/24–31/32–39/40–47/48–55/56–63 → ELF 14,480/14,496/14,512/14,528/14,544/14,560 B | measured — nine builds of the same source, `strings <elf>`, §9.1 |
+| ELF size path dependence | `-fcoverage-compilation-dir=` and `-fdebug-compilation-dir=` both carry the absolute cwd; cwd len ≤23/24–31/32–39/40–47/48–55/56–63 → ELF 14,480/14,496/14,512/14,528/14,544/14,560 B | measured — nine builds of the same source, `strings <elf>`, §9.1 |
 | kernel bundle count | **96** | measured — default `-S` listing parsed by brace groups **and** `-mllvm --tpc-asm-format=2` line count, which agree; §9.2.4 |
 | per-slot count | **not quoted** (82 vs 94 disagree) | measured — deliberately withheld, §9.2.4 |
 | `VECTOR_SIZE` for f32 | 64 | source read — `tpc_kernel_lib/kernels/include/kernel_config.h:19`; cross-ref §4.3.1 |

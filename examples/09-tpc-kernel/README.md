@@ -67,7 +67,8 @@ facts, all in chapter 9 §9.5:
 
 One more, and it is the opposite of what the variable names suggest: the disk cache's filename is
 `<graph hash>_a16fb581eee_syn<version>.recipe`, and that middle field is a **constant**. Editing the
-kernel and rebuilding does not invalidate the cache — you get the stale recipe. Keep one cache
+kernel and rebuilding does not invalidate the cache — the chapter **infers** that you are then served
+the stale recipe (§9.5.3, which tags it INFERRED and says what would settle it). Keep one cache
 directory per build, or set `delete_on_init`. Chapter 9 §9.5.3 has the source and the measurements.
 
 `test_add1_op.py` is upstream's pytest test and needs `pytest`, which is **not installed in this
