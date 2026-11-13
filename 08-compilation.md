@@ -1,0 +1,666 @@
+# 8. How PyTorch code compiles and runs
+
+**Status: draft.** Tags follow the manual's convention — **MEASURED** / **source read** / **ASSUMED** /
+**INFERRED** / **UNKNOWN** ([README](README.md#how-to-read-this-manual)). Every number below is
+restated from the named artifact beside it, not from memory, and each carries the conditions it is
+valid under. The measured material is on the runtime this project executes on: Synapse `1.24.2-481`
+(build `79e284b`), driver `1.24.2-52a555d`, torch `2.13.0a0+git2469d18`, `habana-torch-plugin`
+`1.24.2`. The source reads are the installed bridge (`habana_frameworks`, 1.24.2) and — for Synapse
+internals — an old **1.16** snapshot (base commit `6de1f66`), which is flagged wherever it is the only
+evidence.
+
+**What this chapter is.** The layer *above* the device: what `@torch.compile` actually produces, how
+that reaches Synapse, what a recipe is, what a launch costs, and what any of it costs in memory. It
+answers the three questions that decide whether a change to your Python is a change to one program or
+to four hundred:
+
+1. **What does `@torch.compile` produce, and how many of each thing?** Three counts are routinely
+   conflated — graphs, recipes, submissions — and they are not the same number. (§8.1–§8.3)
+2. **What is a recipe, and what does it cost to run one?** A recipe is a host-side program that holds
+   no device memory; every launch re-downloads it into a rotating ring. (§8.4–§8.5)
+3. **What does the graph count cost in memory, and which cache are you actually sizing?** The answer
+   is host memory and disk, not HBM — and the one cache everyone reaches for does not exist on this
+   card. (§8.6–§8.7)
+
+It closes with the specialisation rule restated at the recipe level (§8.8), the lazy/eager/compiled
+distinction and its stale vendor comment (§8.9), how to see all of this yourself (§8.10), and its own
+UNKNOWN register (§8.11).
+
+> **Why this is chapter 8 and not part of chapter 4.** Chapter 4 is *the TPC execution model* — the
+> layer **under** the compiler, denominated in VLIW bundles. This material is the layer **above** it:
+> dynamo, AOT Autograd, the bridge's passes, Synapse's recipes. It belongs next to chapters 1–2, which
+> use the vocabulary, but the manual appends and does not renumber
+> ([chapter 4's own preface](04-execution-model.md)), so it is chapter 8 and cross-references chapters
+> 1, 2, 4 and 6 rather than restating them.
+
+**A note on what is new here.** Chapters 1–3 use the words *region*, *recipe* and *submission* as
+though their relationship were obvious. It is not: §8.2 measures one decorated function becoming two
+recipes, and §8.6 measures 24 distinct recipes costing **0.0 MiB** of device memory. Both facts are
+load-bearing for how you write code, and neither was in the manual before.
+
+---
+
+## 8.1 The chain in one page
+
+One `@torch.compile` call walks this chain. Each stage produces something with a different lifetime,
+and only one of them is device memory.
+
+| # | stage | produces | counted as | evidence |
+|---|---|---|---|---|
+| 1 | **dynamo** traces the Python frame | one FX graph per frame; a graph break splits a frame | **graphs** | §8.2 (MEASURED) |
+| 2 | **`hpu_backend`** hands the graph to AOT Autograd | a joint fwd/bwd graph, then a partitioned forward | — | `backends.py:52-79` (*source read*) |
+| 3 | **bridge FX passes** | a graph whose every node carries `meta["placement"]` | — | `passes.py:1596` (*source read*) |
+| 4 | **partitioner** groups `hpu_cluster` nodes | one fused submodule per maximal contiguous run | **recipes** | `partitioner.py:27-38`, `cluster_compiler.py:132` (*source read*) |
+| 5 | **`get_callable_recipe`** compiles each submodule | one Synapse recipe (host-side program) | **recipes** | `recipe_compiler.py:361-372` (*source read*) |
+| 6 | **each execution** | one `synLaunch` that re-downloads the program | **submissions** | §8.5 (MEASURED + *source read*) |
+
+**The three counts, and why they are not each other:**
+
+- **graphs** (dynamo) ≥ **recipes** (maximal clusterable runs) ≥ **submissions** (one launch per
+  recipe per execution).
+- A graph break **increases graphs**; it does not by itself increase recipes-per-graph — it ends one
+  region and starts another, each of which still contributes its own runs (§8.2, case C).
+- Ops **do not** multiply recipes. Three clusterable ops in one body are one recipe (§8.2, cases B and
+  D).
+- **`torch.compile`'s boundary is not a recipe boundary.** The backend is
+  `aot_autograd(partition_fn=hpu_partition)` (`backends.py:72-79`): the region is partitioned *first*,
+  and each maximal contiguous clusterable run becomes its own recipe.
+
+The measured table that establishes *which* constructs split a run — placement, not op identity — is
+[§2.4](02-regions.md), 24/24 arms against the live FX graph. **This chapter does not re-argue it.** What
+this chapter adds is the machinery that produces those boundaries, and what each boundary costs.
+
+---
+
+## 8.2 What `@torch.compile` actually produces: frames, graphs, breaks
+
+**A decorated function does not create one graph.** Dynamo traces *frames*, and a graph break splits
+one frame into several graphs. Measured with a cold recipe cache per case, so the `.recipe` count is
+unambiguous (**MEASURED**, [notes §7](notes/recipe-residency-and-memory-budget.md)):
+
+| case | body | dynamo graphs | breaks | ops | **recipes** |
+|---|---|---|---|---|---|
+| A | `t + 1` | 1 | 0 | 1 | **1** |
+| B | `(t + 1) * 2 - 3` | 1 | 0 | 3 | **1** |
+| C | `y = t+1; s = y.sum().item(); return y + s` | **2** | **1** | 2 | **2** |
+| D | `y = t+1; return y[:t.shape[0]//2] * 2` | 1 | 0 | 3 | **1** |
+
+Three readings, each of which changes how you write code:
+
+1. **Case C is the minimal demonstration that a decorated function is not a program.** One function,
+   two graphs, **two recipes** — because `y.sum().item()` is a host read, which is a graph break. A
+   region that breaks is *two regions* for every purpose the rest of this manual cares about: two
+   compilations, two sets of launches, two cache entries.
+2. **Ops do not multiply recipes.** B and D are three ops each and still one recipe. A recipe is one
+   per maximal contiguous run of *clusterable* nodes, so the count tracks **boundaries**, not op count
+   ([§2.4](02-regions.md)).
+3. **The recipe filename carries the environment.** The generated files are
+   `_<libs_env_hash>_syn1.24.2.79e284b.recipe`: an environment hash plus the Synapse build. Change the
+   build, or change `GC_KERNEL_PATH`, and **every filename changes** — which is why a recipe cache
+   appears to "miss" after an upgrade that touched nothing you edited. (**MEASURED**, notes §7.)
+
+**What a graph break costs is not this chapter's subject.** It costs in two currencies — overlap and
+host launch traffic — and [§2.5.1](02-regions.md) prices both. Here the point is narrower: the break
+also changes the *unit of compilation*, and everything downstream is counted per unit.
+
+---
+
+## 8.3 The backend is AOT Autograd with a partitioner
+
+`hpu_backend` is registered as a dynamo backend and is a thin wrapper around `aot_autograd`
+(**source read**, `habana_frameworks/torch/dynamo/compile_backend/backends.py`):
+
+```python
+@register_backend
+def hpu_backend(graph_module, example_inputs, **kwargs):          # :52-53
+    ...
+    inference_compiler = partial(hpu_inference_compiler, dyn_graph_module=graph_module)   # :62
+    ...
+    return aot_autograd(
+        fw_compiler=hpu_backend_config.patch(options)(hpu_training_compiler_fw),
+        bw_compiler=hpu_backend_config.patch(options)(hpu_training_compiler_bw),
+        inference_compiler=hpu_backend_config.patch(options)(inference_compiler),
+        decompositions=get_hpu_decompositions(),
+        keep_inference_input_mutations=hpu_backend_config.keep_input_mutations,
+        partition_fn=hpu_partition,                               # :78
+    )(graph_module, example_inputs)                               # :79
+```
+
+Two things follow, and they are the reason this chapter exists:
+
+- **The partitioner is a first-class stage, not a detail.** `partition_fn=hpu_partition` (`:78`) is
+  the hook that decides how many recipes a region becomes.
+- **`hpu_backend_config.inference is False`** swaps the inference compiler for the training
+  backward compiler (`:66-71`) — i.e. training and inference are the *same* pipeline with a different
+  compiler slot.
+
+### 8.3.1 The partitioner, and what "maximal contiguous run" means mechanically
+
+`hpu_partition` (**source read**, `partition_fn.py:253-291`) runs joint-graph passes and then the
+default partitioner:
+
+```python
+def hpu_partition(joint_module, _joint_inputs, *, num_fwd_outputs, static_lifetime_input_indices=None):  # :253
+    ...
+    fw_module, bw_module = default_partition(joint_module, _joint_inputs, num_fwd_outputs=num_fwd_outputs)  # :282
+    ...
+    except AssertionError:
+        return min_cut_rematerialization_partition(...)           # :291
+```
+
+The *recipe* partitioner — the one that produces clusterable runs — is a capability-based partitioner
+over the forward module, and its capability test is the placement metadata (**source read**,
+`partitioner.py`):
+
+```python
+class HabanaClusterOperatorSupport(OperatorSupport):              # :27
+    def is_node_supported(self, submodules, node):
+        return node.meta["placement"] == "hpu_cluster" and "partition_assigned" not in node.meta   # :29
+
+class HabanaPartitioner(CapabilityBasedPartitioner):              # :32
+    def __init__(self, graph_module, sup_op=HabanaClusterOperatorSupport):
+        super().__init__(graph_module, sup_op(), allows_single_node_partition=True)   # :34-38
+```
+
+**A node is clusterable exactly when its `placement` is `hpu_cluster`.** That is the whole rule; what
+sets placement is [§2.4](02-regions.md)'s subject and the validator's, not this chapter's. The
+placement field itself is written by the bridge's passes (**source read**, `passes.py:1592-1596`), and
+the pass is strict about it:
+
+```python
+if "placement" in node.meta:
+    logger.debug(f"Node {node} ... has had it's placement already set")
+    if not node.meta["placement"] == placement:
+        raise AssertionError("Placement mismatch")                # :1595
+node.meta["placement"] = placement                                # :1596
+```
+
+`allows_single_node_partition=True` (`:37`) is why a **lone** clusterable node between two eager nodes
+still becomes a recipe of its own — which is what makes the recipe count behave the way
+[§2.4](02-regions.md)'s table reports.
+
+### 8.3.2 From fused submodule to compiled recipe
+
+After partitioning, each fused submodule is replaced by a compiled callable (**source read**,
+`cluster_compiler.py`):
+
+```python
+syngraph_module = get_callable_recipe(jit_ir, submod, self.ctx.graph_name, ...)   # :132
+self.ctx.graph_module.delete_submodule(target)                                    # :142
+self.ctx.graph_module.add_submodule(target, syngraph_module)                      # :143
+self.subgraph_cnt += 1                                                            # :145
+```
+
+and `get_callable_recipe`'s own docstring states the fallback honestly (**source read**,
+`recipe_compiler.py:361-372`):
+
+> *Calls backend to create compiled recipe or just returns unchanged module to run it eagerly depending
+> on config.*
+
+That docstring is the whole eager/compiled story in one line (§8.9): eager is not a mode you choose
+for speed, it is the path taken when a node is not compiled.
+
+The bridge reports the count it produced — `Number of subgraphs created: %s` (`cluster_compiler.py:158`)
+— which is a directly observable proxy for **recipes**, and the cheapest instrument in this chapter
+(§8.10).
+
+### 8.3.3 The four compiler phases, in order
+
+`hpu_compiler_inner` (**source read**, `compilers.py:132-181`) is the per-graph entry point, and its
+order is the pipeline:
+
+```python
+optimize_pre_placement(graph_module, ...)          # :168
+optimize_pre_partitioner(graph_module, ...)        # :171
+partition_module(graph_module, ...)                # :174   <- the placement-aware split
+optimize_post_partitioner(graph_module, ...)       # :177
+```
+
+with `hpu_inference_compiler` (`:205-214`) a passthrough that selects the freezing compiler when
+`torch._inductor.config.freezing` is set, and otherwise calls `hpu_compiler_inner(..., is_training=False,
+is_backward=False)`. The four phase names are the useful part: **placement is decided before the
+partitioner runs** (`optimize_pre_placement` → `optimize_pre_partitioner` → `partition_module`), so a
+pass that changes placement changes the recipe count, and a pass that runs after the partitioner
+cannot.
+
+---
+
+## 8.4 What a recipe is, and where it lives
+
+A compiled recipe is a **host-side program**. Everything the device will later walk is allocated as
+host pages and *mapped* into the device address space, not allocated in HBM (**source read**, 1.16
+`src/runtime/common/recipe/recipe_allocator.cpp:15-30` and
+`src/runtime/common/memory_utils/memory_allocator_utils.cpp:12-40`):
+
+```cpp
+const bool mappedAlloc = !m_ignoreDeviceMapping && shouldBeMappedToDevice;
+if (mappedAlloc) buf = (char*)MemoryAllocatorUtils::alloc_memory_to_be_mapped_to_device(sizeInBytes);
+else             buf = new char[sizeInBytes];
+```
+
+and the allocator's comment says why the pages are pinned down:
+
+> *in order to prevent physical pages mapped to device from being swapped, thus causing MMU mapping
+> problems* — followed by `madvise(MADV_DONTFORK)`.
+
+The buffers allocated this way are exactly the ones the device walks: the execution, patching and
+dynamic blob buffers, both ECB command buffers, and the program-data blob buffer. Four consequences:
+
+1. **`synGraphCompile` allocates no device memory.** A compiled, never-launched recipe holds **zero
+   HBM**. (**MEASURED**: 8 distinct recipes, each compiled *and launched*, moved free HBM by
+   **0.0 MiB** — [notes §2b](notes/recipe-residency-and-memory-budget.md).)
+2. **`synRecipeDestroy` frees host memory only** (**source read**, 1.16
+   `recipe_handle_impl.cpp:18-24`: it frees the `RecipeAllocator` and deletes the handle). There is no
+   device free on that path because there is no device allocation to free.
+3. **The workspace is not per-recipe.** `synLaunch` takes `pWorkspace` from the caller
+   (`include/synapse_api.h:612-617`, *source read*, 1.16), and the bridge keeps **one device-wide**
+   workspace buffer sized by the largest recipe. So the workspace is a *max*, not a sum.
+4. **The attribution tools exist, and they are the ones to use.** `synRecipeGetAttribute` reports
+   `WORKSPACE_SIZE`, `DEVICE_MEMORY_SIZE`, `HOST_MEM_SIZE`, `CONST_SECTIONS_SIZE` and
+   `PERSISTENT_TENSORS_SIZE` per recipe; `synRecipeSectionGetProp` reports a **const** section's size
+   and its *host* pointer, and nothing about device addresses. Do not guess a per-recipe device cost —
+   query it. (§8.6 uses the same call set to build the budget.)
+
+**The mental model to keep, and the two wrong ones to drop.** A recipe is a program image on the host
+with a device-side execution window that is **shared and rotating**. "Compiled recipe ⇒ HBM occupied"
+is wrong. "There is a recipe cache in HBM holding my compiled graphs" is also wrong on this card
+(§8.7).
+
+---
+
+## 8.5 What every submission costs
+
+**Every launch downloads the program again.** `RecipeLauncher::launch()` calls `prepareForDownload()`
+then `downloadToDev()` unconditionally — there is no "already resident" branch — and `downloadToDev`
+runs `memcpyToMapped` → patch → **`pdmaDownload`** (mapped host → HBM, by CpDma commands) → fence wait →
+`scalEnqueue` (**source read**, 1.16 `src/runtime/scal/common/recipe_launcher/recipe_launcher.cpp`).
+
+**The destination is a rotating ring, not a cache.** `ArcHbmMemMgr` and `HbmGlblMemMgr` derive from
+`NBuffAllocator`, which splits a fixed window into `NUM_BUFF` chunks and hands out the next one,
+returning *"an offset and the long-sync-object to wait for"*; `prepareForDownload` then waits on that
+long-SO — *wait until this slot is free on the device*. The 1.16 source has `NUM_BUFF = 16`
+(`src/runtime/scal/common/recipe_launcher/nbuff_allocator.hpp:28`) and chunk size `size / NUM_BUFF`
+(`hbm_global_mem_mgr.cpp:39-43`); on 1.24.2 the measured count is **64** (§8.6).
+
+The vendor states the design and its limitation in the header itself (**source read**, 1.16
+`arc_hbm_mem_mgr.hpp`, repeated verbatim in `hbm_global_mem_mgr.hpp`):
+
+> This class is used to allocate memory of the Arc-HBM for running a recipe. It is currently
+> implemented in a very simple way, **assuming no caching**. It splits the given memory into chunks
+> (downloadedRecipes) and each time assigns a new chunk. … **In the future, we can consider adding
+> caching here to avoid the pdma**
+
+So the one-line summary for the manual:
+
+> **A graph costs one program download per launch, not one HBM allocation per compile.**
+
+**What that download costs in time.** The *first* call is size-independent — **103.6 ms at 1 K and at
+1 M elements** — and the steady-state call is **~0.5–0.7 ms** (**MEASURED**,
+[notes §5](notes/recipe-residency-and-memory-budget.md)). The per-launch cost is therefore dominated by
+the fixed path (ring walk, long-SO wait, enqueue), not by program bytes, until the program gets large.
+That is why graph breaks hurt beyond the CPU side: two one-node graphs pay two downloads, two ring
+waits and two enqueues where one two-node graph pays one.
+
+**When the ring is full, the launch does not spill — it throws.** A single recipe's program must fit
+in one chunk; past the window the launch fails outright (**MEASURED**, notes §2).
+
+---
+
+## 8.6 The memory budget
+
+This is the section to read before sizing a KV cache, and its headline is a negative result.
+
+### 8.6.1 The fixed reservation, before your first tensor
+
+**All MEASURED** on 1.24.2 / Gaudi2, one card ([notes §2b](notes/recipe-residency-and-memory-budget.md)):
+
+| item | size | when | scales with recipe count? |
+|---|---|---|---|
+| card HBM (as Synapse reports it) | 97376 MiB = 95.09 GiB | — | no |
+| card HBM (as torch reports it) | 96895.2 MiB = **94.62 GiB** | after acquire | no |
+| ↳ global program window | **192 MiB** = 3 × `HBM_GLOBAL_MEM_SIZE_MEGAS`(64) | device acquire, before any tensor | **no** |
+| ↳ arc program window | **127.5 MiB** (`0x7F80000`) | device acquire | **no** |
+| ↳ streams, monitors, TDR, profiler | **~161 MiB** (remainder) | device acquire | no |
+| **total reserved before your first tensor** | **~481 MiB (0.47 GiB)** | | **no** |
+| your workspace | `synWorkspaceGetSize`, **one** device-wide buffer in the bridge | first launch | no (sized by the max, not the count) |
+| your tensors (weights, KV cache, activations) | the rest | you | you |
+
+The window figures come from the runtime itself, printed once at device acquire with
+`LOG_LEVEL_SYN_PROG_DWNLD=0` (**MEASURED**):
+
+```
+ArcHbmMemMgr: buffer addrCore given/actual 52000000/52000000
+               addrDev given/actual 1001600152000000/1001600152000000
+               size given/actual 7f80000/7f80000   chunkSize 1f8000
+HbmGlblMemMgr: buffer addr given/actual 100160015a000000/100160015a000000
+               size given/actual c000000/c000000   chunkSize 300000
+```
+
+`0x7F80000` = 127.5 MiB with a `0x1F8000` (≈1.97 MiB) chunk; `0xC000000` = 192 MiB with a 3 MiB chunk;
+both divide into **64** chunks.
+
+**The practical rule:**
+
+> Budget = 96 GB − ~0.5 GB (fixed runtime reservation) − workspace − weights.
+> **Do not subtract a per-recipe term.** If HBM is filling up as the graph count grows, the recipes are
+> not what is filling it — look at persistent/const sections, the workspace being sized by the largest
+> recipe, or tensors retained by the host-side cache.
+
+### 8.6.2 What *does* grow, measured
+
+24 distinct recipes, each compiled **and launched** (**MEASURED**,
+[notes §2c](notes/recipe-residency-and-memory-budget.md)):
+
+| resource | 0 recipes | 24 recipes | growth | where the bound comes from |
+|---|---|---|---|---|
+| device memory (free) | 96889.7 MiB | 96889.7 MiB | **+0.0 MiB** | the 64-chunk ring; constant per stream |
+| host RSS | 2104.6 MiB | 2215.2 MiB | **+110.6 MiB** (~4.6 MiB/recipe) | one `recipe_t` + its mmap'd program buffers **per live recipe** |
+| disk (`.recipe` files) | 0 | 0.4 MiB / 9 files | grows with distinct recipes | `PT_HPU_RECIPE_CACHE_CONFIG`'s `max_dir_size_mb` (default 1024) |
+
+So the inversion, which is the sentence to carry into a design review:
+
+> **A million recipes costs the same HBM as one recipe, and is impossible in host memory.** The device
+> holds a fixed window; the *host* holds one program image per live recipe, in `mmap`ed pages that are
+> mapped into the device address space and marked `MADV_DONTFORK` — they cannot be swapped out.
+
+Two corollaries that are worth more than the table:
+
+- **A "recipe count" HBM problem is almost certainly a host-memory problem wearing HBM clothes.** When
+  the bridge's LRU evicts under host pressure (§8.7), the evicted recipes *recompile* on their next
+  launch — which presents as a rising `compileGraph` count and a slower steady state, easily misread as
+  device pressure. [§2.5.3](02-regions.md) lists exactly this signature ("count rises and keeps rising
+  in the steady state → cache-limit thrash").
+- **Executing a million recipes is compile-bound, not memory-bound.** First execution of a distinct
+  recipe measured **~50 ms dynamo + ~52 ms bridge/Synapse ≈ 100 ms**; a million of them is **~28 hours**
+  of compilation, and each launch still pays a program download. (**MEASURED**, notes §2c.)
+
+### 8.6.3 The one knob, and why it is not linear
+
+`HBM_GLOBAL_MEM_SIZE_MEGAS` scales the global window — but it is **private** and **per-stream**
+(**MEASURED**, notes §2):
+
+| env | logged global window | device total reported | delta vs default |
+|---|---|---|---|
+| (unset, default 64) | `0xC000000` = 192 MiB | 96895.2 MiB | — |
+| `HBM_GLOBAL_MEM_SIZE_MEGAS=32` alone | 192 MiB — **silently ignored** | 96895.2 MiB | 0 |
+| `ENABLE_EXPERIMENTAL_FLAGS=true …=256` | `0x30000000` = 768 MiB | 96319.2 MiB | **−576 MiB** = the window delta, exactly |
+| `ENABLE_EXPERIMENTAL_FLAGS=true …=1024` | `0xC0000000` = 3072 MiB | 91359.2 MiB | **−5536 MiB** ≠ window delta (2880) |
+
+Read it as three separate lessons:
+
+1. **Private keys need `ENABLE_EXPERIMENTAL_FLAGS=true`**, and the API cannot set them at all —
+   `synConfigurationSet` passes `enableExperimental=false`. Environment only, before start.
+2. **The reservation is 3 × the key**, because it is per compute stream and there are three
+   (`MaxNumOfComputeStreams = 3`, *source read*, 1.16 `scal_dev.hpp:58`; the pools are allocated
+   `Size × MaxNumOfComputeStreams`, `device_scal.cpp:242-247`).
+3. **A size knob here is not linear.** At 1024 the device lost 5536 MiB rather than 2880: the larger
+   allocation crossed a 4 GB address boundary and triggered the allocator's *"not aligned, moving to
+   next 4GB alignment"* workaround (**source read**, 1.16 `device_scal.cpp:266-290`), which throws away
+   the difference. Budget by differencing the **total**, not by arithmetic on the key.
+
+**And it is a size, never a policy.** A bigger window means a bigger maximum single-recipe program and
+fewer ring waits; it does **not** make anything resident.
+
+**One instrument trap.** `synDeviceGetMemoryInfo()` on this build returns **`free = 0`** (status
+`synSuccess`, total correct). Use `torch.hpu.mem_get_info()`. The reported `total` *falls* as you raise
+the window — Synapse carves it out of the pool — so measure by differencing `total`.
+
+---
+
+## 8.7 The four caches, and which one people confuse
+
+Four different things are called "the cache". Only one is on the device, and it is not on this device.
+
+| cache | what it holds | where it lives | how it is bounded | on Gaudi 2? |
+|---|---|---|---|---|
+| **dynamo's code cache** | traced frames and guards | host, per process | dynamo's own limits | yes |
+| **bridge disk recipe cache** | serialized `.recipe` files | **disk** | `PT_HPU_RECIPE_CACHE_CONFIG`'s `max_dir_size_mb` (default **1024**) | yes |
+| **bridge host LRU** | live `synRecipeHandle`s | **host memory** | `HABANA_PGM_LRU_MAX` (defaults **100 000** eager / **30 000** lazy); evicts on a host threshold | yes |
+| **device recipe cache** | recipe programs in HBM, LRU blocks | **device HBM** | `RECIPE_CACHE_SIZE` (default **500 MB**), block **128 KB** | **no — Gaudi1 only** |
+
+### 8.7.1 The one that does not exist here
+
+There **is** a genuine device-HBM recipe cache in the tree — on the **Gaudi1 / qman** path
+(**source read**, 1.16): `GCFG_RECIPE_CACHE_SIZE` (default 500 MB, private) and
+`GCFG_RECIPE_CACHE_BLOCK_SIZE` (128 KB, private) size one device buffer, wrapped in a
+`RecipeCacheManager` with per-recipe refcounts
+(`device_recipe_addresses_generator.cpp:142-167`, `:219-260`; defaults at
+`habana_global_conf.cpp:1121-1133`). Its invalidation is LRU by its own comment.
+
+The SCAL/Gaudi2 path (`DeviceScal`) references it **nowhere** — a grep over
+`synapse/src/runtime/scal` for `RecipeCacheManager|RECIPE_CACHE` is empty — and setting
+`ENABLE_EXPERIMENTAL_FLAGS=true RECIPE_CACHE_SIZE=262144` on this Gaudi2 box produces **no** cache log
+line and changes neither program window (**MEASURED**, notes §4).
+
+> **If anyone writes "set `RECIPE_CACHE_SIZE` to cache recipes in HBM", that is a Gaudi1 statement.**
+> On Gaudi 2 there is no cache to size; what exists is the rotating ring of §8.5.
+
+### 8.7.2 The one that makes you think you have an HBM leak
+
+The bridge's host LRU is the cache that actually evicts in a long run, and it evicts on **host** memory
+(`PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT`, default 90 %, in 512 MB chunks), calling `synRecipeDestroy` on
+the GC thread (**source read**, bridge). Because eviction destroys the recipe, the next launch of that
+graph **recompiles it**. So the symptom of host pressure is a rising compile count and a slower steady
+state — which reads as device pressure and is not. §8.6.2's corollary is the diagnosis; this table is
+the mechanism.
+
+---
+
+## 8.8 Why a new shape or a new `int` is a new program
+
+The specialisation rule is stated once in [§1.4](01-basics.md) (static shapes, specialised integers)
+and its counting consequence in [§2.5.3](02-regions.md) (the specialisation count as a first-class
+metric). At the recipe level it has one extra edge that is easy to get backwards:
+
+- **A guard is not a node.** A Python `int` in traced code joins the guard set and produces a **new
+  compiled graph per distinct value** — but it does **not** split one compilation into more recipes,
+  because the partitioner never sees it ([§2.4](02-regions.md)'s warning, explicitly).
+- So the two counts move for different reasons: **recipes within one graph** are set by placement
+  boundaries; **graphs per region** are set by the guard set (shape, dtype, int, and the container
+  structure of the inputs).
+- The same function called at a new shape or with a new traced `int` is a **new frame** → new graphs →
+  new recipes, and each new recipe is a new program image on the host and a new ring slot to wait for
+  (§8.5). (**MEASURED** in the sense that the `.recipe` count tracks it — notes §7.)
+
+The arithmetic that makes a large count *expected* rather than a bug — O(layers × constants ×
+buckets) — is [§1.4.3](01-basics.md). This chapter adds only what the count costs: **host memory and
+disk per live recipe, nothing per recipe on the device.**
+
+---
+
+## 8.9 Lazy, eager, compiled: what each is, and which one is a target
+
+| mode | what it is | status |
+|---|---|---|
+| **compiled** | `torch.compile(fn, backend="hpu_backend")` — the only supported target | **the target** |
+| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued, no recipe | a **reference point**, never an option |
+| **lazy mode** | `PT_HPU_LAZY_MODE=1` — ops accumulate into an implicit graph closed at a mark-step | **deprecated** |
+| **eager placement** | a *node* property: the partitioner will not cluster it; it runs outside every recipe | a property of a compiled region, not a mode |
+
+**Why eager is a reference point and not an option:** the project has measured the gap at **400×** — an
+expert kernel at **29 ms eager against 0.356 ms compiled** ([§6.6.1](06-fast-iteration.md)). An eager
+number is not a lower bound on the compiled number and cannot stand in for it.
+
+**Why lazy is deprecated:** modern vLLM Gaudi is `torch.compile`-only. The shipped bridge disables
+autoload *only* when `PT_HPU_LAZY_MODE=1`, i.e. **the default is non-lazy** — while the comment in
+`bridge_config.py` still claims "the default mode is lazy" (**source read**). That comment is a
+**stale claim**, and it is worth keeping as a specimen because it is the same failure mode
+[the TLDR](00-tldr.md) already documents: a vendor comment that was true two releases ago, read as
+documentation today.
+
+**The fourth row is the one that trips people.** *Eager placement* and *eager mode* are unrelated: the
+first is a node that splits a recipe inside a compiled region; the second is an execution model.
+[§2.4](02-regions.md) measures the first; this section separates it from the second.
+
+**One trap worth naming here, because it lives in the same files.** A patched working tree in this
+workspace carried a `synNativeComputeGraph*` "research API" (24 occurrences) whose comment claims it
+"skips recipe preparation, address patching, PDMA download and per-recipe synLaunch", plus a
+`NativeRecipeMemory` device-resident-program path. **Neither exists in vendor Synapse**: zero
+occurrences in a clean `6de1f66` extraction, and zero `nativeCompute`/`NativeRecipeMemory` symbols in
+the installed 1.24.2 `libSynapse.so` (**MEASURED**, notes §0). Two residency models live in this
+workspace; do not mix them, and do not cite the patched tree.
+
+---
+
+## 8.10 How to see it yourself
+
+Five instruments, cheapest first. None needs a profiler.
+
+| want | do this | what you get |
+|---|---|---|
+| **recipe count** | run with a **cold** recipe cache, then count the `.recipe` files in it (exact command in §8.12) | the number §8.2's table is built from |
+| **subgraph count** | bridge log line `Number of subgraphs created: N` (`cluster_compiler.py:158`) | recipes per compilation, without touching disk |
+| **program windows** | `LOG_LEVEL_ALL=6 LOG_LEVEL_SYN_PROG_DWNLD=0` with `HABANA_LOGS=<dir>`, then grep that directory for `ArcHbmMemMgr` / `HbmGlblMemMgr` (exact command in §8.12) | the §8.6.1 block, printed once at device acquire |
+| **the graph itself** | `DUMP_POST_GRAPHS=1` and read the dump ([§2.10](02-regions.md)) | per-node `engine`, recipe membership, modelled cost |
+| **which library did I load?** | grep `/proc/self/maps` from inside the process; `dpkg -V habanalabs-graph`; `nm -D --defined-only` on `libSynapse.so` for a symbol | whether the runtime is the packaged one, and whether a mechanism still exists by name |
+
+**The trap that costs the most time: `hl_logger` levels are inverted.** `TRACE=0 DEBUG=1 INFO=2 WARN=3
+ERROR=4 CRITICAL=5 OFF=6` (**source read**, 1.16
+`swtools_sdk/hl_logger/include/hl_logger/hllog_core.hpp:27-33`). `LOG_LEVEL_ALL=5` is **near-silence**,
+not maximum verbosity; `LOG_LEVEL_ALL=0` is loudest. This cost three wasted runs on this project, and it
+is the single most likely reason a "the log prints nothing" investigation goes nowhere.
+
+---
+
+## 8.11 What this chapter leaves UNKNOWN
+
+Stated rather than omitted, per the manual's convention. Each entry says what would settle it.
+
+| # | UNKNOWN | status | what would settle it |
+|---|---|---|---|
+| 1 | **Whether `NUM_BUFF` is 64 in 1.24.2** | **INFERRED** — 64 is measured three independent ways from the logged window and chunk sizes (192/3, 96/1.5, 48/0.75 MiB), and 1.16 is `16`; the constant itself was not read in a 1.24.2 source drop | a 1.24.2 source drop, or disassembly of `getChunkSize` |
+| 2 | **What sizes the *arc* window (127.5 MiB)** | **UNKNOWN** — unaffected by `HBM_GLOBAL_MEM_SIZE_MEGAS`; no key found that moves it | a config sweep, or a source drop |
+| 3 | **Whether the per-stream and total split of the logged sizes is exactly `Size × 3`** | **INFERRED** from the source's `Size × MaxNumOfComputeStreams` and the measured 3× scaling of the global window; not measured with a single compute stream | one probe restricted to one compute stream |
+| 4 | **`synUpdateMemoryConsumption` (new in 1.24.2)** | **UNKNOWN** — absent from the 1.16 source; could be the missing per-recipe attribution hook | a 1.24.2 header, or a probe that calls it and reads the device total |
+| 5 | **Steady-state launch cost for a multi-MB program** | **UNKNOWN** — every measured program is small enough that the fixed path dominates (103.6 ms first call, ~0.5–0.7 ms steady state, size-independent at 1 K vs 1 M elements) | one probe with a program large enough for PDMA bytes to show |
+| 6 | **Whether MME descriptors have their own device allocation** | **INFERRED** that they ride the ECB/dynamic-blob path into ARC HBM: the only program-data registrations in 1.16 are TPC kernels, the TPC printf buffer and H2D/static tensors | a 1.24.2 source read, or a launch of an MME-heavy graph with the device total sampled before and after |
+| 7 | **Whether `DeviceGaudi::releaseRecipeMemory` is reached at all** | **UNKNOWN** — the 1.16 tree has its definition and no caller; either it is reached through an interface not in that tree, or the Gaudi1 path leaks per-recipe memory until device teardown | a 1.24.2 source read, or a compile/launch/destroy loop watching the device total |
+
+---
+
+## What to carry forward
+
+1. **Three counts, three units.** Graphs (dynamo frames, split by breaks) ≥ recipes (maximal
+   `hpu_cluster` runs) ≥ submissions (one launch per recipe per execution). A `torch.compile` boundary
+   is not a recipe boundary.
+2. **One decorated function is not one program.** Case C: two graphs, two recipes, from one function
+   with one host read in it.
+3. **Ops do not multiply recipes; boundaries do.** Three clusterable ops are one recipe; one eager node
+   between them is three.
+4. **A compiled recipe holds no HBM.** `synGraphCompile` allocates host pages mapped into the device;
+   `synRecipeDestroy` frees host memory only; an unlaunched recipe costs zero device memory.
+5. **Every launch downloads the program again**, into a rotating chunk of a fixed per-stream window —
+   the vendor's own "assuming no caching … to avoid the pdma". Past one chunk the launch throws; it
+   does not spill.
+6. **Budget ~0.5 GB of the 96 GB for the runtime, then stop subtracting per-recipe terms.** 24 recipes
+   compiled and launched moved free HBM by **0.0 MiB**; host RSS moved ~4.6 MiB per recipe.
+7. **The graph count costs host memory and disk, not device memory.** If HBM grows with the graph
+   count, look at sections, the workspace's max-sizing, or retained tensors — not at recipes.
+8. **`RECIPE_CACHE_SIZE` is a Gaudi1 key.** On Gaudi 2 there is no device recipe cache; there is a
+   rotating ring, and the cache that evicts is the bridge's **host** LRU (eviction ⇒ recompile).
+9. **Only compiled is a target.** Eager is a reference point (**400×** off, [§6.6.1](06-fast-iteration.md));
+   lazy is deprecated; eager *placement* is neither.
+10. **`hl_logger` levels are inverted.** `LOG_LEVEL_ALL=0` is loudest, `=5` is near-silence.
+
+---
+
+## 8.12 Examples
+
+The chapter adds no files, so these are inline and runnable. They are the smallest commands that
+reproduce §8.2, §8.5 and §8.6.
+
+**Count recipes for a set of tiny cases** (cold cache each time — §8.2's table):
+
+```bash
+export PT_HPU_RECIPE_CACHE_CONFIG="$PWD/rc-cache",false,1024,false
+for case in a b c d; do
+  rm -rf "$PWD/rc-cache"    # cold, so the count is unambiguous
+  python case_${case}.py    # one decorated function per case
+  echo "$case: $(ls "$PWD"/rc-cache/_*.recipe 2>/dev/null | wc -l) recipes"
+done
+```
+
+**See the program windows** (§8.6.1):
+
+```bash
+HABANA_LOGS="$PWD/habana-logs" \
+LOG_LEVEL_ALL=6 LOG_LEVEL_SYN_PROG_DWNLD=0 LOG_LEVEL_SYN_DEVICE=0 \
+  python your_probe.py
+grep -h 'ArcHbmMemMgr\|HbmGlblMemMgr' "$PWD"/habana-logs/* | sed 's/.*\] //'
+```
+
+**Watch a graph count fail to cost device memory** (§8.6.2):
+
+```python
+import torch, torch_hpu
+f = torch.compile(lambda t: t + 1, backend="hpu_backend")
+free0, total0 = torch.hpu.mem_get_info()
+handles = [f(torch.arange(1024, dtype=torch.float32, device="hpu")) for _ in range(24)]
+free1, total1 = torch.hpu.mem_get_info()
+print(f"free {free0} -> {free1} MiB, total {total0} -> {total1} MiB")
+```
+
+Read the **total**, not the free: `synDeviceGetMemoryInfo()` reports `free = 0` on this build, and the
+window is carved out of the total (§8.6.3).
+
+**Dump the graph and read placement** (§8.10, and [§2.10](02-regions.md) for the reader):
+
+```bash
+DUMP_POST_GRAPHS=1 python your_probe.py
+ls .graph_dumps/ | head            # a dot-directory: a non-recursive ls of the parent hides it
+```
+
+---
+
+## Provenance of every figure
+
+Every number in this chapter, with its source. "notes §n" is
+[`notes/recipe-residency-and-memory-budget.md`](notes/recipe-residency-and-memory-budget.md); `file:line`
+is a source read of the installed bridge (`habana_frameworks`, 1.24.2) or of the clean 1.16 Synapse
+extraction (base `6de1f66`), flagged as 1.16 where it matters.
+
+| figure | source |
+|---|---|
+| A–D table: graphs / breaks / ops / recipes (1,2,2,2) | MEASURED — notes §7 |
+| recipe filename `_<libs_env_hash>_syn1.24.2.79e284b` | MEASURED — notes §7 |
+| 8 recipes compiled+launched → 0.0 MiB device change | MEASURED — notes §2b |
+| 24 recipes: device 96889.7 → 96889.7 MiB; host RSS 2104.6 → 2215.2 MiB (+110.6); ~4.6 MiB/recipe | MEASURED — notes §2c |
+| disk 0 → 0.4 MiB / 9 files | MEASURED — notes §2c |
+| `max_dir_size_mb` default 1024 | source read — notes §2c (bridge config) |
+| card HBM 97376 MiB = 95.09 GiB (Synapse) / 96895.2 MiB = 94.62 GiB (torch) | MEASURED — notes §2b |
+| global window 192 MiB = 3 × 64; arc window 127.5 MiB (`0x7F80000`); ~161 MiB remainder; ~481 MiB total | MEASURED — notes §2b |
+| chunk sizes `0x1F8000`, `0x300000`; **64** chunks | MEASURED — notes §2 |
+| `NUM_BUFF = 16` (1.16) | source read, 1.16 — `nbuff_allocator.hpp:28`; chunk `size / NUM_BUFF` at `hbm_global_mem_mgr.cpp:39-43` |
+| `HBM_GLOBAL_MEM_SIZE_MEGAS` default 64 | source read, 1.16 — `habana_global_conf.cpp:594-598` |
+| key ignored without `ENABLE_EXPERIMENTAL_FLAGS`; 256→768 MiB, total 96319.2 (−576); 1024→3072 MiB, total 91359.2 (−5536 ≠ 2880) | MEASURED — notes §2 |
+| 4 GB-alignment workaround | source read, 1.16 — `device_scal.cpp:266-290` |
+| `MaxNumOfComputeStreams = 3`; pools allocated `Size × 3` | source read, 1.16 — `scal_dev.hpp:58`, `device_scal.cpp:242-247` |
+| `hbmSharedSize = 32 MiB` (1.16) | source read, 1.16 — `device_scal.hpp:126` |
+| 103.6 ms first call (size-independent at 1 K and 1 M elements); ~0.5–0.7 ms steady state | MEASURED — notes §5 |
+| ~50 ms dynamo + ~52 ms bridge ≈ 100 ms per new recipe; ~28 hours for a million | MEASURED — notes §2c |
+| eager 29 ms vs compiled 0.356 ms = **400×** | MEASURED — [§6.6.1](06-fast-iteration.md) |
+| `HABANA_PGM_LRU_MAX` 100 000 eager / 30 000 lazy; 90 % host threshold; 512 MB chunks | source read — notes §1 (bridge) |
+| `RECIPE_CACHE_SIZE` 500 MB / `RECIPE_CACHE_BLOCK_SIZE` 128 KB (Gaudi1 only) | source read, 1.16 — `habana_global_conf.cpp:1121-1133`, `device_recipe_addresses_generator.cpp:142-167,219-260` |
+| SCAL/Gaudi2 references the recipe cache nowhere; `RECIPE_CACHE_SIZE=262144` changes nothing | source read + MEASURED — notes §4 |
+| `synGraphCompile` allocates no device memory; `madvise(MADV_DONTFORK)` rationale | source read, 1.16 — `recipe_allocator.cpp:15-30`, `memory_allocator_utils.cpp:12-40` |
+| `synRecipeDestroy` frees host memory only | source read, 1.16 — `recipe_handle_impl.cpp:18-24` |
+| workspace is a caller argument (`pWorkspace`) | source read, 1.16 — `include/synapse_api.h:612-617` |
+| `synRecipeGetAttribute` attribute set; `synRecipeSectionGetProp` const-only, host pointer | source read, 1.16 — `device_agnostic_recipe_processor.cpp:252-338`, `syn_singleton_section.cpp:206-270` |
+| vendor "assuming no caching … to avoid the pdma" | source read, 1.16 — `arc_hbm_mem_mgr.hpp`, `hbm_global_mem_mgr.hpp` |
+| `hpu_backend` → `aot_autograd(..., partition_fn=hpu_partition)` | source read — `backends.py:52-79` (lines 62, 66-71, 78) |
+| `hpu_compiler_inner` four phases in order | source read — `compilers.py:132-181` (168, 171, 174, 177) |
+| `hpu_inference_compiler` passthrough / freezing branch | source read — `compilers.py:205-214` |
+| `hpu_partition` → `default_partition`, fallback `min_cut_rematerialization_partition` | source read — `partition_fn.py:253-291` (282, 291) |
+| cluster membership = `placement == "hpu_cluster"` | source read — `partitioner.py:27-29` |
+| `HabanaPartitioner(CapabilityBasedPartitioner)`, `allows_single_node_partition=True` | source read — `partitioner.py:32-38` |
+| placement written by the pass; mismatch raises | source read — `passes.py:1592-1596` |
+| one fused submodule → `get_callable_recipe`; `subgraph_cnt`; "Number of subgraphs created" | source read — `cluster_compiler.py:132,142-145,158` |
+| `get_callable_recipe` docstring: "…or just returns unchanged module to run it eagerly…" | source read — `recipe_compiler.py:361-372` |
+| `hl_logger` levels inverted `TRACE=0 … OFF=6` | source read, 1.16 — `hllog_core.hpp:27-33` |
+| patched tree's `synNativeComputeGraph*` (24 occurrences) absent from clean tree and from 1.24.2 symbols | MEASURED — notes §0 |
+| `synDeviceGetMemoryInfo()` returns `free = 0`; measure the total | MEASURED — notes §2b |
+| 145 public entry points / 155 exported `syn*` symbols; no residency API | source read + MEASURED — notes §3 |
+| "one recipe per maximal contiguous run of `hpu_cluster` nodes"; 24/24 arms | MEASURED — [§2.4](02-regions.md) (cross-referenced, not restated) |
+| specialisation count as a first-class metric; thrash signature | [§2.5.3](02-regions.md) (cross-referenced) |
+| O(layers × constants × buckets) is expected | [§1.4.3](01-basics.md) (cross-referenced) |
+| `DUMP_POST_GRAPHS` reading; the dot-directory trap | [§2.10](02-regions.md) (cross-referenced) |
