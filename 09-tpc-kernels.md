@@ -49,13 +49,31 @@ artifact 2 is `tpc_kernel_lib/src/` (entry points + glue) → the same `build/`;
 `hpu_custom_add1.cpp` + `setup.py` → `build/lib.linux-x86_64-cpython-312/`; `custom_add1.py` is the Python
 face.
 
-The sizes on this container: device ELF **14,544 bytes** (`0x38d0`), glue library **28,832 bytes**, torch
-extension **10,959,632 bytes** (it embeds debug info, so it moves with the build path). **MEASURED** —
-§9.3's build paste.
+The sizes on this container: device ELF **14,480 bytes** (`0x3890`) from a 22-character working directory,
+glue library **28,832 bytes**, torch extension **10,959,536 bytes**. **MEASURED** — §9.3's build paste.
 
-> **The glue library is not a library in the usual sense.** It exports **three** functions and nothing else
-> matters: `GetKernelGuids`, `InstantiateTpcKernel`, `GetShapeInference` (`nm -D --defined-only`,
-> **MEASURED**). Synapse `dlopen`s it, asks for its GUID list, and calls `InstantiateTpcKernel` per node.
+> **Two of those three sizes are not reproducible: they move with the checkout path.** The device ELF embeds
+> its own `-cc1` command line, which carries the absolute working directory twice —
+> `-fcoverage-compilation-dir=<cwd>` and `-fdebug-compilation-dir=<cwd>` — and the file grows in 16-byte
+> steps as the path gets longer. Measured over nine builds of the identical source:
+>
+> | length of the working directory | 20–23 | 24–31 | 32–39 | 40–47 | 48–55 | 56–63 |
+> |---|---|---|---|---|---|---|
+> | device ELF, bytes | **14,480** (`0x3890`) | **14,496** (`0x38a0`) | **14,512** (`0x38b0`) | **14,528** (`0x38c0`) | **14,544** (`0x38d0`) | **14,560** (`0x38e0`) |
+>
+> **MEASURED** *(nine builds at path lengths 20–61; `strings <elf>` shows both `compilation-dir` fields, each
+> padded to an 8-byte boundary)*. So a byte count here is only meaningful with the path that produced it — and
+> **the 14,544 bytes an earlier draft of this chapter carried is not a different kernel: it is this same
+> kernel built from a 48-to-55-character working directory.** **INFERRED** *(the step table is measured; the
+> attribution is arithmetic on it)*. The extension's byte count moves with the build path for the same reason.
+
+> **The glue library is not a library in the usual sense.** It has **3 entry points** — `GetKernelGuids`,
+> `InstantiateTpcKernel`, `GetShapeInference` — and those are the only functions Synapse calls.
+> `nm -D --defined-only` returns **14** defined dynamic symbols in total: the 3 entry points, the class's
+> `GetKernelName` and `GetGcDefinitions`, its three destructor variants, its typeinfo, typeinfo name and
+> vtable, and the 3 `_binary_*` embed symbols. **MEASURED** *(§9.3.2's `nm` for the embed's three; the rest
+> are C++ artifacts of the one class, not callable by Synapse)*. Synapse `dlopen`s it, asks for its GUID
+> list, and calls `InstantiateTpcKernel` per node.
 > **There is no symbol per kernel: one library holds many kernels**, and the example's entry points are a
 > one-element dispatch table you extend by adding a class and a `strcmp` branch.
 
@@ -228,8 +246,8 @@ and the symbols that come out:
 
 ```
 $ nm __add1_fwd_f32_gaudi2_kernel.o
-00000000000038d0 R _binary___add1_fwd_f32_gaudi2_o_end
-00000000000038d0 A _binary___add1_fwd_f32_gaudi2_o_size
+0000000000003890 R _binary___add1_fwd_f32_gaudi2_o_end
+0000000000003890 A _binary___add1_fwd_f32_gaudi2_o_size
 0000000000000000 R _binary___add1_fwd_f32_gaudi2_o_start
 ```
 
@@ -237,6 +255,9 @@ $ nm __add1_fwd_f32_gaudi2_kernel.o
 `__add1_fwd_f32_gaudi2.o` and every non-alphanumeric becomes `_`. **That double underscore in the copy is the
 whole reason the copy exists**: the glue declares `_binary___add1_fwd_f32_gaudi2_o_start` — three underscores
 — at `gaudi2_src/add1_fwd_f32_gaudi2.cpp:13–14`.
+
+(`_binary_…_o_size` is the input file's length, so it is not an independent measurement of the ELF size —
+it is the same number `stat` gives, and it moves with the checkout path for the reason in §9.1.)
 
 > ⚠ **Embed the file under its own name and the link still succeeds.** Measured: `objcopy` on
 > `add1_fwd_f32_gaudi2.o` mints `_binary_add1_fwd_f32_gaudi2_o_start` (**two** underscores), and
@@ -285,12 +306,12 @@ x86_64-linux-gnu-g++ -fno-strict-overflow -Wsign-compare -DNDEBUG -g -O2 -Wall -
 
 built:
 -rwxr-xr-x 1 nat nat   28832 tpc_kernel_lib/build/libadd1_kernels.so
--rwxr-xr-x 1 nat nat 10959632 build/lib.linux-x86_64-cpython-312/hpu_custom_add1.cpython-312-x86_64-linux-gnu.so
+-rwxr-xr-x 1 nat nat 10959536 build/lib.linux-x86_64-cpython-312/hpu_custom_add1.cpython-312-x86_64-linux-gnu.so
 ```
 
 **MEASURED**, from a clean tree — `./build.sh` in a checkout with no `build/` directories, exit 0. The two
 `AutogradState.h` warnings are torch's own headers under `-std=c++17` and appear in every extension build on
-this stack.
+this stack. (The extension's byte count moves with the build path too — see §9.1.)
 
 **Two things to notice.** The compile line's `-I` list is **torch's**, not the example's — `setup.py` names
 only `-std=c++17` and three include directories, and `cpp_extension` adds the rest. And the extension links
@@ -392,17 +413,36 @@ optimisation story, and a good one for a *shipping* story.
 ### 9.5.1 The list, and which entries are load-bearing
 
 `GC_KERNEL_PATH` is a **colon-separated list of `.so` files** that Synapse searches for kernel libraries.
-Three measured configurations, all with `PT_HPU_LAZY_MODE=0`:
+Three measured configurations, all with `PT_HPU_LAZY_MODE=0`, plus a control that has no custom op in it at
+all:
 
-| `GC_KERNEL_PATH` | eager op | `torch.compile` region containing the op |
-|---|---|---|
-| `libadd1_kernels.so:/usr/lib/habanalabs/libtpc_kernels.so` | **works** | **works** |
-| `/usr/lib/habanalabs/libtpc_kernels.so` (ours absent) | fails — §9.5.2 | fails |
-| `libadd1_kernels.so` (stock absent) | **works** | **fails** |
+| `GC_KERNEL_PATH` | eager op | `torch.compile` op | `torch.compile` **plain** `x*2.0`, no custom op |
+|---|---|---|---|
+| `libadd1_kernels.so:/usr/lib/habanalabs/libtpc_kernels.so` | **works** | **works** | **works** |
+| `/usr/lib/habanalabs/libtpc_kernels.so` (ours absent) | fails — §9.5.2 | fails | **works** |
+| `libadd1_kernels.so` (stock absent) | **works** | **fails** | **fails** |
 
-**MEASURED.** The third row is the trap: **the stock library is not needed to *run* a custom kernel, but it
-is needed to *compile a graph* that contains one.** Our kernel depends on no stock kernel; the recipe compiler
-does, and it does not say so. Ship the two-entry list. *(This container ships
+**MEASURED.** The third row is the trap, and **it is not about the op.** The stock library is not needed to
+*run* a custom kernel — the eager column works with our library alone — but it is needed for **any
+`torch.compile` region at all**, including one that contains no custom op and whose process never imports our
+library. The last column is the control that proves it: a script that only does
+`torch.compile(lambda t: t * 2.0, fullgraph=True, backend="hpu_backend")` and never mentions `custom_add1`
+dies with
+
+```
+RuntimeError: [Rank:0] FATAL ERROR :: MODULE:PT_EAGER HabanaLaunchOpPT Run returned exception....
+Graph compile failed. Recipe: .graph_dumps/graph_0000_fused_0_syn_1000000_1000000_1, synStatus=synStatus 26 [Generic failure].
+Last synapse error: file: recipe_manager.cpp:304 function: compileGraph, scope: SYN_RECIPE,
+failed condition: (ret == false), message: Can not compile graph. ...
+```
+
+when `GC_KERNEL_PATH` names only our library, and compiles bit-exact when it names only the stock one.
+**MEASURED** *(three configurations × three programs; the failing arm reproduces on every run)*. The layer
+is **Synapse**: the failure is `scope: SYN_RECIPE` in `recipe_manager.cpp:304`, below the bridge and above
+the hardware, and it is the recipe compiler that wants the stock library — not our kernel, and not the
+graph. **So the recipe compiler needs `libtpc_kernels.so` to compile anything on this stack, and it does not
+say so** — which also means **§9.5.2's generic `synStatus 26` is the ordinary signature of a `torch.compile`
+failure here, not a custom-kernel signature.** Ship the two-entry list. *(This container ships
 `GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so` by default, which cost me a wrong conclusion once:
 **a measurement on this path must state the variable's value, not just that it was "set".**)*
 
@@ -422,10 +462,11 @@ disagrees between `GetKernelName` and `registerUserCustomOp`, and by any glue fu
 The error says **the node could not be instantiated** and nothing about why. Diagnosis order: (1) `nm -D` the
 glue library for `U _binary_*`; (2) print both GUID strings and compare; (3) only then suspect the kernel.
 
-### 9.5.3 The sharp edge: the list is hashed into the recipe cache key
+### 9.5.3 The sharp edge: the disk cache's key is blind to your library
 
-The bridge's **disk** recipe cache keys every entry on a suffix built from a hash of the *contents* of the
-kernel libraries plus the driver version. From `gaudi-pytorch-bridge` at tag `v1.24.2`:
+The bridge's **disk** recipe cache names every entry `<hashCode>_<libs_env_hash>_syn<version>.recipe`. The
+name looks like it keys on the *contents* of the kernel libraries plus the driver version. It does not: **the
+middle field is a constant.** From `gaudi-pytorch-bridge` at tag `v1.24.2`:
 
 ```cpp
 // backend/kernel/hpu_recipe_cache.cpp:293
@@ -453,23 +494,63 @@ if (IS_ENV_FLAG_DEFINED_NEW(GC_KERNEL_PATH)) {                              // :
 ```
 
 **source read** *(v1.24.2; the plugin here is the same stack; two statements are abridged to
-`<angle brackets>` where the source builds a substring)*. Four consequences, none of them the one the
-variable's name suggests:
+`<angle brackets>` where the source builds a substring)*.
 
-1. **What is hashed is the file's bytes, not the string** (`hash64_file_content` `mmap`s and hashes it,
-   `cache_version.cpp:120–170`). So **renaming or moving an identical library does not invalidate the cache**,
-   and **rebuilding it does** — every TPC edit costs a full cache miss, which is what you want.
+#### The hash is dead code, in two independent ways
+
+`hash64_file_content` (`cache_version.cpp:100–139`) declares `size_t hashRes{0}` at `:107`, then declares a
+**second, shadowing** `size_t hashRes{0}` at `:123` inside the `mmap` branch. The loop at `:126` fills the
+inner variable; `:138` returns the outer one. **So the function returns 0 for every file, whatever its
+contents.** The environment half is dead too: `hashed_env_vars` (`:143–168`) holds needles padded to a
+column — `"ENABLE_RAGGED_SOFTMAX_OPT             "`, `"DISABLE_TENSORS_PINNING               "` — and they are
+matched with `env_var.find(v)` (`:170`) against a string of the form `NAME=VALUE`. A padded needle can never
+be a substring of an unpadded `NAME=VALUE`. **source read.**
+
+That makes the middle field a constant, and it is reproducible from the source in three lines of arithmetic:
+`hash_combine(hash_combine(hash_combine(0, 0), 0), 0)` — three files, each hashing to 0 — is
+`0xa16fb581eee`, which is exactly the `a16fb581eee` on every recipe filename this manual has ever seen,
+including the one from a **different container state** in [`experiments/`](experiments/README.md) rung 1
+(`4169968267915495333_a16fb581eee_syn1.24.2.79e284b.recipe`). **INFERRED** *(from `:178–203` plus
+`c10::hash_combine`'s definition; the arithmetic matches the observed field exactly)*.
+
+#### Measured: the key does not see a kernel edit, or an environment change
+
+With the disk cache enabled and a single-path `GC_KERNEL_PATH`, the same graph gives:
+
+| what changed between runs | recipe filename |
+|---|---|
+| baseline | `1058408721741903309_a16fb581eee_syn1.24.2.79e284b.recipe` |
+| **one byte appended to the 585,861,120-byte kernel library** | `1058408721741903309_a16fb581eee_syn1.24.2.79e284b.recipe` |
+| **`DISABLE_TENSORS_PINNING=true`** (a name on `hashed_env_vars`) | `1058408721741903309_a16fb581eee_syn1.24.2.79e284b.recipe` |
+| a **different graph** (`x*2.0+1.0` instead of `x*2.0`) | `14517805940679984190_a16fb581eee_syn1.24.2.79e284b.recipe` |
+
+**MEASURED** *(four runs, each into a fresh cache directory; a copy of `libtpc_kernels.so` was used as the
+single path so its bytes could be changed). Only the leading `hashCode` moves, and it moves for the graph,
+not for the library.*
+
+#### What follows, and it is the opposite of what the field name suggests
+
+1. **⚠ The cache cannot see a kernel edit. Editing a TPC kernel, rebuilding, and re-running serves the
+   *stale recipe*.** There is no miss to protect you. The recipe is keyed on the graph's shape and dtype
+   spec, not on the machine code that implements it, so a fixed kernel runs the old binary until you clear
+   the directory. **INFERRED** *(store and lookup use the same key expression — `hpu_recipe_cache.cpp:317`
+   and `:354` — so an identical filename is a hit; the filename identity itself is measured above)*.
+   **Guidance: maintain your own key — one cache directory per *(build, configuration)* pair, or set the
+   second field (`delete_on_init`) to `true` and pay the recompile.** The environment blindness compounds
+   it: a cache directory shared between two configurations silently mixes recipes built under different
+   compiler flags, and nothing in the filename records which.
 2. **It is the disk cache's key, not the in-memory LRU's.** `RecipeArgumentSpec::hash_code`
-   (`hpu_habana_cache.cpp.h:69`) is what the in-process LRU compares, and `libs_env_hash` is **not in it** —
-   it enters only through `cache_id_suffix_`. Changing `GC_KERNEL_PATH` evicts nothing in a running process;
-   it makes the *next* process miss.
-3. **⚠ The parser splits on `:` once and then on `,`.** `:184` finds the first `:`; `:198` then looks for a
-   **comma**, which is not the list separator — the comment at `:186` says *"comma separated"*. A two-entry
-   colon list works by accident; for **three or more**, the rest is hashed as one path string,
-   `hash64_file_content` fails to open it and returns **0**, so only the **first** entry's content is keyed.
-4. **⚠ On this stack the disk recipe cache and a colon list are mutually exclusive.** Setting
-   `PT_HPU_RECIPE_CACHE_CONFIG` makes the bridge validate `GC_KERNEL_PATH`, and a colon list is rejected
-   outright:
+   (`backend/kernel/hpu_habana_cache.h:201`, member of the struct at `:69`) is what the in-process LRU
+   compares, and `libs_env_hash` is **not in it** — it enters only through `cache_id_suffix_`. Changing
+   `GC_KERNEL_PATH` evicts nothing in a running process; it makes the *next* process miss. Since the suffix
+   is constant anyway, it does not even do that.
+3. **The `:`/`,` split bug is real but inert.** `:184` finds the first `:`, then `:198` looks for a
+   **comma**, which is not the list separator — the comment at `:186` says *"comma separated"*. For three or
+   more entries the remainder is passed to `hash64_file_content` as one path string, which fails to open and
+   returns 0. That would key only the first entry's contents — except that every entry's contents hash to 0
+   already, so the bug changes nothing. **source read**, and moot for the same reason as §9.5.3's first
+   consequence.
+4. **⚠ An *enabled* disk recipe cache and a colon-separated `GC_KERNEL_PATH` are mutually exclusive.**
 
    ```
    RuntimeError: [Rank:0] FATAL ERROR :: MODULE:PT_SYNHELPER Flag GC_KERNEL_PATH:
@@ -477,19 +558,61 @@ variable's name suggests:
    terminate called without an active exception
    ```
 
-   **MEASURED**, exit **134**, with the cache flag `true` *and* with it `false` — the mere presence of the
-   variable is enough. A single-path `GC_KERNEL_PATH` passes. So: **a custom TPC kernel can have the
-   two-entry search path, or the disk recipe cache, but not both** — and since §9.6 needs `torch.compile`,
-   the recipe cache is what goes.
+   **MEASURED**, exit **134**. The condition is narrower than "the variable is set", and the distinction
+   matters: `PT_HPU_RECIPE_CACHE_CONFIG` has a **default of `,false,1024,false`** (`scripts/env_flags.yaml:97`),
+   whose first field — the cache directory — is empty, and an empty path *disables* the disk cache. Measured
+   across six settings of the variable, with the same colon list:
 
-**What is UNKNOWN.** I could only *read* the hash, not measure it: the disk cache never populated here —
-with `PT_HPU_RECIPE_CACHE_CONFIG` set, even a trivial `x * 2.0` region fails to compile
-(`syn_singleton_graph.cpp:735`, `synStatus 26`) before any cache file is written, and without it there is no
-cache. The manual's own [`experiments/`](experiments/README.md) rung 1 shows the key's shape from a working
-configuration — `4169968267915495333_a16fb581eee_syn1.24.2.79e284b.recipe`, whose middle field is the
-11-hex-digit `libs_env_hash` — but that is a **different container state**. What would settle it: a compiled
-region with the cache on, then the same region with one byte appended to the custom library, then a diff of
-the two filenames.
+   | `PT_HPU_RECIPE_CACHE_CONFIG` | result |
+   |---|---|
+   | unset | **works** |
+   | `,false,1024,false` (the default; empty path, cache disabled) | **works** |
+   | `<dir>,false,1024` | **abort, exit 134** |
+   | `<dir>,true,1024` | **abort, exit 134** |
+   | `<dir>,false,1024,false` | **abort, exit 134** |
+   | `<dir>` | **abort, exit 134** |
+
+   **MEASURED.** So `delete_on_init` makes no difference; **enabling the cache is what rejects the list.**
+
+   The mechanism is a chain worth following, because it explains why the two features collide at all
+   (**bridge** layer, all four links):
+
+   * enabling the cache constructs `DiskCache`, whose constructor calls `CacheVersion::libs_env_hash()`
+     (`hpu_recipe_cache.cpp:305`);
+   * `libs_env_hash()` reads `GC_KERNEL_PATH` through `GET_ENV_FLAG_NEW` (`cache_version.cpp:181–183`) —
+     **the only reader of that flag in the bridge**;
+   * a first read of a flag runs its declared constraint (`env_flags_impl.h:453`), and
+     `scripts/env_flags.yaml:43–47` declares `GC_KERNEL_PATH` as `type: filepath, value: is_file`;
+   * `check_file_path` (`backend/synapse_helpers/env_flags_impl.cpp:350`) calls
+     `std::filesystem::is_regular_file` on the **whole colon-joined string** (`:394–396`), which is false,
+     and `validate_constraint_with_type` raises `PT_SYNHELPER_FATAL("Flag ", …)` (`:664`) — an abort, hence
+     134.
+
+   With the cache disabled nothing reads the flag through that accessor, so nothing validates it, and the
+   list works. **The constraint contradicts the flag's own documented semantics** — `GC_KERNEL_PATH` *is* a
+   colon list — so this reads as a bridge defect, not a Synapse limit. **INFERRED** *(the chain is
+   `source read` at each link and the `only reader` step is a grep of the whole bridge tree; the six-config
+   matrix above is the measurement)*. Consequence: **a custom TPC kernel can have the two-entry search path,
+   or the disk recipe cache, but not both** — and since §9.6 needs `torch.compile`, the recipe cache is what
+   goes.
+
+#### The disk cache does populate
+
+An earlier draft of this section reported that the cache never populated here, and that even a trivial
+`x * 2.0` region failed to compile (`syn_singleton_graph.cpp:735`, `synStatus 26`) before any cache file was
+written. **That conclusion was wrong, and the cause was §9.5.1's missing stock library**, not the cache.
+With a **single-path** `GC_KERNEL_PATH` naming `libtpc_kernels.so`, an enabled cache, and the same trivial
+region, the compile succeeds and a recipe is written:
+
+```
+$ find <cache-dir> -name '*.recipe'
+1058408721741903309_a16fb581eee_syn1.24.2.79e284b.recipe
+```
+
+**MEASURED**, reproducibly, from a fresh cache directory each time. With our library as the single path and
+no stock library, the *same* region fails with `synStatus 26 … recipe_manager.cpp:304 … Can not compile
+graph` and writes nothing — which is §9.5.1's third row, not a cache problem. **So the cache works; the
+colon list is what it cannot coexist with.**
 
 ---
 
@@ -556,12 +679,16 @@ wrapper (`:19–27`) is three lines that call the op.
 `backend="hpu_backend"`). The op **composes**: it traces, the Meta kernel supplies the fake tensor, and the
 compiled region runs bit-exactly.
 
-> ⚠ **The same three arms, with `GC_KERNEL_PATH` set to our library alone, read `FAIL / FAIL / OK`.** I wrote
-> that down as a finding before checking the control's environment, and it was wrong: the cause was
-> §9.5.1's missing stock library, not the op. So **a control must run in the same environment as the arm it
-> controls**, and **the first `FAIL` you see is a hypothesis**. It also took a second trap to notice: **once
-> the custom op's recipe has failed to compile, a later compiled graph in the same process fails too**, so an
-> in-process control reports the wrong thing. Hence the subprocess-per-arm structure.
+> ⚠ **The same three arms, with `GC_KERNEL_PATH` set to our library alone, read `OK / FAIL / FAIL`** — and
+> that is not an op defect. The cause is §9.5.1's missing stock library, and the control arm is what proves
+> it: it contains no custom op at all, and it fails too. I first wrote this triple down the wrong way round
+> (`FAIL / FAIL / OK`) before checking the control's environment. Three lessons, and the third is the one that
+> cost the most: **a control must run in the same environment as the arm it controls**; **the first `FAIL`
+> you see is a hypothesis**; and **once a compiled graph has failed in a process, a later compiled graph in
+> the same process fails too**, so an in-process control reports the wrong thing. Hence the
+> subprocess-per-arm structure. Run the arms against all three `GC_KERNEL_PATH` settings in §9.5.1's table
+> before believing any of them: with our library alone the eager arm still passes, which is exactly what
+> makes "the op is broken" a tempting and wrong reading.
 
 ---
 
@@ -636,7 +763,7 @@ tree, one constant changed — `v_mov_s((SCALAR)1.0)` → `(SCALAR)2.0` at `add1
 
 exit **1**. **MEASURED.** The dtype arm still passes, because a wrong constant has nothing to do with dtype
 validation. A gate with only that arm would be decoration; this one separates the two failure classes. It still cannot tell you the kernel ran **once** (use §9.4.4's trace) or that no partial block
-wrote past the tensor's end (§9.10 item 5).
+wrote past the tensor's end (§9.10 item 3).
 
 ---
 
@@ -649,8 +776,8 @@ Every row is something this chapter hit or read. **Almost nothing fails loudly a
 | 1 | kernel library not on `GC_KERNEL_PATH` | `Graph compile failed … synStatus 26 [Generic failure] … Current graph is nullptr` | MEASURED |
 | 2 | embed symbol name mismatch (§9.3.2) — **links clean** | the *same* text as row 1 | MEASURED |
 | 3 | GUID string differs between `GetKernelName` and `registerUserCustomOp` | the *same* text again | **INFERRED** from rows 1–2 (one error for every `GLUE_*` failure); not separately built |
-| 4 | colon list + `PT_HPU_RECIPE_CACHE_CONFIG` set (§9.5.3) | `FATAL ERROR … Flag GC_KERNEL_PATH: Path is not a regular file: <whole string>`, then abort, exit 134 | MEASURED |
-| 5 | stock library absent, `torch.compile` in use (§9.5.1) | `MODULE:PT_EAGER HabanaLaunchOpPT Run returned exception … recipe_manager.cpp:304 … Can not compile graph` — blames the graph | MEASURED |
+| 4 | colon list + an **enabled** disk recipe cache (§9.5.3) | `FATAL ERROR … Flag GC_KERNEL_PATH: Path is not a regular file: <whole string>`, then abort, exit 134 | MEASURED |
+| 5 | stock library absent, `torch.compile` in use — **even with no custom op in the graph** (§9.5.1) | `MODULE:PT_EAGER HabanaLaunchOpPT Run returned exception … recipe_manager.cpp:304 … Can not compile graph` — blames the graph | MEASURED |
 | 6 | `#include "kernel_config.h"` with no `-I` | `fatal error: 'kernel_config.h' file not found` — the one loud failure | MEASURED |
 | 7 | `import pytest` without pytest | `ModuleNotFoundError: No module named 'pytest'` at import, not at test time | MEASURED |
 | 8 | `prof.export_chrome_trace(path)` | `TypeError: … takes 2 positional arguments but 3 were given` — a monkey-patch out of step with torch 2.13; use `prof.profiler.export_chrome_trace(path)` | MEASURED |
@@ -678,15 +805,19 @@ MMIO pair. `ld_g`/`st_g` is a global access through a tensor descriptor; `ld_l`/
 
 ## 9.10 What this chapter leaves UNKNOWN
 
+**Three questions an earlier draft carried are now answered and have left this register:** the recipe-cache
+key **cannot** change when a kernel library is rebuilt or a hashed environment variable changes — it is a
+constant per Synapse version (§9.5.3, **MEASURED** and **source read**); the disk cache **does** populate on
+this stack (§9.5.3, **MEASURED**); and the `:`/`,` split in `libs_env_hash` is inert because every content
+hash it feeds in is 0 (§9.5.3).
+
 | # | UNKNOWN | status | what would settle it |
 |---|---|---|---|
-| 1 | **Whether the recipe-cache key changes when the custom library is rebuilt** | **source read only** — the `libs_env_hash` → `cache_id_suffix_` → store/lookup chain is read from v1.24.2, but the disk cache never populated here | a compiled region with the cache on, one byte appended to the custom library, then a diff of the two cache filenames |
-| 2 | **Whether the `:`/`,` split hashes only the first entry of a 3-entry list** | **source read** — `:184` splits on `:`, `:198` then looks for `,`; the comment at `:186` says "comma separated" | two runs with different third entries and a populated disk cache; the filenames should be identical if the reading is right |
-| 3 | **Why the disk recipe cache's compile path fails on this stack at all** | **UNKNOWN** — `syn_singleton_graph.cpp:735`, `synStatus 26`, for a graph with no custom op in it; not a custom-kernel problem | a different plugin build, or a cache directory with different ownership |
-| 4 | **What MMIO `0x538` controls** — the kernel prologue's `ld_l mmio %S0, 0x538` / `or.i32 %S0, %S0, 0x1000000` / `st_l mmio 0x538, %S0` (listing lines 8–21) | **UNKNOWN** — no header, no vendor statement found; it is compiler-generated, not source-generated | a TPC ISA document, or a disassembly that names the register |
-| 5 | **Whether a partial block writes past the tensor** (§9.8.2) | **UNKNOWN** — outputs are right for 64/100/256/1000/1048576, and the glue has no tail guard; `maxSizes` was not read back | a `maxSizes` dump at a length that is not a multiple of 256, or a canary element after the tensor |
-| 6 | **Whether five `recipeId`s over five identical eager launches mean five compiles** (§9.4.4) | **UNKNOWN** — a `recipeId` count is not a compile count | a run with the cache populated (blocked by item 3), or a compile counter |
-| 7 | **Whether one library can hold several kernels end to end** (and whether `--rename-section .data=.rodata` matters) | **not investigated** — the entry points are a dispatch table, so the shape says yes, but this chapter built one kernel; both section forms link and run | a second kernel in the same library and namespace, then §9.4.4's trace check on both |
+| 1 | **Whether an enabled disk recipe cache can be combined with a colon-separated `GC_KERNEL_PATH`** | **answered: no, on this stack** — exit 134, and the trigger is a bridge-side `is_file` constraint (`scripts/env_flags.yaml:43–47` → `env_flags_impl.cpp:394–396`) that contradicts the flag's own documented meaning. Whether that is a defect fixed in a later release is **UNKNOWN** | a later bridge build, or a build with `GC_KERNEL_PATH`'s constraint relaxed, then the §9.5.3 matrix re-run |
+| 2 | **What MMIO `0x538` controls** — the kernel prologue's `ld_l mmio %S0, 0x538` / `or.i32 %S0, %S0, 0x1000000` / `st_l mmio 0x538, %S0` (listing lines 8–21) | **UNKNOWN** — no header, no vendor statement found; it is compiler-generated, not source-generated | a TPC ISA document, or a disassembly that names the register |
+| 3 | **Whether a partial block writes past the tensor** (§9.8.2) | **UNKNOWN** — outputs are right for 64/100/256/1000/1048576, and the glue has no tail guard; `maxSizes` was not read back | a `maxSizes` dump at a length that is not a multiple of 256, or a canary element after the tensor |
+| 4 | **Whether five `recipeId`s over five identical eager launches mean five compiles** (§9.4.4) | **UNKNOWN** — a `recipeId` count is not a compile count. Note that the disk cache does **not** help here: it is not written on the eager path at all (a gate run with the cache enabled and populated-capable wrote zero recipes), so a "populated cache" is not the instrument | a compile counter, or a lazy-mode run where a single region recipe is reused |
+| 5 | **Whether one library can hold several kernels end to end** (and whether `--rename-section .data=.rodata` matters) | **not investigated** — the entry points are a dispatch table, so the shape says yes, but this chapter built one kernel; both section forms link and run | a second kernel in the same library and namespace, then §9.4.4's trace check on both |
 
 ---
 
@@ -700,10 +831,12 @@ MMIO pair. `ld_g`/`st_g` is a global access through a tensor descriptor; `ld_l`/
    `_binary___<name>_o_start` match the glue's `extern`. Get it wrong and **the link succeeds**; the failure
    is a runtime graph-compile error.
 3. **`GC_KERNEL_PATH` is a colon list and both entries are load-bearing** — ours for the GUID, the stock
-   library for `torch.compile`. A missing entry produces the same uninformative error as a wrong symbol, a
-   wrong GUID string, or a bad glue return. Its **contents** are hashed into the disk recipe cache key, and
-   on this stack that cache and a colon list are **mutually exclusive**: if you need `torch.compile`, the
-   recipe cache is what goes.
+   library for **any** `torch.compile` region at all, including one that contains no custom op. A missing
+   entry produces the same uninformative error as a wrong symbol, a wrong GUID string, or a bad glue return.
+   An **enabled** disk recipe cache and a colon list are **mutually exclusive** (exit 134), so if you need
+   `torch.compile`, the recipe cache is what goes. And do **not** expect the cache to protect you from a
+   stale kernel: its key is a constant per Synapse version, so a rebuilt kernel is served the **old** recipe
+   (§9.5.3). Key your own directory per build, or set `delete_on_init`.
 4. **Register in the existing `custom_op` namespace**, and know that the namespace is a *placement* decision
    made by `shared_layer.py`'s short-circuit ([§2.4](02-regions.md)) — not by anything in your kernel.
    Verify placement; never infer it from the name.
@@ -727,8 +860,9 @@ container, with the command given.
 | figure(s) | value | provenance |
 |---|---|---|
 | compiler and stack versions | `tpc-clang` 2.7.33 (clang 14.0.5); `torch` 2.13.0a0+git2469d18; driver `1.24.2-52a555d`; fw `hl-gaudi2-1.24.0-fw-62.6.2-sec-11`; 2 × `HL-225` | measured — `tpc-clang --version`, `torch.__version__`, `hl-smi -L`, §9.3.1 |
-| three artifact sizes | ELF 14,544 B (`0x38d0`); glue `.so` 28,832 B; extension 10,959,632 B | measured — `./build.sh` from a clean tree, §9.3.3; `0x38d0` corroborated by `nm`'s `_binary_…_o_size`, §9.3.2 |
-| exported glue symbols | 3 | measured — `nm -D --defined-only`; declared at `tpc_kernel_lib/src/entry_points.cpp:17,39,54` |
+| three artifact sizes | ELF 14,480 B (`0x3890`); glue `.so` 28,832 B; extension 10,959,536 B | measured — `./build.sh` from a clean tree, §9.3.3. **Both path-dependent**: the ELF steps by 16 B every 8 characters of cwd, §9.1 |
+| exported glue symbols | **3 entry points** (14 defined dynamic symbols in total) | measured — `nm -D --defined-only`; entry points declared at `tpc_kernel_lib/src/entry_points.cpp:17,39,54`; the other 11 are the one class's methods, destructors, typeinfo and vtable, plus the 3 `_binary_*` |
+| ELF size path dependence | `-fcoverage-compilation-dir=` and `-fdebug-compilation-dir=` both carry the absolute cwd; cwd len 20–23/24–31/32–39/40–47/48–55/56–63 → ELF 14,480/14,496/14,512/14,528/14,544/14,560 B | measured — nine builds of the same source, `strings <elf>`, §9.1 |
 | kernel bundle count | **96** | measured — default `-S` listing parsed by brace groups **and** `-mllvm --tpc-asm-format=2` line count, which agree; §9.2.4 |
 | per-slot count | **not quoted** (82 vs 94 disagree) | measured — deliberately withheld, §9.2.4 |
 | `VECTOR_SIZE` for f32 | 64 | source read — `tpc_kernel_lib/kernels/include/kernel_config.h:19`; cross-ref §4.3.1 |
@@ -746,14 +880,22 @@ container, with the command given.
 | trace: census, event fields, span | 120 of 524 events named by the GUID; 5 launches; 24 distinct `tid`s; 5 distinct `recipeId`s; `EventName` `1/add1_fwd_f32_gaudi2/0`; `HW event name` `TPC_SPU_START_TO_SPU_HALT`; `dataType` `float32`; `Device` `accel5`; span 3.605–3.993 µs, mean 3.799 µs | measured — `check_guid_in_trace.py`, §9.4.4 |
 | achieved bandwidth | 8.39 MB / 3.799 µs = 2.21 TB/s | arithmetic on the row above; the comparison to 2.26–2.43 TB/s is [§4.1.2](04-execution-model.md)'s floor, INFERRED |
 | `torch.compile` arms | eager OK, compiled op OK, control OK (colon list) | measured — `check_torch_compile.py`, §9.6.3 |
-| the same arms, our library alone | FAIL / FAIL / OK | measured — and identified as an environment artefact, not an op defect, §9.6.3 |
+| the same arms, our library alone | **OK / FAIL / FAIL** | measured — and identified as §9.5.1's missing stock library, not an op defect, §9.6.3 |
+| plain `x*2.0` region, no custom op imported | ours alone **fails** `synStatus 26 … recipe_manager.cpp:304 … Can not compile graph`; stock alone **OK equal=True**; colon list **OK equal=True** | measured — a 10-line script that never mentions `custom_add1`, §9.5.1 |
 | in-process contamination | a later compiled graph fails after the op's recipe fails | measured — §9.6.3 |
 | error texts | `synStatus 26 … Current graph is nullptr`; `Path is not a regular file: <whole string>` + abort, exit 134; `recipe_manager.cpp:304 … Can not compile graph` | measured — §9.5.2, §9.5.3, §9.5.1 |
-| colon list + recipe cache | rejected with the cache flag both `true` and `false` | measured — §9.5.3 |
-| container's default `GC_KERNEL_PATH` | `/usr/lib/habanalabs/libtpc_kernels.so` | measured — `env`, §9.5.1 |
+| colon list + **enabled** recipe cache | aborted, exit 134, for every non-empty cache path (`<dir>`, `<dir>,false,1024`, `<dir>,true,1024`, `<dir>,false,1024,false`); unset and the default `,false,1024,false` (empty path) both **work** | measured — six-configuration matrix, §9.5.3 |
+| the abort's origin | `GC_KERNEL_PATH` carries `type: filepath, value: is_file` (`scripts/env_flags.yaml:43–47`) → `check_file_path` (`env_flags_impl.cpp:350`) → `std::filesystem::is_regular_file` on the whole colon string (`:394–396`) → `PT_SYNHELPER_FATAL("Flag ", …)` (`:664`); reached only via `libs_env_hash`'s `GET_ENV_FLAG_NEW(GC_KERNEL_PATH)` (`cache_version.cpp:181–183`), the bridge's only reader | source read + INFERRED (the chain is `source read`; "only reader" is a grep of the bridge tree) |
+| disk cache populates | `1058408721741903309_a16fb581eee_syn1.24.2.79e284b.recipe`, reproducibly, from a fresh directory | measured — single-path `GC_KERNEL_PATH=libtpc_kernels.so`, `PT_HPU_RECIPE_CACHE_CONFIG=<dir>,false,1024`, §9.5.3 |
+| the cache key is blind to the library | one byte appended to a 585,861,120-byte kernel library → **identical** filename; `DISABLE_TENSORS_PINNING=true` → **identical**; `x*2.0+1.0` instead of `x*2.0` → prefix `14517805940679984190`, same suffix | measured — four runs, fresh cache directory each, §9.5.3 |
+| `libs_env_hash` is constant | `hash_combine(hash_combine(hash_combine(0,0),0),0)` = `0xa16fb581eee` = the observed middle field | INFERRED — arithmetic on `cache_version.cpp:178–203` with `c10::hash_combine` (`c10/util/hash.h:47–49`); matches the observed field exactly |
 | `libs_env_hash` definition | `cache_version.cpp:174`; libs `:178–179`; `GC_KERNEL_PATH` `:181`; first split `:184`; content hash `:193`; second split `:198`; tail `:203` | source read — `gaudi-pytorch-bridge` v1.24.2 |
+| `hash64_file_content` is dead | function `:100–139`; outer `size_t hashRes{0}` `:107`; shadowing inner `:123`; loop fills inner `:126`; `return hashRes` returns the outer `:138` | source read — same tag |
+| the env half is dead | `hashed_env_vars` `:143–168`, needles space-padded to a column; matched with `env_var.find(v)` `:170` against `NAME=VALUE` | source read — same tag |
 | cache key construction | `cache_id_suffix_` `hpu_recipe_cache.cpp:305`; store `:317`; lookup `:354` | source read — same tag |
-| `RecipeArgumentSpec::hash_code` | `hpu_habana_cache.h:69`; does **not** include `libs_env_hash` | source read — same tag |
-| recipe filename shape | `4169968267915495333_a16fb581eee_syn1.24.2.79e284b.recipe` | [experiments/README.md](experiments/README.md) rung 1 — **a different container state**, cited for shape only |
+| `RecipeArgumentSpec::hash_code` | `backend/kernel/hpu_habana_cache.h:201` (struct at `:69`); does **not** include `libs_env_hash` | source read — same tag |
+| `PT_HPU_RECIPE_CACHE_CONFIG` default | `",false,1024,false"` — first field empty, which disables the disk cache | source read — `scripts/env_flags.yaml:96–97`; `recipe_cache_config.cpp:41–55` |
+| recipe filename shape | `4169968267915495333_a16fb581eee_syn1.24.2.79e284b.recipe` | [experiments/README.md](experiments/README.md) rung 1 — **a different container state**, cited for shape only; the suffix is identical to the one measured here, which is the point |
+| container's default `GC_KERNEL_PATH` | `/usr/lib/habanalabs/libtpc_kernels.so` | measured — `env`, §9.5.1 |
 | `pip` and profiler failures | `PermissionError: [Errno 13] Permission denied: '/root'`; `takes 2 positional arguments but 3 were given` | measured — §9.8.1, §9.9 rows 7–8 |
 | cross-referenced, not re-measured | 32-bit pointers and `ld_l`/`st_l` vs `ld_g`/`st_g` ([§7.4](07-sram.md)); the 22 = 22 dead-LUT case and the operand rule ([§4.5](04-execution-model.md)); the `custom_op` short-circuit at `shared_layer.py:273` ([§2.4](02-regions.md)); `a` as a knob, 5.235× ([§4.2.9](04-execution-model.md)); `tpc_working_engines` ∈ {4, 16, 22, 24} ([§4.2.8](04-execution-model.md)); the 2.26–2.43 TB/s streaming floor ([§4.1.2](04-execution-model.md)) | those sections, as cited |

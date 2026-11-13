@@ -54,11 +54,21 @@ facts, all in chapter 9 §9.5:
 * **without our library** — `GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so` alone — the GUID
   cannot be resolved and the op fails with `Graph compile failed … synStatus 26 [Generic failure] …
   Current graph is nullptr`, which names neither the kernel nor the path;
-* **without the stock library** — our library alone — the *eager* path works, but every
-  `torch.compile` region containing the op fails to compile, with an error that blames the graph;
-* **do not add `PT_HPU_RECIPE_CACHE_CONFIG`** to a colon-separated `GC_KERNEL_PATH`: the bridge then
-  rejects the list outright — `Flag GC_KERNEL_PATH: Path is not a regular file: <the whole colon-joined
-  string>` — and the process aborts.
+* **without the stock library** — our library alone — the *eager* path works, but **every**
+  `torch.compile` region fails to compile, *including one that contains no custom op at all*: a plain
+  `t * 2.0` region dies with `synStatus 26 … recipe_manager.cpp:304 … Can not compile graph`. The
+  stock library is needed for any compile on this stack, and the error blames the graph. This is the
+  most misleading failure in the example — `check_torch_compile.py`'s control arm is what catches it;
+* **do not *enable* the disk recipe cache** alongside a colon-separated `GC_KERNEL_PATH`. A non-empty
+  cache directory makes the bridge validate the list as a single file path, reject it
+  (`Flag GC_KERNEL_PATH: Path is not a regular file: <the whole colon-joined string>`) and abort with
+  exit **134**. The default value `,false,1024,false` has an empty path and is harmless — it is the
+  *enabled* cache that collides, not the variable's presence.
+
+One more, and it is the opposite of what the variable names suggest: the disk cache's filename is
+`<graph hash>_a16fb581eee_syn<version>.recipe`, and that middle field is a **constant**. Editing the
+kernel and rebuilding does not invalidate the cache — you get the stale recipe. Keep one cache
+directory per build, or set `delete_on_init`. Chapter 9 §9.5.3 has the source and the measurements.
 
 `test_add1_op.py` is upstream's pytest test and needs `pytest`, which is **not installed in this
 container** (`pip` here cannot run: it walks a directory it may not read). `gate_add1.py` is the same
@@ -109,23 +119,26 @@ examples/09-tpc-kernel/
 
 Upstream's README carried absolute paths from one machine (`$HOME/FastQwen/...` and a virtualenv
 that does not exist) and its kernel `#include "kernel_config.h"` resolved only through one of them.
-The changes here are:
+`diff -r` against upstream at `2220281` gives exactly **three modified files, five added files and one
+added directory** — a complete accounting, so nothing in this tree is unattributed:
 
-1. **`README.md` rewritten** — this file. No absolute paths, and the two artifacts are named.
-2. **`build.sh` and `run.sh` added** — upstream documented the commands inline in prose.
-3. **`kernel_config.h` vendored** at `tpc_kernel_lib/kernels/include/`. It is *not* part of the
-   `habanatools` package, which ships only `tpc_kernel_lib_interface.h`, `gc_interface.h` and the
-   test-core headers, so the kernel cannot compile without it.
-4. **`tpc_kernel_lib/CMakeLists.txt`** — the kernel include directory is now
-   `${CMAKE_SOURCE_DIR}/kernels/include` instead of the absolute path.
-5. **`check_guid_in_trace.py`, `check_torch_compile.py` added** — the two verifications the chapter
-   quotes.
-6. **`run.sh` uses `setup.py build`, not `setup.py install --user`** — upstream's install wrote into
-   `$HOME/.local`; `custom_add1.py` already globs `build/lib.linux-x86_64-*/`, so an in-tree build is
-   enough and nothing is installed.
+| | file | change |
+|---|---|---|
+| **modified** | `README.md` | rewritten as this file: no absolute paths, and the two artifacts are named |
+| **modified** | `.gitignore` | the ignore list is grouped (`# artifacts`, `# runtime dumps`) and `.traces/` is added |
+| **modified** | `tpc_kernel_lib/CMakeLists.txt` | `TPC_INCLUDE_DIR_KERNELS` is `${CMAKE_SOURCE_DIR}/kernels/include` instead of the absolute path inside one developer's checkout |
+| **added** | `build.sh` | upstream documented the four build commands inline in prose |
+| **added** | `run.sh` | the environment, then demo + gate. It uses `setup.py build`, not `setup.py install --user`: upstream's install wrote into `$HOME/.local`, and `custom_add1.py` already globs `build/lib.linux-x86_64-*/`, so an in-tree build is enough and nothing is installed |
+| **added** | `check_guid_in_trace.py` | §9.4's verification — the GUID as a device event, and the per-TPC census |
+| **added** | `check_torch_compile.py` | §9.6's verification — eager vs `torch.compile`, plus a control arm |
+| **added** | `gate_add1.py` | 57 lines. The bit-exact gate as a standalone program: `pytest` is not installed in this container, and a gate is what has to run everywhere |
+| **added** | `tpc_kernel_lib/kernels/include/kernel_config.h` | vendored from `HabanaAI/Habana_Custom_Kernel` @ `06e73bba`, licence header intact. It is *not* part of the `habanatools` package, which ships only `tpc_kernel_lib_interface.h`, `gc_interface.h` and the test-core headers, so the kernel cannot compile without it |
 
-The kernel source, the glue, the entry points, `hpu_custom_add1.cpp`, `setup.py`, `custom_add1.py`,
-`add1_demo.py` and `test_add1_op.py` are upstream's, byte for byte.
+**Everything else is upstream's, byte for byte** — checked with `cmp` against upstream at `2220281`:
+`__init__.py`, `add1_demo.py`, `custom_add1.py`, `hpu_custom_add1.cpp`, `setup.py`, `test_add1_op.py`,
+`tpc_kernel_lib/kernels/gaudi2/add1_fwd_f32_gaudi2.c`, `tpc_kernel_lib/src/entry_points.cpp`,
+`tpc_kernel_lib/src/gaudi2_src/add1_fwd_f32_gaudi2.cpp` and
+`tpc_kernel_lib/src/gaudi2_src/add1_fwd_f32_gaudi2.hpp`.
 
 ## Requirements
 
