@@ -82,8 +82,13 @@ unambiguous (**MEASURED**, [notes §7](notes/recipe-residency-and-memory-budget.
 |---|---|---|---|---|---|
 | A | `t + 1` | 1 | 0 | 1 | **1** |
 | B | `(t + 1) * 2 - 3` | 1 | 0 | 3 | **1** |
-| C | `y = t+1; s = y.sum().item(); return y + s` | **2** | **1** | 2 | **2** |
+| C | `y = t+1; s = y.sum().item(); return y + s` | **2** | **1** | 3 | **2** |
 | D | `y = t+1; return y[:t.shape[0]//2] * 2` | 1 | 0 | 3 | **1** |
+
+The `ops` column counts **every** op in the function **across all its graphs** — case C is `add`,
+`sum`, `add`, and the `.item()` that causes the break is a transfer, not an op. That is why B, C and D
+are all three and only C needs two recipes: the column exists to show that op count is not what moves
+the recipe count.
 
 Three readings, each of which changes how you write code:
 
@@ -94,10 +99,14 @@ Three readings, each of which changes how you write code:
 2. **Ops do not multiply recipes.** B and D are three ops each and still one recipe. A recipe is one
    per maximal contiguous run of *clusterable* nodes, so the count tracks **boundaries**, not op count
    ([§2.4](02-regions.md)).
-3. **The recipe filename carries the environment.** The generated files are
-   `_<libs_env_hash>_syn1.24.2.79e284b.recipe`: an environment hash plus the Synapse build. Change the
-   build, or change `GC_KERNEL_PATH`, and **every filename changes** — which is why a recipe cache
-   appears to "miss" after an upgrade that touched nothing you edited. (**MEASURED**, notes §7.)
+3. **The recipe filename does *not* carry the environment, and that is a hazard.** The generated names
+   are `<graph hash>_<libs_env_hash>_syn1.24.2.79e284b.recipe`. The **trailing** field is the *driver*
+   version string, so a Synapse or driver upgrade does change every filename. The **middle** field looks
+   like an environment hash and is a **constant** — `_a16fb581eee_` in every filename this project has
+   ever produced — because both of its inputs are dead code (§8.7.3). **Rebuilding a TPC kernel or
+   changing a compiler flag does not change the key.** What that costs you, and what to do about it, is
+   §8.7.3; the file's contents are hashed to zero at `cache_version.cpp:107,123,138`. (**MEASURED**,
+   notes §8.1.)
 
 **What a graph break costs is not this chapter's subject.** It costs in two currencies — overlap and
 host launch traffic — and [§2.5.1](02-regions.md) prices both. Here the point is narrower: the break
@@ -312,16 +321,31 @@ This is the section to read before sizing a KV cache, and its headline is a nega
 
 ### 8.6.1 The fixed reservation, before your first tensor
 
-**All MEASURED** on 1.24.2 / Gaudi2, one card ([notes §2b](notes/recipe-residency-and-memory-budget.md)):
+**All MEASURED** on 1.24.2 / Gaudi2, one card ([notes §2b](notes/recipe-residency-and-memory-budget.md);
+the driver and idle rows re-confirmed for this chapter with `hl-smi` on 2026-11-13). **Three "total HBM"
+figures are in circulation and they are three views of one card** — quote the one you measured, with its
+instrument:
+
+| view | figure | instrument |
+|---|---|---|
+| **driver** | **98304 MiB = 96.00 GiB** | `hl-smi -Q memory.total -f csv,nounits,noheader` |
+| **Synapse** — **the budget base** | **97376 MiB = 95.09 GiB** | `synDeviceGetMemoryInfo(dev, &free, &total)`, take `total` |
+| **torch** | **96895.2 MiB = 94.62 GiB** | `torch.hpu.mem_get_info()[1]` — **bytes**, divide by 2²⁰ |
+| **driver `memory.used` at idle** | **768 MiB** | `hl-smi -Q memory.used …`, no process holding the card |
+
+The driver's total is **928 MiB** larger than Synapse's (firmware and driver reservation, which Synapse
+never sees and you can never allocate). Synapse's is **481 MiB** larger than torch's (the program
+windows, carved out at device acquire). The **768 MiB** is a *usage* figure, not a fourth total — it is
+the idle baseline this manual already publishes ([§1.5](01-basics.md), `01-basics.md:394`: *"an idle
+baseline of ~768 MiB. **MEASURED**"*) — and it is **not** something to subtract on top of the 481 MiB.
 
 | item | size | when | scales with recipe count? |
 |---|---|---|---|
-| card HBM (as Synapse reports it) | 97376 MiB = 95.09 GiB | — | no |
-| card HBM (as torch reports it) | 96895.2 MiB = **94.62 GiB** | after acquire | no |
+| card HBM, Synapse view — **the budget base** | **97376 MiB** = 95.09 GiB | — | no |
 | ↳ global program window | **192 MiB** = 3 × `HBM_GLOBAL_MEM_SIZE_MEGAS`(64) | device acquire, before any tensor | **no** |
 | ↳ arc program window | **127.5 MiB** (`0x7F80000`) | device acquire | **no** |
 | ↳ streams, monitors, TDR, profiler | **~161 MiB** (remainder) | device acquire | no |
-| **total reserved before your first tensor** | **~481 MiB (0.47 GiB)** | | **no** |
+| **total reserved before your first tensor** | **~481 MiB (0.47 GiB)** — which is exactly why torch reports 96895.2 | | **no** |
 | your workspace | `synWorkspaceGetSize`, **one** device-wide buffer in the bridge | first launch | no (sized by the max, not the count) |
 | your tensors (weights, KV cache, activations) | the rest | you | you |
 
@@ -336,12 +360,21 @@ HbmGlblMemMgr: buffer addr given/actual 100160015a000000/100160015a000000
                size given/actual c000000/c000000   chunkSize 300000
 ```
 
-`0x7F80000` = 127.5 MiB with a `0x1F8000` (≈1.97 MiB) chunk; `0xC000000` = 192 MiB with a 3 MiB chunk;
-both divide into **64** chunks.
+`0x7F80000` = 127.5 MiB with a `0x1F8000` (≈1.97 MiB) chunk; `0xC000000` = 192 MiB with a 3 MiB chunk.
+
+**The 64-chunk count holds for the global window only, and it is INFERRED.** One method at three
+settings of one key — 192/3, 768/12 and 3072/48 MiB — gives 64 every time, so the *global* window has
+64 chunks and 1.16's `NUM_BUFF = 16` was raised. The **arc** window does not divide: 64 × `0x1F8000`
+= `0x7E00000` = 126 MiB against a `0x7F80000` window, so **1.5 MiB is never handed out**. The 1.16
+source has the two terms that could explain it — `round_down(chunkSize, ALIGN)` with `ALIGN = 128`
+(`arc_hbm_mem_mgr.cpp:44-48`, `arc_hbm_mem_mgr.hpp:36`), and `m_size = size - (m_addr - addr)`
+(`hbm_global_mem_mgr.cpp:24-27`), the size after the base address is rounded up — but which one applies
+in 1.24.2 is **UNKNOWN** (the log prints the *given* size in both fields). The budget uses the 127.5 MiB
+**window**, not the chunk, so nothing below depends on it. It is UNKNOWN #2.
 
 **The practical rule:**
 
-> Budget = 96 GB − ~0.5 GB (fixed runtime reservation) − workspace − weights.
+> Budget = **97376 MiB − 481 MiB** − workspace − weights.
 > **Do not subtract a per-recipe term.** If HBM is filling up as the graph count grows, the recipes are
 > not what is filling it — look at persistent/const sections, the workspace being sized by the largest
 > recipe, or tensors retained by the host-side cache.
@@ -401,9 +434,11 @@ Read it as three separate lessons:
 **And it is a size, never a policy.** A bigger window means a bigger maximum single-recipe program and
 fewer ring waits; it does **not** make anything resident.
 
-**One instrument trap.** `synDeviceGetMemoryInfo()` on this build returns **`free = 0`** (status
-`synSuccess`, total correct). Use `torch.hpu.mem_get_info()`. The reported `total` *falls* as you raise
-the window — Synapse carves it out of the pool — so measure by differencing `total`.
+**Two instrument traps.** `synDeviceGetMemoryInfo()` on this build returns **`free = 0`** (status
+`synSuccess`, total correct). Use `torch.hpu.mem_get_info()`. And that call returns **bytes, not MiB** —
+`101601996800` is 96895.2 MiB — so reading it as MiB is a **2²⁰×** error. (Re-measured for this chapter:
+`free = 101596229504 B`, `total = 101601996800 B` = 96895.21 MiB.) The reported `total` *falls* as you
+raise the window — Synapse carves it out of the pool — so measure by differencing `total`.
 
 ---
 
