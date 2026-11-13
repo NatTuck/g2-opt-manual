@@ -533,16 +533,20 @@ is in the key.
 
 ### 8.3 What we could not show, and why it matters
 
-The stale-serving half is **INFERRED**, not measured end to end. In this bridge configuration the disk
-cache did not *hit* even on four identical repeated runs: each run recompiled (first call 218–230 ms,
-against ~140 ms cold and ~77 ms with a recipe already on disk, `recipe-launch-notes.md` §0) and rewrote
-the `.recipe` — whose size varied between runs (3366 B, 3144 B). So the hazard is a property of a cache
-that *does* hit, and the launch notes record one that does (`recipe-launch-notes.md` §4: "0 new recipes
-on a same-config reboot"). What is unconditional, and what this section establishes, is that **the key
-cannot change when the kernel library or a hashed environment variable changes**. Whether a given
-configuration then serves the old bytes is the disk cache's business — and its key contains nothing
-else. **UNKNOWN:** why it did not hit here; a per-process component inside the serialised
-`RecipeArgumentSpec` is the obvious suspect.
+The stale-serving half is **INFERRED**, not measured end to end. **Part of the reason was our own
+instrument.** The four-run experiment that concluded "the disk cache does not hit" used
+`PT_HPU_RECIPE_CACHE_CONFIG=<dir>,true,1024,false` — and the second field is `delete_on_init`, which
+wipes the directory at **every** process start. A cache wiped at init cannot hit. That is the
+"an instrument that overwrites its own evidence" failure the manual warns about, committed here.
+
+With `delete_on_init=false` the cache **does** hit, and that has been measured twice: a second process
+at an unseen integer value created **0 new recipes** and took a disk hit (ch 8 §8.8.2), and
+`recipe-launch-notes.md` §4 records "0 new recipes on a same-config reboot". So the *hit* is MEASURED.
+
+What remains INFERRED is the last step — that a **rebuilt kernel** then receives the *old* bytes. The
+key is provably constant (8.1–8.2), and the cache provably hits (above), but nobody has rebuilt the
+kernel and inspected the result. **That is one experiment away and should be run before the manual
+asserts the end-to-end hazard.**
 
 ---
 

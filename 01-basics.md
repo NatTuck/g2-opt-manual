@@ -284,10 +284,11 @@ cannot pass a dynamic slice bound or a dynamic shape and have one graph serve se
 > recipe serves every size inside it (MME `M`, `N` and `K` all patchable). The constraint above is a
 > **policy** of the layer we ship, and the hardware is not implicated either way — nothing we have run
 > is below Synapse. Chapter 8 develops this;
-> [the residency note](notes/recipe-residency-and-memory-budget.md) §10 carries the measurements.
+> [the residency note](notes/recipe-residency-and-memory-budget.md) §9 carries the measurements.
 
 **ASSUMED (vendor).** Stated here as the toolchain's behaviour; it is consistent with everything in
-§1.6–§1.9, and it is the standard account of this class of accelerator.
+§1.6–§1.9, and it is the standard account of this class of accelerator. *(This tag qualifies the
+paragraphs **above**, not the blockquote in between them.)*
 
 **Read it as a design constraint, not a limitation.** The consequence is that you work with a
 **shape set**: you decide which shapes the program must serve, and you accept that **each new shape
@@ -309,12 +310,14 @@ and **a new graph is compiled** — exactly as a new shape would.
 > not one per value: the first value is baked as a constant, the second recompiles to a graph that takes
 > the int as a symbolic input and serves every later value — unless you force `dynamic=False`, which
 > makes it one per value again. Structural uses (`x[:n]`, `x.reshape(n)`) cannot be escaped at all.
-> Chapter 8 §8.8 develops this;
-> [the residency note](notes/recipe-residency-and-memory-budget.md) §11 carries the measurements.
+> Chapter 8 §8.8 develops this and carries the measurements.
 
 **The consequence, stated as a rule:**
 
 > **Code that computes an offset from a loop index has written one program per iteration.**
+
+*(That is a **structural** use — the value decides the graph, so no tensor can carry it. The escape
+hatch above applies only when the int reaches the arithmetic.)*
 
 A loop that walks layers and computes `offset = layer * stride` *inside* the traced region does
 not produce one graph with a runtime offset. It produces **one graph per layer**, each with its own
