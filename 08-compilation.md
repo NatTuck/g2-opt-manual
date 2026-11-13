@@ -449,18 +449,25 @@ Four different things are called "the cache". Only one is on the device, and it 
 | cache | what it holds | where it lives | how it is bounded | on Gaudi 2? |
 |---|---|---|---|---|
 | **dynamo's code cache** | traced frames and guards | host, per process | dynamo's own limits | yes |
-| **bridge disk recipe cache** | serialized `.recipe` files | **disk** | `PT_HPU_RECIPE_CACHE_CONFIG`'s `max_dir_size_mb` (default **1024**) | yes |
+| **bridge disk recipe cache** | serialized `.recipe` files | **disk** | `PT_HPU_RECIPE_CACHE_CONFIG`'s `max_dir_size_mb` (default **1024**) — and its key **cannot see a kernel edit** (§8.7.3) | yes |
 | **bridge host LRU** | live `synRecipeHandle`s | **host memory** | `HABANA_PGM_LRU_MAX` (defaults **100 000** eager / **30 000** lazy); evicts on a host threshold | yes |
-| **device recipe cache** | recipe programs in HBM, LRU blocks | **device HBM** | `RECIPE_CACHE_SIZE` (default **500 MB**), block **128 KB** | **no — Gaudi1 only** |
+| **device recipe cache** | recipe programs in HBM, LRU blocks | **device HBM** | `RECIPE_CACHE_SIZE` (default **500 MiB**), block **128 KiB** | **no — Gaudi1 only** |
+
+Two names that are *not* the same cache and are routinely conflated: `GCFG_RECIPE_CACHE_*` is
+Synapse's **on-device** cache (Gaudi1), and `PT_HPU_RECIPE_CACHE_CONFIG` is the bridge's **disk** cache.
+Different layer, different medium, different owner.
 
 ### 8.7.1 The one that does not exist here
 
 There **is** a genuine device-HBM recipe cache in the tree — on the **Gaudi1 / qman** path
-(**source read**, 1.16): `GCFG_RECIPE_CACHE_SIZE` (default 500 MB, private) and
-`GCFG_RECIPE_CACHE_BLOCK_SIZE` (128 KB, private) size one device buffer, wrapped in a
-`RecipeCacheManager` with per-recipe refcounts
-(`device_recipe_addresses_generator.cpp:142-167`, `:219-260`; defaults at
-`habana_global_conf.cpp:1121-1133`). Its invalidation is LRU by its own comment.
+(**source read**, 1.16): `GCFG_RECIPE_CACHE_SIZE` (default **500 MiB** — `500 * 1024` KB, private) and
+`GCFG_RECIPE_CACHE_BLOCK_SIZE` (**128 KiB**, private) size one device buffer, wrapped in a
+`RecipeCacheManager` with per-recipe refcounts and an LRU invalidation policy
+(`recipe_cache_manager.cpp:40` calls it an *"on-device cache that stores recently used static part of
+recipes on pre allocated memory"*; the allocation is
+`allocateMemory(cache_size + MANDATORY_KERNEL_ALIGNMENT, synMemFlags::synMemDevice, …)` at
+`device_recipe_addresses_generator.cpp:139-160`, refcounts at `:219-260`; defaults at
+`habana_global_conf.cpp:1121-1133`). **Device HBM, not disk.**
 
 The SCAL/Gaudi2 path (`DeviceScal`) references it **nowhere** — a grep over
 `synapse/src/runtime/scal` for `RecipeCacheManager|RECIPE_CACHE` is empty — and setting
@@ -472,12 +479,118 @@ line and changes neither program window (**MEASURED**, notes §4).
 
 ### 8.7.2 The one that makes you think you have an HBM leak
 
-The bridge's host LRU is the cache that actually evicts in a long run, and it evicts on **host** memory
-(`PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT`, default 90 %, in 512 MB chunks), calling `synRecipeDestroy` on
-the GC thread (**source read**, bridge). Because eviction destroys the recipe, the next launch of that
-graph **recompiles it**. So the symptom of host pressure is a rising compile count and a slower steady
-state — which reads as device pressure and is not. §8.6.2's corollary is the diagnosis; this table is
+The bridge's host LRU is the cache that actually evicts in a long run, and it evicts on **host** memory,
+calling `synRecipeDestroy` on the GC thread. Because eviction destroys the recipe, the next launch of
+that graph **recompiles it**. So the symptom of host pressure is a rising compile count and a slower
+steady state — which reads as device pressure and is not. §8.6.2's corollary is the diagnosis; this is
 the mechanism.
+
+The threshold is a **two-level story, and a grep misleads**:
+
+- The gcfg default for `PT_HPU_HOST_MEMORY_THRESHOLD_PERCENT` is **0**, and 0 **disables the check
+  entirely** (`scripts/env_flags.yaml:428-430`; `pytorch_helpers/habana_helpers/misc_utils.cpp:32-34`
+  tests `!= 0U`).
+- The familiar **90 %** comes from the *bridge*, which substitutes its own default the first time a
+  dynamic bucket is created: `RecipeCacheLRU::default_host_memory_threshold = 90`
+  (`backend/kernel/hpu_recipe_cache.h:130`), written into the flag if it is unset.
+
+So "default 90 %" is true of a process that compiled something and false of the gcfg. Eviction runs in
+**512 MiB** chunks (`512LL * 1024 * 1024`, `backend/kernel/hpu_habana_launch_op_pt.cpp:4211` — the code
+comment says "512MB", the constant is MiB), and it is only *attempted* when a graph is built or a recipe
+inserted, never on a timer.
+
+### 8.7.3 The disk cache's key cannot see your build
+
+The disk cache's **filename is its key** — `recipe_cache_.store(hashCode + cache_id_suffix_, …)` at
+`backend/kernel/hpu_recipe_cache.cpp:317` — and the suffix is built at `:294-308`:
+
+```
+<RecipeArgumentSpec::hashCode()>_<CacheVersion::libs_env_hash()>_syn<synDriverGetVersion()>
+```
+
+The leading field is the graph (ops, shapes, attributes). The trailing field is the **driver** version
+string, so a Synapse or driver upgrade changes every filename. The middle field is *meant* to change
+when the **kernel library** or a compiler flag changes, so that a rebuild misses the cache. **It does
+not.** Both halves of it are dead code, for two independent reasons.
+
+**The file half.** `hash64_file_content()`
+(`pytorch_helpers/habana_helpers/habana_serialization/cache_version.cpp:100-139`) declares
+`size_t hashRes{0}` at `:107` and then a **second, shadowing** `size_t hashRes{0}` inside the `mmap`
+branch at `:123`. The loop at `:126-127` fills the **inner** one; `:138` returns the **outer** one. It
+therefore returns **0 for every file, whatever its size or contents** — the `mmap` and the per-byte loop
+are wasted work. (**source read**: `cache_version.cpp:107,123,126-127,138`.)
+
+**The env half.** `check_env_fo_hashing()` (`cache_version.cpp:141-172`) decides with `env_var.find(v)`
+(`:170`) whether an environment entry is on its list. The needles are **space-padded to a column** so
+they line up in the source — `"ENABLE_RAGGED_SOFTMAX_OPT             "` (`:150`) — and the haystack is a
+`"NAME=VALUE"` string taken from `environ` (`:208-215`). `"NAME=VALUE"` contains no run of spaces, so
+**no needle ever matches**: no environment variable has ever been hashed. (**source read**:
+`cache_version.cpp:141-172,150,165,170,208-215`.)
+
+So `libs_env_hash()` (`cache_version.cpp:174-222`) is `at::hash_combine` applied N times to 0. It varies
+with the *number* of files it was asked to hash and with nothing else. (That number is 2 or 3 — the
+habana device path, the Synapse library, and one `GC_KERNEL_PATH` entry. The multi-path branch at
+`:184-198` splits on `:`, but a colon-list `GC_KERNEL_PATH` is **rejected at device init** — `FATAL
+ERROR … Path is not a regular file`, exit 134 — so that branch is unreachable in practice.)
+
+**Measured: three arms, one filename.** One graph (`x * 2.0 + 1.0`, `fullgraph=True`, `dynamic=False`), a
+**fresh cache directory per arm**, `PT_HPU_RECIPE_CACHE_CONFIG=<dir>,true,1024,false`. All three arms
+produced the **identical** file:
+
+| arm | `GC_KERNEL_PATH` | environment | recipe file |
+|---|---|---|---|
+| 1 | the stock `libtpc_kernels.so` | — | `4757981558864380105_a16fb581eee_syn1.24.2.79e284b.recipe` |
+| 2 | a copy of the same library with **one byte appended** | — | **identical** |
+| 3 | the stock library | `DISABLE_TENSORS_PINNING=true` — a name on the hashed list (`:165`) | **identical** |
+
+`_a16fb581eee_` is also the field in every filename this project has ever produced, including every
+filename in §8.8's measurements. A constant is exactly what a hash of "0, 0, 0" looks like.
+**MEASURED.**
+
+**The consequence is the opposite of the obvious one.** The cache cannot see a kernel edit or a
+configuration change, so:
+
+1. **Editing a TPC kernel and rebuilding will serve the stale recipe.** The name is unchanged, the file
+   is there, the graph is the same graph. When you iterate on a kernel, **clear the cache directory** —
+   or set the config's second field, `delete_on_init`, to `true` — as part of the rebuild. The hazard is
+   **INFERRED**, not measured end to end: see the honest limit below.
+2. **A cache directory shared across two configurations silently mixes recipes** built under different
+   compiler flags: two builds of one kernel library, one directory, one key.
+3. **Maintain your own key: one cache directory per *(build, configuration)* pair.** Nothing in the
+   filename provides that separation, so it has to come from you.
+4. **`PT_RECIPE_CACHE_IGNORE_VERSION=1`** drops the `_<hash>_syn<version>` suffix altogether
+   (`hpu_recipe_cache.cpp:299-301`). It exists, it makes the sharing worse, and it is a reminder that
+   this suffix is the cache's only version guard.
+
+**What does still invalidate:** `RecipeArgumentSpec::hashCode()` — the graph, i.e. ops, shapes and
+attributes — and the driver version string. A **Synapse or driver upgrade** changes every filename; a
+**kernel-library rebuild does not**. Two different things are called "the build", and only one of them
+is in the key.
+
+**The honest limit on the stale-serving half — it is INFERRED.** In this bridge configuration the disk
+cache did not *hit* even on four identical repeated runs: each run recompiled (first call 218–230 ms,
+against ~140 ms cold and ~77 ms with a recipe already on disk) and rewrote the `.recipe`, whose size
+varied between runs (3366 B, 3144 B). So the hazard is a property of a cache that *does* hit, and
+[`recipe-launch-notes.md`](notes/recipe-launch-notes.md) §4 records one that does ("0 new recipes on a
+same-config reboot"). What is unconditional, and what this section establishes, is that **the key cannot
+change when the kernel library or a hashed environment variable changes**. Whether a given configuration
+then serves the old bytes is the disk cache's business — and its key contains nothing else. **UNKNOWN:**
+why it did not hit here; a per-process component inside the serialised `RecipeArgumentSpec` is the
+obvious suspect (UNKNOWN #8).
+
+### 8.7.4 Two more traps in the same configuration string
+
+1. **The second field is `delete_recipe_cache_on_init`, and the third is MB — not entries**
+   (`bridge_config.py:71-86`: `path, delete_on_init, max_size_MB, allow_NFS`). With `true`, **every
+   process wipes the directory at init**, so `.recipe` counts are destroyed as evidence and
+   cross-process reuse cannot be measured at all. Per-arm counts taken with `true` are fine for
+   *within-process* counting and invalid for anything cross-process. The fourth field, NFS, makes the
+   second and third be ignored entirely.
+2. **The recipe filename does not determine the bytes.** Two recipes with the same filename *and* the
+   same size had different md5s (`cf1e1816…` vs `552cbe27…`). The name keys graph **structure**, not
+   content. Sharing a directory was measured safe for the integer case — the 0-d operand is an input
+   *slot* bound at launch (§8.8.2) — but "same filename" is not "same recipe", and §8.7.3's whole hazard
+   is that the name is the only thing the cache checks.
 
 ---
 
