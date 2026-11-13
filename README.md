@@ -1,6 +1,6 @@
 # Gaudi 2 HPU Optimization Manual
 
-**Status: DRAFT.** Eight chapters are written and filled with measured material. Gaps are
+**Status: DRAFT.** Nine chapters are written and filled with measured material. Gaps are
 marked explicitly rather than left blank or guessed — each chapter carries its own
 **UNKNOWN register**, and chapter 3 also carries a **dead-end register**.
 
@@ -62,6 +62,7 @@ those in from general knowledge.**
 | **6** | **[The fast iteration workflow](06-fast-iteration.md)** | ~630 | **how optimisation actually gets done** — one attributable profile, then spans cut at recipe boundaries, harnessed against captured bytes in seconds instead of minutes, gated on correctness, rewritten from scratch against an estimated hardware ceiling, and confirmed in situ once per span — including how to tell a span worth doing from one that merely extracts cleanly |
 | **7** | **[The on-die SRAM](07-sram.md)** | ~850 | **read before you plan around SRAM** — the 48 MiB pool and where it sits, the compiler's live slicer and the knobs it reads, what actually decides placement, the routes to *placing a tensor* that are closed (most of them silently) alongside the two that work for putting bytes there yourself, how to verify what the compiler placed, the arithmetic for the tile that would have to fit, and what it is worth — **+10.2 % over HBM on the TPC path with non-overlapping distributions (1.18× at the highest rate seen), small because the engines, not the memory, appear to bind — INFERRED, one point cannot settle it** |
 | 8 | [How PyTorch code compiles and runs](08-compilation.md) | ~1,000 | **what `@torch.compile` actually produces** — the three counts that are not each other (graphs ≥ recipes ≥ submissions), the AOT-Autograd-plus-partitioner backend, a recipe as a host-side program that holds **no HBM**, one program download per launch into a rotating 64-chunk ring, and the memory budget behind it — three totals, ~0.5 GiB fixed and **0.0 MiB** of device memory for 24 more recipes — plus the four caches (the disk cache's key cannot see a kernel rebuild), a layer table for which layer owns each constraint, and the measured integer story: a 0-d tensor is one recipe across processes, a Python int is two |
+| **9** | **[Writing and shipping a TPC kernel](09-tpc-kernels.md)** | ~900 | **the workflow, end to end, with a running example** — the two artifacts and the `objcopy` embed, the `tpc-clang` invocation, how Synapse finds a kernel and resolves the GUID, the host glue and the access-pattern contract it shares with the device code, exposing the kernel as a `torch.ops.custom_op` (and why the namespace is a placement decision), a bit-exact gate that has been shown to **fail**, and the one error message that means four different things |
 
 **`~lines` is a deliberately coarse band, not an exact count.** This column used to carry exact
 figures maintained by hand, and **two of the five had gone stale** — chapter 1 read 944 against an
@@ -69,14 +70,16 @@ actual 936, and chapter 3 read 1504 against an actual 1765 when this was checked
 is a number that is usually wrong, so it is now an order of magnitude for judging reading effort. **Do
 not cite it.**
 
-Example code lives in [`examples/`](examples/), organized by chapter — **21 files**, of which
+Example code lives in [`examples/`](examples/), organized by chapter — **40 files**, of which
 **four** run CPU-only and have been verified end to end
 (`examples/02-regions/03_inspect_graph_dumps.py --demo`, `examples/01-basics/gap_histogram.py`
 including its `--selftest` control, `examples/05-profiling/attribute_chain.py`, and
 `examples/06-workflow/traced_state_gate.py` — whose `--selftest` is a gate **on** the gate: it asserts
 that it *fails* on the buggy construct), and one
 (`examples/03-porting/fp8_scale_adjustment.py`) is host-only and has been run. **The rest are
-annotated sketches** that need a device; each says so in its header.
+annotated sketches** that need a device; each says so in its header — with one exception on the other
+side. **Chapter 9's example needs a device and has been run on one**: its 19 files build both artifacts
+and pass the gate on a real Gaudi 2 (§9.8), and its *failing* variant is a measurement too (§9.8.2).
 
 Chapter 5's three programs are the exception to "annotated sketch": they were **run on a real
 Gaudi 2 on 2026-10-21** and their outputs are archived, so the worked example in §5.8 is a
