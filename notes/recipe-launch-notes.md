@@ -285,7 +285,7 @@ optional sync + trace
 |---|---|---|---|---|
 | dynamo | FX graph + guards | code object + guard values | process | ~50 ms per (function × shape) trace; **no cross-process cache** |
 | **bridge** | serialised recipe + metadata | `RecipeArgumentSpec::hashCode()` + `libs_env_hash` + driver | **disk** | works; 0 new recipes on a same-config reboot |
-| Synapse (internal) | compiled binary | internal `GCFG_RECIPE_CACHE_*` | disk | configured by the same env var, opaque |
+| Synapse (internal) | a recipe's **static part**, in **device HBM** | internal `GCFG_RECIPE_CACHE_*` (`RECIPE_CACHE_SIZE` / `_BLOCK_SIZE`) — a **different cache** from `PT_HPU_RECIPE_CACHE_CONFIG` | device acquire → release | Gaudi1/qman path only; not on the Gaudi2/SCAL path at all — see [the residency note](recipe-residency-and-memory-budget.md) §4 |
 | runtime | loaded recipe handle | handle in the bridge's LRU | process | 0.5–0.7 ms per launch |
 
 **The one layer with no cross-process cache is dynamo's.** Everything below it is durable and
