@@ -22,9 +22,9 @@ to four hundred:
    is host memory and disk, not HBM — and the one cache everyone reaches for does not exist on this
    card. (§8.6–§8.7)
 
-It closes with the specialisation rule restated at the recipe level (§8.8), the lazy/eager/compiled
-distinction and its stale vendor comment (§8.9), how to see all of this yourself (§8.10), and its own
-UNKNOWN register (§8.11).
+It closes with the specialisation rule restated at the recipe level (§8.8), a table of **which layer
+owns each constraint** (§8.9), the lazy/eager/compiled distinction and its stale vendor comment
+(§8.10), how to see all of this yourself (§8.11), and its own UNKNOWN register (§8.12).
 
 > **Why this is chapter 8 and not part of chapter 4.** Chapter 4 is *the TPC execution model* — the
 > layer **under** the compiler, denominated in VLIW bundles. This material is the layer **above** it:
@@ -206,12 +206,12 @@ and `get_callable_recipe`'s own docstring states the fallback honestly (**source
 > *Calls backend to create compiled recipe or just returns unchanged module to run it eagerly depending
 > on config.*
 
-That docstring is the whole eager/compiled story in one line (§8.9): eager is not a mode you choose
+That docstring is the whole eager/compiled story in one line (§8.10): eager is not a mode you choose
 for speed, it is the path taken when a node is not compiled.
 
 The bridge reports the count it produced — `Number of subgraphs created: %s` (`cluster_compiler.py:158`)
 — which is a directly observable proxy for **recipes**, and the cheapest instrument in this chapter
-(§8.10).
+(§8.11).
 
 ### 8.3.3 The four compiler phases, in order
 
@@ -617,7 +617,7 @@ the manual's own summary has been wrong twice.
 
 Pass the varying integer as a **0-d tensor** and the value stops being part of the program. Measured —
 one compiled function, `f(t, k) = t + k`, `k` a 0-d `int64` tensor on the device, `n = 1…10`
-(**MEASURED**, §8.12's integer probe):
+(**MEASURED**, §8.13's integer probe):
 
 | arm | dynamo graphs | recipes |
 |---|---|---|
@@ -645,7 +645,7 @@ requirement.
 ### 8.8.3 A Python `int` costs **two** recipes on the default path — or one per value if you force static
 
 This is the part the manual's summary gets wrong twice, so both halves are measured (**MEASURED**,
-§8.12's integer probe; torch 2.13 / bridge 1.24.2):
+§8.13's integer probe; torch 2.13 / bridge 1.24.2):
 
 | arm | values | recipes |
 |---|---|---|
@@ -682,7 +682,7 @@ grows the cache without bound. That, and not the in-process count, is the scalin
 ### 8.8.4 Structural ints cannot be escaped
 
 Where the integer decides the **shape**, a tensor cannot help — the value *is* the graph. `x[:n] * 2`
-with a Python int (**MEASURED**, §8.12's integer probe):
+with a Python int (**MEASURED**, §8.13's integer probe):
 
 | values | dynamo graphs | recipes |
 |---|---|---|
@@ -704,49 +704,110 @@ live recipe, nothing per recipe on the device** (§8.6.2).
 
 ---
 
-## 8.9 Lazy, eager, compiled: what each is, and which one is a target
+## 8.9 Where each constraint lives
+
+Every rule in this manual is a rule *somewhere* in the stack, and the layers do not have the same
+strength. The distinction matters because a policy is a thing you can argue with a flag, a capability
+limit is not, and we have never measured the bottom layer at all.
+
+| constraint | layer | status |
+|---|---|---|
+| traced frames are guarded; a break splits a frame into graphs | **dynamo** | **source read** — dynamo's own machinery, exercised by §8.2's table |
+| each op still compiles to its own one-node recipe in eager mode | **dynamo → bridge** | **MEASURED** — 768 TPC kernel events for one eager `y.copy_(x)` ([§2.4](02-regions.md)) |
+| the default is **static** compilation: a new shape is a new recipe | **bridge** | **MEASURED** at the recipe level — §8.2's table, notes §7 |
+| "`dynamic=True` is turned into static compilation" | **bridge** | **ASSUMED (vendor)** — the standard account, not something we instrumented ([§1.4.1](01-basics.md)) |
+| the bridge **has** a dynamic path — this is a *default*, not a capability limit | **bridge** | **source read** — `get_dynamic_config_value()` reads dynamo's `assume_static_by_default` (`passes.py:543-556`, the read at `:554`) and the DS/SIF path is gated on `optim_output_sif_ds` (`passes.py:2260,2282`); `force_static_compile` short-circuits both (`:523,2278`). We have never seen it produce a dynamic recipe on the default path |
+| a recipe **can** be declared size-parametric, and is exact | **Synapse** | **MEASURED** — `DATA_TENSOR_DYNAMIC` with a `[min,max]` bound: exact M, N **and K** down to 1, rejects outside the bound with `synStatus 35` (notes §9.1) |
+| a **static** recipe silently ignores the launch size | **Synapse** | **MEASURED** — the control: compiled for M=512, launched at M=64, returned `synSuccess` and wrote 262,144 elements (229,376 sentinel violations) (notes §9.1) |
+| the recipe is genuinely re-parameterised, not masked | **Synapse** | **MEASURED** — `m_mappedSizePatch` 263,264 B (87 % of the image) for the dynamic recipe against 208 B (0.07 %) static (notes §9.1) |
+| the HPU itself | — | **UNKNOWN** — nothing we have run is below Synapse |
+
+**Read the row, not the headline.** "There are no dynamic shapes" is a **bridge** statement — tagged
+ASSUMED as a mechanism and MEASURED as a recipe count. It is the right operating rule, because the
+bridge will not hand you a dynamic recipe on any path we have seen, so every new shape is a new program.
+It is the **wrong** conclusion about the device. The bridge defaults to static compilation; it is not
+incapable of anything else, and the measurements above show the layer beneath it is size-parametric. Do
+not infer a hardware limit from a layer above it — and do not let this section replace the fixed-shape
+discipline until the throughput question below is answered.
+
+**What keeps this from being a recommendation.** Exactness is not a schedule. Nothing measured above
+says the MME is **re-tiled** for a smaller shape rather than **re-parameterised at the tiling chosen for
+the compiled maximum** — a 64×64×64 GEMM run at a 512×512×512 tiling would be exact and slow. So
+"dynamic shapes" may be true for correctness and still be "one big bucket" for throughput. That is
+UNKNOWN #10, and it is the question that decides usability: measure per-size efficiency of a dynamic
+recipe against static-per-shape before recommending it.
+
+**Two practical traps, both measured** (notes §9.3–§9.4):
+
+- **A user-section intermediate breaks the dynamic path.** Put the MME output that feeds the TPC node
+  into an **application section** — persistent or not — and the recipe fails at the *exact* compiled
+  shape with `Failed to perform DSD SIF patching` / status 35. Each node alone patches fine; the trigger
+  is specifically the MME→TPC edge into a user section. **Keep intermediate tensors compiler-owned.**
+- **`ENABLE_WIDE_BUCKET` is a footgun.** It removes the lower-bound *check* without making the recipe
+  correct: at N=1 it wrote 138 elements and returned success. **Declare `min=1` instead. Never relax the
+  bound.**
+
+And the reason the dynamic path is not something you can reach from a caller at all: it is a
+**kernel-library declaration**, not an option. `GetKernelGuids` must set `supportsDynamicShapes = 1`
+**and** a non-zero `nameHash.hashValue` (the SIF id), and `GetShapeInference` must actually resize the
+output — all three mandatory. The upstream `add1` kernel has none of them, so "make add1
+shape-parametric" means **editing the kernel library**.
+
+---
+
+## 8.10 Lazy, eager, compiled: what each is, and which one is a target
 
 | mode | what it is | status |
 |---|---|---|
 | **compiled** | `torch.compile(fn, backend="hpu_backend")` — the only supported target | **the target** |
-| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued, no recipe | a **reference point**, never an option |
-| **lazy mode** | `PT_HPU_LAZY_MODE=1` — ops accumulate into an implicit graph closed at a mark-step | **deprecated** |
+| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued; **each op still compiles to its own one-node recipe** (there is no region recipe) | a **reference point**, never an option |
+| **lazy mode** | `PT_HPU_LAZY_MODE=1` — ops accumulate into an implicit graph closed at a mark-step | **legacy; not the default; not a viable target** |
 | **eager placement** | a *node* property: the partitioner will not cluster it; it runs outside every recipe | a property of a compiled region, not a mode |
 
-**Why eager is a reference point and not an option:** the project has measured the gap at **400×** — an
+**Why eager is a reference point and not an option:** the project has measured the gap at **81×** — an
 expert kernel at **29 ms eager against 0.356 ms compiled** ([§6.6.1](06-fast-iteration.md)). An eager
-number is not a lower bound on the compiled number and cannot stand in for it.
+number is not a lower bound on the compiled number and cannot stand in for it. **And eager is not
+cheaper for anything this chapter measures:** one eager op is one one-node recipe, so N ops is N
+recipes, N submissions and N program downloads (§8.5) — the limit case of the residency story, not an
+escape from it.
 
-**Why lazy is deprecated:** modern vLLM Gaudi is `torch.compile`-only. The shipped bridge disables
-autoload *only* when `PT_HPU_LAZY_MODE=1`, i.e. **the default is non-lazy** — while the comment in
-`bridge_config.py` still claims "the default mode is lazy" (**source read**). That comment is a
-**stale claim**, and it is worth keeping as a specimen because it is the same failure mode
-[the TLDR](00-tldr.md) already documents: a vendor comment that was true two releases ago, read as
-documentation today.
+**Why lazy is legacy rather than deprecated:** the evidence proves **not the default**, not a vendor
+deprecation. `PT_HPU_LAZY_MODE` is declared `default: 0` (**source read**,
+`scripts/env_flags.yaml:125-127`), and the shipped autoload reads `os.getenv("PT_HPU_LAZY_MODE", "0")`
+(**source read**, `python_packages/habana_frameworks/autoload/__init__.py:30`). Modern vLLM Gaudi is
+`torch.compile`-only, so lazy is not a viable target — but do not call it deprecated without a vendor
+statement saying so. Meanwhile the comment in
+`python_packages/habana_frameworks/torch/internal/bridge_config.py:529` still claims "the default mode
+is lazy" (**source read**). That comment is a **stale claim**, and it is worth keeping as a specimen
+because it is the same failure mode [the TLDR](00-tldr.md) already documents: a vendor comment that was
+true two releases ago, read as documentation today.
 
 **The fourth row is the one that trips people.** *Eager placement* and *eager mode* are unrelated: the
 first is a node that splits a recipe inside a compiled region; the second is an execution model.
 [§2.4](02-regions.md) measures the first; this section separates it from the second.
 
 **One trap worth naming here, because it lives in the same files.** A patched working tree in this
-workspace carried a `synNativeComputeGraph*` "research API" (24 occurrences) whose comment claims it
-"skips recipe preparation, address patching, PDMA download and per-recipe synLaunch", plus a
-`NativeRecipeMemory` device-resident-program path. **Neither exists in vendor Synapse**: zero
+workspace — the 1.16 base plus **80 modified files (+4211/−863) and 17 untracked**, a heavily patched
+research tree — carried a `synNativeComputeGraph*` "research API" whose comment claims it "skips recipe
+preparation, address patching, PDMA download and per-recipe synLaunch", plus a `NativeRecipeMemory`
+device-resident-program path. Count it by `grep -rho 'synNative[A-Za-z0-9_]*' synapse/include
+synapse/src`: **210 occurrences in 14 files, 29 distinct identifiers** (21 `synNativeComputeGraph*`
+entry points and types, 8 `synNativeGraph*` state enums). **None of it exists in vendor Synapse**: zero
 occurrences in a clean `6de1f66` extraction, and zero `nativeCompute`/`NativeRecipeMemory` symbols in
-the installed 1.24.2 `libSynapse.so` (**MEASURED**, notes §0). Two residency models live in this
-workspace; do not mix them, and do not cite the patched tree.
+the installed 1.24.2 `libSynapse.so` (**MEASURED**, notes *Provenance*, trap 1). Two residency models
+live in this workspace; do not mix them, and do not cite the patched tree.
 
 ---
 
-## 8.10 How to see it yourself
+## 8.11 How to see it yourself
 
 Five instruments, cheapest first. None needs a profiler.
 
 | want | do this | what you get |
 |---|---|---|
-| **recipe count** | run with a **cold** recipe cache, then count the `.recipe` files in it (exact command in §8.12) | the number §8.2's table is built from |
+| **recipe count** | run with a **cold** recipe cache, then count the `.recipe` files in it (exact command in §8.13) | the number §8.2's table is built from |
 | **subgraph count** | bridge log line `Number of subgraphs created: N` (`cluster_compiler.py:158`) | recipes per compilation, without touching disk |
-| **program windows** | `LOG_LEVEL_ALL=6 LOG_LEVEL_SYN_PROG_DWNLD=0` with `HABANA_LOGS=<dir>`, then grep that directory for `ArcHbmMemMgr` / `HbmGlblMemMgr` (exact command in §8.12) | the §8.6.1 block, printed once at device acquire |
+| **program windows** | `LOG_LEVEL_ALL=6 LOG_LEVEL_SYN_PROG_DWNLD=0` with `HABANA_LOGS=<dir>`, then grep that directory for `ArcHbmMemMgr` / `HbmGlblMemMgr` (exact command in §8.13) | the §8.6.1 block, printed once at device acquire |
 | **the graph itself** | `DUMP_POST_GRAPHS=1` and read the dump ([§2.10](02-regions.md)) | per-node `engine`, recipe membership, modelled cost |
 | **which library did I load?** | grep `/proc/self/maps` from inside the process; `dpkg -V habanalabs-graph`; `nm -D --defined-only` on `libSynapse.so` for a symbol | whether the runtime is the packaged one, and whether a mechanism still exists by name |
 
@@ -758,7 +819,7 @@ is the single most likely reason a "the log prints nothing" investigation goes n
 
 ---
 
-## 8.11 What this chapter leaves UNKNOWN
+## 8.12 What this chapter leaves UNKNOWN
 
 Stated rather than omitted, per the manual's convention. Each entry says what would settle it.
 
@@ -800,7 +861,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 
 ---
 
-## 8.12 Examples
+## 8.13 Examples
 
 The chapter adds no files, so these are inline and runnable. They are the smallest commands that
 reproduce §8.2, §8.5 and §8.6.
@@ -839,7 +900,7 @@ print(f"free {free0} -> {free1} MiB, total {total0} -> {total1} MiB")
 Read the **total**, not the free: `synDeviceGetMemoryInfo()` reports `free = 0` on this build, and the
 window is carved out of the total (§8.6.3).
 
-**Dump the graph and read placement** (§8.10, and [§2.10](02-regions.md) for the reader):
+**Dump the graph and read placement** (§8.11, and [§2.10](02-regions.md) for the reader):
 
 ```bash
 DUMP_POST_GRAPHS=1 python your_probe.py
