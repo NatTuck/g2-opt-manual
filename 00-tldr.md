@@ -19,7 +19,7 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 | **node** | one op in that graph, carrying a **placement** (`hpu_cluster` or `eager`) |
 | **eager placement** | an op the partitioner will not cluster; it runs outside every recipe. **Not** the same thing as eager *mode*. |
 | **lazy mode** | `PT_HPU_LAZY_MODE=1` — the legacy execution model: ops accumulate into an implicit graph closed at a mark-step. **Legacy; not the default; not a viable target.** |
-| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued; **each op still compiles to its own one-node recipe** (there is no region recipe). A reference point, never an option: N one-node recipes is N submissions and N program downloads, and it is ~81× slower (29 ms vs 0.356 ms on one kernel, ch 6). |
+| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued; **each op still compiles to its own one-node recipe** (there is no region recipe). A reference point, never an option: N one-node recipes is N submissions and N program downloads. → *ch 6* |
 | **compiled mode** | `torch.compile(fn, backend="hpu_backend")` — **the only supported target.** Modern vLLM Gaudi is `torch.compile`-only. |
 | **recipe** | one compiled binary — **one per maximal contiguous run of clusterable nodes**. The region is partitioned *before* it becomes a recipe, so a `torch.compile` boundary is **not** a recipe boundary. → *ch 1 §1.3, ch 2 §2.2* |
 | **submission** | one Synapse `Launch` — the only unit the scheduler co-schedules *within* |
@@ -31,12 +31,9 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 An `eager`-placed node runs **outside** every recipe, splits the recipe run, and emits no
 `LaunchRecipe` — a recipe/handle count is not a submission count.
 
-**The default is non-lazy, and two source reads say so.** `PT_HPU_LAZY_MODE` is declared
-`default: 0` (**source read**, `scripts/env_flags.yaml:125-127`), and the shipped autoload reads
-`os.getenv("PT_HPU_LAZY_MODE", "0")` (**source read**,
-`python_packages/habana_frameworks/autoload/__init__.py:30`). The comment in
-`python_packages/habana_frameworks/torch/internal/bridge_config.py:529` claiming "the default mode is
-lazy" is **stale** — an instance of the "stale claim to watch for" pattern below.
+**The default is non-lazy.** The shipped bridge disables autoload only when `PT_HPU_LAZY_MODE=1`, and
+the vendor comment claiming "the default mode is lazy" is **stale** — an instance of the "stale claim
+to watch for" pattern below. The citations and the layer analysis are in *ch 8*.
 
 ---
 
@@ -257,7 +254,7 @@ union, op count, launch count and busy fraction together → confirm in situ onc
   *arbitrary* under dynamo. Thread tensors as graph arguments. A bit-exact gate on self-consistent
   inputs cannot detect this: the required case class is **same shape, different data**. The negative
   control must fail on the pre-fix code.
-- Eager is not a cheaper version of the compiled program — it is a different one (measured ~81×, ch 6);
+- Eager is not a cheaper version of the compiled program — it is a different one (ch 6);
   a gate that never executes the compiled path cannot see that the compiled path exists. A confirmation
   that comes back flat is a result: the span was not on the critical path, or the change moved cost into
   the host term.
