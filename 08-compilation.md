@@ -642,9 +642,9 @@ call is 142 ms and every later value costs 0.3–0.5 ms.
 That 83.7 ms is a real disk hit at an unseen value: nothing was compiled, the recipe was deserialised.
 A Python int at the same point does not behave this way (§8.8.3).
 
-**What it costs.** One extra `cast` node when the 0-d tensor is `int64` and the arithmetic is `f32` — an
-on-device cast, not a host sync. Both `shape ()` and `shape (1,)` are accepted; there is no rank-≥1
-requirement.
+**What it costs.** The graph takes an `i64` operand and produces an `f32` result, so the recipe carries a
+cast — on the device, not a host sync, and not a second graph. Both `shape ()` and `shape (1,)` are
+accepted; there is no rank-≥1 requirement.
 
 ### 8.8.3 A Python `int` costs **two** recipes on the default path — or one per value if you force static
 
