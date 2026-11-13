@@ -7,9 +7,9 @@ valid under. The measured material is on the runtime this project executes on: S
 (build `79e284b`), driver `1.24.2-52a555d`, torch `2.13.0a0+git2469d18`, `habana-torch-plugin`
 `1.24.2`. The source reads are the bridge source tree at **1.24.2** — the version the running process
 loads; its `passes.py` is bit-identical to the installed `python_packages/habana_frameworks` copy — and,
-for Synapse
-internals, an old **1.16** snapshot (base commit `6de1f66`), which is flagged wherever it is the only
-evidence. Bridge paths are relative to that source root; Synapse paths to the 1.16 extraction root.
+for Synapse internals, an old **1.16** snapshot (base commit `6de1f66`), which is flagged wherever it is
+the only evidence. Bridge paths are relative to that source root; Synapse paths to the 1.16 extraction
+root.
 
 **What this chapter is.** The layer *above* the device: what `@torch.compile` actually produces, how
 that reaches Synapse, what a recipe is, what a launch costs, and what any of it costs in memory. It
