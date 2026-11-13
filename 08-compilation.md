@@ -884,7 +884,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 ## 8.13 Examples
 
 The chapter adds no files, so these are inline and runnable. They are the smallest commands that
-reproduce §8.2, §8.5 and §8.6.
+reproduce §8.2, §8.5, §8.6 and §8.8.
 
 **Count recipes for a set of tiny cases** (cold cache each time — §8.2's table):
 
@@ -893,7 +893,7 @@ export PT_HPU_RECIPE_CACHE_CONFIG="$PWD/rc-cache",false,1024,false
 for case in a b c d; do
   rm -rf "$PWD/rc-cache"    # cold, so the count is unambiguous
   python case_${case}.py    # one decorated function per case
-  echo "$case: $(ls "$PWD"/rc-cache/_*.recipe 2>/dev/null | wc -l) recipes"
+  echo "$case: $(ls "$PWD"/rc-cache/*.recipe 2>/dev/null | wc -l) recipes"
 done
 ```
 
@@ -910,11 +910,12 @@ grep -h 'ArcHbmMemMgr\|HbmGlblMemMgr' "$PWD"/habana-logs/* | sed 's/.*\] //'
 
 ```python
 import torch, torch_hpu
+MiB = 2 ** 20                      # mem_get_info returns BYTES
 f = torch.compile(lambda t: t + 1, backend="hpu_backend")
 free0, total0 = torch.hpu.mem_get_info()
 handles = [f(torch.arange(1024, dtype=torch.float32, device="hpu")) for _ in range(24)]
 free1, total1 = torch.hpu.mem_get_info()
-print(f"free {free0} -> {free1} MiB, total {total0} -> {total1} MiB")
+print(f"free {free0 / MiB:.1f} -> {free1 / MiB:.1f} MiB, total {total0 / MiB:.1f} -> {total1 / MiB:.1f} MiB")
 ```
 
 Read the **total**, not the free: `synDeviceGetMemoryInfo()` reports `free = 0` on this build, and the
