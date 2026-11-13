@@ -915,6 +915,36 @@ print(f"free {free0} -> {free1} MiB, total {total0} -> {total1} MiB")
 Read the **total**, not the free: `synDeviceGetMemoryInfo()` reports `free = 0` on this build, and the
 window is carved out of the total (§8.6.3).
 
+**Count the recipes an `int` costs** (§8.8). Save as `ints.py`; the cache directory is the last
+argument and must persist between runs for the cross-process arm:
+
+```python
+# python ints.py tensor 1,2,3,4,5 ./rc    -> 1 recipe
+# python ints.py int    1,2,3     ./rc    -> 2 recipes   (3 with dynamic=False)
+import glob, os, sys, time
+mode, values, cache = sys.argv[1], [int(v) for v in sys.argv[2].split(",")], sys.argv[3]
+os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = f"{cache},false,1024,false"   # false: keep across runs
+import torch, torch_hpu
+
+def n_recipes():
+    return len(glob.glob(os.path.join(cache, "*.recipe")))
+
+# Compile ONCE. Compiling inside the loop resets dynamo's cache and measures nothing.
+f = torch.compile(lambda x, k: x + k, backend="hpu_backend", fullgraph=True, dynamic=None)
+t = torch.arange(1024, dtype=torch.float32, device="hpu")
+for n in values:
+    arg = torch.tensor(n, dtype=torch.int64, device="hpu") if mode == "tensor" else n
+    t0 = time.perf_counter()
+    f(t, arg)
+    torch.hpu.synchronize()
+    print(f"{mode} n={n} {(time.perf_counter() - t0) * 1e3:7.1f} ms  recipes={n_recipes()}")
+```
+
+Three arms settle §8.8: run `tensor 1,2,3,4,5` (one recipe), then `tensor 42` **in a new process**
+against the same directory (**zero** new recipes), then `int 1,2,3` (two recipes — or three if you
+change `dynamic=None` to `dynamic=False`). For the structural case, replace the body with
+`lambda x, n: x[:n] * 2` and pass Python ints; the recipe count grows with the value set.
+
 **Dump the graph and read placement** (§8.11, and [§2.10](02-regions.md) for the reader):
 
 ```bash
@@ -922,26 +952,41 @@ DUMP_POST_GRAPHS=1 python your_probe.py
 ls .graph_dumps/ | head            # a dot-directory: a non-recursive ls of the parent hides it
 ```
 
+**See the integer graph, not just the count** (§8.8.3): `TORCH_LOGS=graph_code` prints the two graphs —
+the first with `add = l_x_ + 1`, the second with `L_k_: "Sym(s16)"`.
+
 ---
 
 ## Provenance of every figure
 
 Every number in this chapter, with its source. "notes §n" is
-[`notes/recipe-residency-and-memory-budget.md`](notes/recipe-residency-and-memory-budget.md); `file:line`
-is a source read of the installed bridge (`habana_frameworks`, 1.24.2) or of the clean 1.16 Synapse
-extraction (base `6de1f66`), flagged as 1.16 where it matters.
+[`notes/recipe-residency-and-memory-budget.md`](notes/recipe-residency-and-memory-budget.md), whose
+numbering this table tracks; "notes *Provenance*" is that file's unnumbered preamble. `file:line` is a
+source read of the installed bridge (`habana_frameworks`, 1.24.2 — the tree the running process loads)
+or of the clean 1.16 Synapse extraction (base `6de1f66`), flagged as 1.16 where it matters. Rows whose
+source is another chapter are cross-references, not restatements.
 
 | figure | source |
 |---|---|
-| A–D table: graphs / breaks / ops / recipes (1,2,2,2) | MEASURED — notes §7 |
-| recipe filename `_<libs_env_hash>_syn1.24.2.79e284b` | MEASURED — notes §7 |
+| A–D table: graphs / breaks / ops / recipes — A 1/0/1/1, B 1/0/3/1, C 2/1/3/2, D 1/0/3/1 | MEASURED — notes §7 |
+| recipe filename `<graph hash>_<libs_env_hash>_syn1.24.2.79e284b`; middle field the constant `_a16fb581eee_` | MEASURED — notes §8.1; the three arms below |
+| `hash64_file_content()` returns 0 for every file (shadowed `hashRes`) | source read — `cache_version.cpp:107,123,126-127,138` |
+| `check_env_fo_hashing()` never matches (space-padded needles vs `NAME=VALUE`) | source read — `cache_version.cpp:141-172,150,165,170,208-215` |
+| `libs_env_hash()` is `hash_combine` over 0; colon-list branch unreachable (exit 134) | source read — `cache_version.cpp:174-222`, `:184-198` |
+| filename is the cache key; `PT_RECIPE_CACHE_IGNORE_VERSION` drops the suffix | source read — `hpu_recipe_cache.cpp:294-308,317,299-301` |
+| three arms (stock lib / one byte appended / `DISABLE_TENSORS_PINNING=true`) → one identical filename | MEASURED — notes §8.1 |
+| two recipes, same filename and size, different md5 (`cf1e1816…` vs `552cbe27…`) | MEASURED — notes §8 |
 | 8 recipes compiled+launched → 0.0 MiB device change | MEASURED — notes §2b |
 | 24 recipes: device 96889.7 → 96889.7 MiB; host RSS 2104.6 → 2215.2 MiB (+110.6); ~4.6 MiB/recipe | MEASURED — notes §2c |
 | disk 0 → 0.4 MiB / 9 files | MEASURED — notes §2c |
-| `max_dir_size_mb` default 1024 | source read — notes §2c (bridge config) |
-| card HBM 97376 MiB = 95.09 GiB (Synapse) / 96895.2 MiB = 94.62 GiB (torch) | MEASURED — notes §2b |
+| `PT_HPU_RECIPE_CACHE_CONFIG` fields `path, delete_on_init, max_size_MB, allow_NFS`; default 1024 | source read — `bridge_config.py:71-86`; notes §2c |
+| card HBM 98304 MiB (driver) / 97376 MiB = 95.09 GiB (Synapse) / 96895.2 MiB = 94.62 GiB (torch) / 768 MiB used at idle | MEASURED — notes §2b, re-run for this chapter with `hl-smi` and `torch.hpu.mem_get_info()` on 2026-11-13 |
+| `torch.hpu.mem_get_info()` returns **bytes** (101601996800 = 96895.2 MiB) | MEASURED — re-run for this chapter |
+| idle baseline ~768 MiB | MEASURED — `01-basics.md:394` |
 | global window 192 MiB = 3 × 64; arc window 127.5 MiB (`0x7F80000`); ~161 MiB remainder; ~481 MiB total | MEASURED — notes §2b |
-| chunk sizes `0x1F8000`, `0x300000`; **64** chunks | MEASURED — notes §2 |
+| chunk sizes `0x1F8000`, `0x300000`; **64** chunks, **global window only** | MEASURED + INFERRED — notes §2, §2a |
+| 64 × `0x1F8000` = `0x7E00000` = 126 MiB against `0x7F80000`; 1.5 MiB never handed out | MEASURED arithmetic — notes §2a |
+| `round_down(chunkSize, ALIGN = 128)`; `m_size = size - (m_addr - addr)` | source read, 1.16 — `arc_hbm_mem_mgr.cpp:44-48`, `arc_hbm_mem_mgr.hpp:36`, `hbm_global_mem_mgr.cpp:24-27` |
 | `NUM_BUFF = 16` (1.16) | source read, 1.16 — `nbuff_allocator.hpp:28`; chunk `size / NUM_BUFF` at `hbm_global_mem_mgr.cpp:39-43` |
 | `HBM_GLOBAL_MEM_SIZE_MEGAS` default 64 | source read, 1.16 — `habana_global_conf.cpp:594-598` |
 | key ignored without `ENABLE_EXPERIMENTAL_FLAGS`; 256→768 MiB, total 96319.2 (−576); 1024→3072 MiB, total 91359.2 (−5536 ≠ 2880) | MEASURED — notes §2 |
@@ -950,9 +995,12 @@ extraction (base `6de1f66`), flagged as 1.16 where it matters.
 | `hbmSharedSize = 32 MiB` (1.16) | source read, 1.16 — `device_scal.hpp:126` |
 | 103.6 ms first call (size-independent at 1 K and 1 M elements); ~0.5–0.7 ms steady state | MEASURED — notes §5 |
 | ~50 ms dynamo + ~52 ms bridge ≈ 100 ms per new recipe; ~28 hours for a million | MEASURED — notes §2c |
-| eager 29 ms vs compiled 0.356 ms = **400×** | MEASURED — [§6.6.1](06-fast-iteration.md) |
-| `HABANA_PGM_LRU_MAX` 100 000 eager / 30 000 lazy; 90 % host threshold; 512 MB chunks | source read — notes §1 (bridge) |
-| `RECIPE_CACHE_SIZE` 500 MB / `RECIPE_CACHE_BLOCK_SIZE` 128 KB (Gaudi1 only) | source read, 1.16 — `habana_global_conf.cpp:1121-1133`, `device_recipe_addresses_generator.cpp:142-167,219-260` |
+| eager 29 ms vs compiled 0.356 ms = **81×** | MEASURED — [§6.6.1](06-fast-iteration.md) |
+| one eager `y.copy_(x)` → 768 TPC kernel events, zero DMA events | MEASURED — `02-regions.md:1198` |
+| `HABANA_PGM_LRU_MAX` 100 000 eager / 30 000 lazy | source read — notes §1 (bridge) |
+| host threshold: gcfg default 0 disables the check; the bridge substitutes 90 at the first dynamic bucket | source read — `scripts/env_flags.yaml:428-430`, `misc_utils.cpp:32-34`, `hpu_recipe_cache.h:130` |
+| eviction in 512 MiB chunks (`512LL * 1024 * 1024`) | source read — `hpu_habana_launch_op_pt.cpp:4211` |
+| `RECIPE_CACHE_SIZE` 500 MiB / `RECIPE_CACHE_BLOCK_SIZE` 128 KiB; device HBM; Gaudi1 only | source read, 1.16 — `habana_global_conf.cpp:1121-1133`, `device_recipe_addresses_generator.cpp:139-160,219-260`, `recipe_cache_manager.cpp:40` |
 | SCAL/Gaudi2 references the recipe cache nowhere; `RECIPE_CACHE_SIZE=262144` changes nothing | source read + MEASURED — notes §4 |
 | `synGraphCompile` allocates no device memory; `madvise(MADV_DONTFORK)` rationale | source read, 1.16 — `recipe_allocator.cpp:15-30`, `memory_allocator_utils.cpp:12-40` |
 | `synRecipeDestroy` frees host memory only | source read, 1.16 — `recipe_handle_impl.cpp:18-24` |
@@ -968,11 +1016,26 @@ extraction (base `6de1f66`), flagged as 1.16 where it matters.
 | placement written by the pass; mismatch raises | source read — `passes.py:1592-1596` |
 | one fused submodule → `get_callable_recipe`; `subgraph_cnt`; "Number of subgraphs created" | source read — `cluster_compiler.py:132,142-145,158` |
 | `get_callable_recipe` docstring: "…or just returns unchanged module to run it eagerly…" | source read — `recipe_compiler.py:361-372` |
+| the bridge's dynamic path: `get_dynamic_config_value()` reads `assume_static_by_default`; the DS/SIF gate; `force_static_compile` short-circuits both | source read — `passes.py:543-556` (read at `:554`), `:2260,2282`, `:523,2278` |
 | `hl_logger` levels inverted `TRACE=0 … OFF=6` | source read, 1.16 — `hllog_core.hpp:27-33` |
-| patched tree's `synNativeComputeGraph*` (24 occurrences) absent from clean tree and from 1.24.2 symbols | MEASURED — notes §0 |
+| patched tree's `synNativeComputeGraph*`: 210 occurrences in 14 files, 29 identifiers; absent from the clean tree and from 1.24.2 symbols | MEASURED — notes *Provenance*, trap 1 |
+| patched tree: 80 modified files (+4211/−863), 17 untracked | MEASURED — notes *Provenance* |
 | `synDeviceGetMemoryInfo()` returns `free = 0`; measure the total | MEASURED — notes §2b |
 | 145 public entry points / 155 exported `syn*` symbols; no residency API | source read + MEASURED — notes §3 |
+| DSD: exact M, N **and K** down to 1; `synStatus 35` outside `[min,max]`; static control wrote 262,144 elements at M=64 | MEASURED — notes §9.1 |
+| `m_mappedSizePatch` 263,264 B (87 %) dynamic vs 208 B (0.07 %) static; 10/112 blobs patched | MEASURED — notes §9.1 |
+| DSD is a kernel-library declaration: `supportsDynamicShapes`, non-zero `nameHash`, real `GetShapeInference` | MEASURED — notes §9.4 |
+| `ENABLE_WIDE_BUCKET` + experimental flags writes 138 elements at N=1 | MEASURED — notes §9.4 |
+| workspace 8448 B dynamic vs 256 B static | MEASURED — notes §9.4 |
+| a user-section intermediate → `Failed to perform DSD SIF patching` / status 35 | MEASURED — notes §9.3 |
+| 0-d `int64` tensor, `n = 1…10`: 1 graph, 1 recipe; signature `L_k_: "i64[][]hpu:0"`; 142 ms first, 0.3–0.5 ms after | MEASURED — §8.13's `ints.py` |
+| 0-d tensor across processes: 151.3 ms / 1 recipe, then 83.7 ms / **0 new recipes** at `n = 42` | MEASURED — §8.13's `ints.py` |
+| Python int: 2 recipes at `dynamic=None` (flat to 10 values) and at `dynamic=True`; 3 for `dynamic=False` and for `specialize_int=True` | MEASURED — §8.13's `ints.py` |
+| Python-int mechanism: first graph `add = l_x_ + 1`, second `L_k_: "Sym(s16)"` | MEASURED — `TORCH_LOGS=graph_code` |
+| cold process at `n = 42` after a Python int: 186 ms, 2 recipes | MEASURED — §8.13's `ints.py` |
+| structural int `x[:n] * 2`: 3 recipes for `n = 1,2,3`, 4 for `n = 1…7` | MEASURED — §8.13's `ints.py` |
 | "one recipe per maximal contiguous run of `hpu_cluster` nodes"; 24/24 arms | MEASURED — [§2.4](02-regions.md) (cross-referenced, not restated) |
 | specialisation count as a first-class metric; thrash signature | [§2.5.3](02-regions.md) (cross-referenced) |
 | O(layers × constants × buckets) is expected | [§1.4.3](01-basics.md) (cross-referenced) |
+| "`dynamic=True` is forced to static compilation" (ASSUMED, vendor) | [§1.4.1](01-basics.md) (cross-referenced) |
 | `DUMP_POST_GRAPHS` reading; the dot-directory trap | [§2.10](02-regions.md) (cross-referenced) |
