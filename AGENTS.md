@@ -28,6 +28,8 @@ etc.
   - Tensor data must stay on the HPU once it's there, absolutely no device to host transfers
     mid computation, not even a little bit.
   - Graph breaks and syncs are the big cost to avoid.
+- The TLDR chapter is not a place for concrete numbers that need sourcing / provenance. Specifics
+go in the other chapters.
 
-As changes are made to the manual, the tldr file should be kept up to date. It should stay as compact as it reasonably
-can be, never more than 10,000 tokens.
+As changes are made to the manual, the tldr file should be kept up to date. It
+should stay as compact as it reasonably can be, never more than 10,000 tokens.
