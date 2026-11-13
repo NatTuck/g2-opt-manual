@@ -146,7 +146,7 @@ monitor wait; same-engine elementwise → fused, usually a win) — **(4)** at *
 
 ---
 
-## Writing a TPC kernel → *ch 4*
+## Writing a TPC kernel → *ch 4 (the model), ch 9 (the workflow)*
 
 - **The cost currency is the VLIW bundle, not the instruction** — the device retires ~one bundle per
   cycle (~0.556 ns at 1.8 GHz); one vector slot per bundle, so the floor is the vector-op count. Count
@@ -165,6 +165,15 @@ monitor wait; same-engine elementwise → fused, usually a win) — **(4)** at *
   local instead of `ld_g`/`st_g` global), and an instruction count cannot tell a live op from a
   dead-code-eliminated one. Compare `.text`, never `.o` md5. Per-launch overhead grows sublinearly with
   bundle count, so small-shape microbenchmarks mostly measure the residue, not the kernel.
+- **Shipping a kernel: two artifacts, and the error message is the least informative part.** The device
+  ELF is embedded as bytes by `objcopy -I binary`, so the glue's `extern` symbol is derived from the
+  *input filename* — get it wrong and the link still **succeeds**, failing only at run time.
+  `GC_KERNEL_PATH` is a colon list and **both** entries are load-bearing: the stock
+  `libtpc_kernels.so` is needed for **any** `torch.compile` region, including one with no custom op in
+  it. An **enabled** disk recipe cache cannot coexist with that list — the bridge's own env-flag
+  validation rejects it as "not a regular file" — and that cache's key is a **constant**, so a rebuilt
+  kernel is served the *stale* recipe. Gate bit-exactly on a value that is not 0 or 1, and prove the
+  gate fails. → *ch 9*
 
 ---
 
