@@ -586,11 +586,13 @@ obvious suspect (UNKNOWN #8).
    cross-process reuse cannot be measured at all. Per-arm counts taken with `true` are fine for
    *within-process* counting and invalid for anything cross-process. The fourth field, NFS, makes the
    second and third be ignored entirely.
-2. **The recipe filename does not determine the bytes.** Two recipes with the same filename *and* the
-   same size had different md5s (`cf1e1816…` vs `552cbe27…`). The name keys graph **structure**, not
-   content. Sharing a directory was measured safe for the integer case — the 0-d operand is an input
-   *slot* bound at launch (§8.8.2) — but "same filename" is not "same recipe", and §8.7.3's whole hazard
-   is that the name is the only thing the cache checks.
+2. **The recipe filename does not determine the bytes.** The same graph compiled into two fresh cache
+   directories produced the same filename at the same size — 26,270 B — and **different md5s**
+   (`1ca32f92…` vs `a76dd872…`) (**MEASURED**: `md5sum` over the two `.recipe` files; reproduce with two
+   runs of §8.13's `ints.py`). The name keys graph **structure**, not content. Sharing a directory was
+   measured safe for the integer case — the 0-d operand is an input *slot* bound at launch (§8.8.2) —
+   but "same filename" is not "same recipe", and §8.7.3's whole hazard is that the name is the only
+   thing the cache checks.
 
 ---
 
@@ -976,7 +978,7 @@ source is another chapter are cross-references, not restatements.
 | `libs_env_hash()` is `hash_combine` over 0; colon-list branch unreachable (exit 134) | source read — `cache_version.cpp:174-222`, `:184-198` |
 | filename is the cache key; `PT_RECIPE_CACHE_IGNORE_VERSION` drops the suffix | source read — `hpu_recipe_cache.cpp:294-308,317,299-301` |
 | three arms (stock lib / one byte appended / `DISABLE_TENSORS_PINNING=true`) → one identical filename | MEASURED — notes §8.1 |
-| two recipes, same filename and size, different md5 (`cf1e1816…` vs `552cbe27…`) | MEASURED — notes §8 |
+| same filename and size (26,270 B), different md5 (`1ca32f92…` vs `a76dd872…`) | MEASURED — `md5sum` over two fresh runs' `.recipe` files (2026-11-13) |
 | 8 recipes compiled+launched → 0.0 MiB device change | MEASURED — notes §2b |
 | 24 recipes: device 96889.7 → 96889.7 MiB; host RSS 2104.6 → 2215.2 MiB (+110.6); ~4.6 MiB/recipe | MEASURED — notes §2c |
 | disk 0 → 0.4 MiB / 9 files | MEASURED — notes §2c |
