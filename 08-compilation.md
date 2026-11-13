@@ -119,7 +119,7 @@ also changes the *unit of compilation*, and everything downstream is counted per
 ## 8.3 The backend is AOT Autograd with a partitioner
 
 `hpu_backend` is registered as a dynamo backend and is a thin wrapper around `aot_autograd`
-(**source read**, `habana_frameworks/torch/dynamo/compile_backend/backends.py`):
+(**source read**, `habana_frameworks/torch/dynamo/compile_backend/backends.py:52-79`):
 
 ```python
 @register_backend
@@ -161,7 +161,7 @@ def hpu_partition(joint_module, _joint_inputs, *, num_fwd_outputs, static_lifeti
 
 The *recipe* partitioner — the one that produces clusterable runs — is a capability-based partitioner
 over the forward module, and its capability test is the placement metadata (**source read**,
-`partitioner.py`):
+`partitioner.py:27-38`):
 
 ```python
 class HabanaClusterOperatorSupport(OperatorSupport):              # :27
@@ -193,7 +193,7 @@ still becomes a recipe of its own — which is what makes the recipe count behav
 ### 8.3.2 From fused submodule to compiled recipe
 
 After partitioning, each fused submodule is replaced by a compiled callable (**source read**,
-`cluster_compiler.py`):
+`cluster_compiler.py:132-145`):
 
 ```python
 syngraph_module = get_callable_recipe(jit_ir, submod, self.ctx.graph_name, ...)   # :132
@@ -284,7 +284,9 @@ is wrong. "There is a recipe cache in HBM holding my compiled graphs" is also wr
 **Every launch downloads the program again.** `RecipeLauncher::launch()` calls `prepareForDownload()`
 then `downloadToDev()` unconditionally — there is no "already resident" branch — and `downloadToDev`
 runs `memcpyToMapped` → patch → **`pdmaDownload`** (mapped host → HBM, by CpDma commands) → fence wait →
-`scalEnqueue` (**source read**, 1.16 `src/runtime/scal/common/recipe_launcher/recipe_launcher.cpp`).
+`scalEnqueue` (**source read**, 1.16 `src/runtime/scal/common/recipe_launcher/recipe_launcher.cpp`,
+quoted in [notes §1](notes/recipe-residency-and-memory-budget.md); that file is one of the 80 the patched
+tree modifies, so no clean line number can be quoted for it).
 
 **The destination is a rotating ring, not a cache.** `ArcHbmMemMgr` and `HbmGlblMemMgr` derive from
 `NBuffAllocator`, which splits a fixed window into `NUM_BUFF` chunks and hands out the next one,
@@ -294,7 +296,8 @@ long-SO — *wait until this slot is free on the device*. The 1.16 source has `N
 (`hbm_global_mem_mgr.cpp:39-43`); on 1.24.2 the measured count is **64** (§8.6).
 
 The vendor states the design and its limitation in the header itself (**source read**, 1.16
-`arc_hbm_mem_mgr.hpp`, repeated verbatim in `hbm_global_mem_mgr.hpp`):
+`arc_hbm_mem_mgr.hpp:9,14`, repeated at `hbm_global_mem_mgr.hpp:8,13` — both headers are unmodified in
+the patched tree, so these are clean 1.16 lines):
 
 > This class is used to allocate memory of the Arc-HBM for running a recipe. It is currently
 > implemented in a very simple way, **assuming no caching**. It splits the given memory into chunks
@@ -1028,7 +1031,7 @@ whose source is another chapter are cross-references, not restatements.
 | patched tree's `synNativeComputeGraph*`: 210 occurrences in 14 files, 29 identifiers; absent from the clean tree and from 1.24.2 symbols | MEASURED — notes *Provenance*, trap 1 |
 | patched tree: 80 modified files (+4211/−863), 17 untracked | MEASURED — notes *Provenance* |
 | `synDeviceGetMemoryInfo()` returns `free = 0`; measure the total | MEASURED — notes §2b |
-| 145 public entry points / 155 exported `syn*` symbols; no residency API | source read + MEASURED — notes §3 |
+| 145 public entry points in `synapse/include/synapse_api.h` / 155 exported `syn*` symbols; no residency API | source read + MEASURED — notes §3 |
 | DSD: exact M, N **and K** down to 1; `synStatus 35` outside `[min,max]`; static control wrote 262,144 elements at M=64 | MEASURED — notes §9.1 |
 | `m_mappedSizePatch` 263,264 B (87 %) dynamic vs 208 B (0.07 %) static; 10/112 blobs patched | MEASURED — notes §9.1 |
 | DSD is a kernel-library declaration: `supportsDynamicShapes`, non-zero `nameHash`, real `GetShapeInference` | MEASURED — notes §9.4 |
