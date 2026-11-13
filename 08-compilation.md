@@ -747,8 +747,8 @@ recipe against static-per-shape before recommending it.
   correct: at N=1 it wrote 138 elements and returned success. **Declare `min=1` instead. Never relax the
   bound.**
 
-And the reason the dynamic path is not something you can reach from a caller at all: it is a
-**kernel-library declaration**, not an option. `GetKernelGuids` must set `supportsDynamicShapes = 1`
+**Why you cannot reach the dynamic path from a caller at all:** it is a **kernel-library
+declaration**, not an option. `GetKernelGuids` must set `supportsDynamicShapes = 1`
 **and** a non-zero `nameHash.hashValue` (the SIF id), and `GetShapeInference` must actually resize the
 output — all three mandatory. The upstream `add1` kernel has none of them, so "make add1
 shape-parametric" means **editing the kernel library**.
