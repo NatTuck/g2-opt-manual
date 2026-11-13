@@ -825,13 +825,17 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 
 | # | UNKNOWN | status | what would settle it |
 |---|---|---|---|
-| 1 | **Whether `NUM_BUFF` is 64 in 1.24.2** | **INFERRED** — 64 is measured three independent ways from the logged window and chunk sizes (192/3, 96/1.5, 48/0.75 MiB), and 1.16 is `16`; the constant itself was not read in a 1.24.2 source drop | a 1.24.2 source drop, or disassembly of `getChunkSize` |
-| 2 | **What sizes the *arc* window (127.5 MiB)** | **UNKNOWN** — unaffected by `HBM_GLOBAL_MEM_SIZE_MEGAS`; no key found that moves it | a config sweep, or a source drop |
+| 1 | **Whether `NUM_BUFF` is 64 in 1.24.2** | **INFERRED** — 64 is one method at three settings of `HBM_GLOBAL_MEM_SIZE_MEGAS` on the **global** window (192/3, 768/12, 3072/48 MiB all give 64); 1.16 is `16`; the constant itself was not read in a 1.24.2 source drop | a 1.24.2 source drop, or disassembly of `getChunkSize` |
+| 2 | **What sizes the *arc* window (127.5 MiB), and where its 1.5 MiB goes** | **UNKNOWN** — unaffected by `HBM_GLOBAL_MEM_SIZE_MEGAS`; no key found that moves it; 64 × `0x1F8000` = 126 MiB against a 127.5 MiB window, and the 1.16 terms that could explain the shortfall (`round_down(chunkSize, ALIGN)`; `m_size = size - (m_addr - addr)`) are not distinguishable from the log, which prints the *given* size in both fields | a 1.24.2 source drop, or a log line that prints `m_size` |
 | 3 | **Whether the per-stream and total split of the logged sizes is exactly `Size × 3`** | **INFERRED** from the source's `Size × MaxNumOfComputeStreams` and the measured 3× scaling of the global window; not measured with a single compute stream | one probe restricted to one compute stream |
 | 4 | **`synUpdateMemoryConsumption` (new in 1.24.2)** | **UNKNOWN** — absent from the 1.16 source; could be the missing per-recipe attribution hook | a 1.24.2 header, or a probe that calls it and reads the device total |
 | 5 | **Steady-state launch cost for a multi-MB program** | **UNKNOWN** — every measured program is small enough that the fixed path dominates (103.6 ms first call, ~0.5–0.7 ms steady state, size-independent at 1 K vs 1 M elements) | one probe with a program large enough for PDMA bytes to show |
 | 6 | **Whether MME descriptors have their own device allocation** | **INFERRED** that they ride the ECB/dynamic-blob path into ARC HBM: the only program-data registrations in 1.16 are TPC kernels, the TPC printf buffer and H2D/static tensors | a 1.24.2 source read, or a launch of an MME-heavy graph with the device total sampled before and after |
 | 7 | **Whether `DeviceGaudi::releaseRecipeMemory` is reached at all** | **UNKNOWN** — the 1.16 tree has its definition and no caller; either it is reached through an interface not in that tree, or the Gaudi1 path leaks per-recipe memory until device teardown | a 1.24.2 source read, or a compile/launch/destroy loop watching the device total |
+| 8 | **Why the disk recipe cache did not hit across four identical runs** (§8.7.3) | **UNKNOWN** — four runs recompiled and rewrote the `.recipe` (sizes 3366 B, 3144 B); a per-process field inside the serialised `RecipeArgumentSpec` is the obvious suspect. This is the difference between "the stale-recipe hazard is live" and "the disk cache never serves anything on this configuration" | one run with the serialised spec compared byte for byte, or a `strings` diff of two runs' `.recipe` files |
+| 9 | **The bucketing rule for a structural `int`** (§8.8.4) | **UNKNOWN** — `x[:n] * 2` gave 3 recipes for `n = 1,2,3` and 4 for `n = 1…7`, with `n = 4,5,6` reusing `n = 3`; growth is real and not one-per-value | a sweep over a wide contiguous value range, recording which recipe each value lands on |
+| 10 | **Whether a dynamic recipe is re-tiled, or only re-parameterised at the compiled maximum** (§8.9) | **UNKNOWN** — and it is the question that decides usability: a 64×64×64 GEMM run at a 512×512×512 tiling would be exact and slow | per-size efficiency of a dynamic recipe against static-per-shape |
+| 11 | **Whether an *unbounded* dynamic maximum is possible** | **expected no** — the compiler must size descriptors, the index space, data chunks and the workspace for the largest shape (8448 B dynamic against 256 B static) | a source read of the descriptor sizing, or a probe that omits `max` |
 
 ---
 
@@ -849,15 +853,26 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 5. **Every launch downloads the program again**, into a rotating chunk of a fixed per-stream window —
    the vendor's own "assuming no caching … to avoid the pdma". Past one chunk the launch throws; it
    does not spill.
-6. **Budget ~0.5 GB of the 96 GB for the runtime, then stop subtracting per-recipe terms.** 24 recipes
-   compiled and launched moved free HBM by **0.0 MiB**; host RSS moved ~4.6 MiB per recipe.
+6. **Budget `97376 MiB − 481 MiB − workspace − weights`, then stop subtracting per-recipe terms.** 24
+   recipes compiled and launched moved free HBM by **0.0 MiB**; host RSS moved ~4.6 MiB per recipe.
+   Three totals are in circulation (98304 driver / 97376 Synapse / 96895.2 torch) and the 768 MiB idle
+   baseline is a *usage*, not a fourth one.
 7. **The graph count costs host memory and disk, not device memory.** If HBM grows with the graph
    count, look at sections, the workspace's max-sizing, or retained tensors — not at recipes.
 8. **`RECIPE_CACHE_SIZE` is a Gaudi1 key.** On Gaudi 2 there is no device recipe cache; there is a
    rotating ring, and the cache that evicts is the bridge's **host** LRU (eviction ⇒ recompile).
-9. **Only compiled is a target.** Eager is a reference point (**400×** off, [§6.6.1](06-fast-iteration.md));
-   lazy is deprecated; eager *placement* is neither.
+9. **Only compiled is a target.** Eager is a reference point (**81×** off, [§6.6.1](06-fast-iteration.md))
+   and compiles one one-node recipe per op; lazy is legacy, not deprecated; eager *placement* is
+   neither.
 10. **`hl_logger` levels are inverted.** `LOG_LEVEL_ALL=0` is loudest, `=5` is near-silence.
+11. **The disk cache's key cannot see your build.** The filename's middle field is the constant
+    `_a16fb581eee_`: `libs_env_hash()` hashes every file to zero and never matches an environment name,
+    so a kernel rebuild or a flag change does not miss the cache. Keep one cache directory per
+    *(build, configuration)* pair, or use `delete_on_init=true`.
+12. **An `int` can be data or structure.** As a 0-d tensor it is a graph *input* — one recipe across
+    values and across processes. As a Python int it is two recipes in a process (one per value if you
+    force `dynamic=False`), and one per **cold process** — which is the unbounded case. A structural int
+    (`x[:n]`) cannot be escaped at all.
 
 ---
 
