@@ -712,7 +712,7 @@ limit is not, and we have never measured the bottom layer at all.
 
 | constraint | layer | status |
 |---|---|---|
-| traced frames are guarded; a break splits a frame into graphs | **dynamo** | **source read** — dynamo's own machinery, exercised by §8.2's table |
+| traced frames are guarded; a break splits a frame into graphs | **dynamo** | **MEASURED** — §8.2's table, and `TORCH_LOGS=graph_code` prints each graph as it is produced |
 | each op still compiles to its own one-node recipe in eager mode | **dynamo → bridge** | **MEASURED** — 768 TPC kernel events for one eager `y.copy_(x)` ([§2.4](02-regions.md)) |
 | the default is **static** compilation: a new shape is a new recipe | **bridge** | **MEASURED** at the recipe level — §8.2's table, notes §7 |
 | "`dynamic=True` is turned into static compilation" | **bridge** | **ASSUMED (vendor)** — the standard account, not something we instrumented ([§1.4.1](01-basics.md)) |
@@ -769,7 +769,8 @@ expert kernel at **29 ms eager against 0.356 ms compiled** ([§6.6.1](06-fast-it
 number is not a lower bound on the compiled number and cannot stand in for it. **And eager is not
 cheaper for anything this chapter measures:** one eager op is one one-node recipe, so N ops is N
 recipes, N submissions and N program downloads (§8.5) — the limit case of the residency story, not an
-escape from it.
+escape from it. (**MEASURED**, [§2.4](02-regions.md): one eager `y.copy_(x)` produced **768** TPC kernel
+events and zero DMA events.)
 
 **Why lazy is legacy rather than deprecated:** the evidence proves **not the default**, not a vendor
 deprecation. `PT_HPU_LAZY_MODE` is declared `default: 0` (**source read**,
