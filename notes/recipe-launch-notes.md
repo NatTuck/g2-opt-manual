@@ -9,8 +9,8 @@ bridge source at the exact version installed here.
   Paths below are relative to that tree.
 - Synapse API: `/usr/include/habanalabs/synapse_api.h` and `synapse_api_types.h` as installed.
 - Runtime: driver `1.24.2-52a555d`, torch `2.13.0a0+git2469d18`, `habana-torch-plugin 1.24.2`.
-- Experiment: `experiments/01_one_region.py`, artefacts under
-  `/tmp/outer-galliform-root/experiments/01/`.
+- Experiment: `experiments/01_one_region.py` (run it with `experiments/run.sh`, which sets the cache
+  contract and reports counts).
 
 **Basis tags.** **MEASURED** (ran here, artefact named) · **source read** (a named file and line) ·
 **INFERRED** (derivation stated) · **UNKNOWN**.
@@ -285,11 +285,14 @@ optional sync + trace
 |---|---|---|---|---|
 | dynamo | FX graph + guards | code object + guard values | process | ~50 ms per (function × shape) trace; **no cross-process cache** |
 | **bridge** | serialised recipe + metadata | `RecipeArgumentSpec::hashCode()` + `libs_env_hash` + driver | **disk** | works; 0 new recipes on a same-config reboot |
-| Synapse (internal) | compiled binary | internal `GCFG_RECIPE_CACHE_*` | disk | configured by the same env var, opaque |
+| Synapse (internal) | a recipe's **static part**, in **device HBM** | internal `GCFG_RECIPE_CACHE_*` (`RECIPE_CACHE_SIZE` / `_BLOCK_SIZE`) — a **different cache** from `PT_HPU_RECIPE_CACHE_CONFIG` | device acquire → release | Gaudi1/qman path only; not on the Gaudi2/SCAL path at all — see [the residency note](recipe-residency-and-memory-budget.md) §4 |
 | runtime | loaded recipe handle | handle in the bridge's LRU | process | 0.5–0.7 ms per launch |
 
-**The one layer with no cross-process cache is dynamo's.** Everything below it is durable and
-content-keyed; everything above it is process-local.
+**The one layer with no cross-process cache is dynamo's.** Everything below it is durable; **none of
+it is content-keyed** — the key's library and environment component is dead code (the shadowed
+`hashRes` in `cache_version.cpp`; see [§8.3 of the residency note](recipe-residency-and-memory-budget.md)),
+so a rebuilt kernel or a changed flag is **not** detected and a stale recipe can be served. Everything
+above dynamo is process-local.
 
 ---
 

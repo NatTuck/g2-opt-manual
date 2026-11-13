@@ -17,7 +17,11 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 |---|---|
 | **region** | one dynamo-traced FX graph from a `torch.compile` region |
 | **node** | one op in that graph, carrying a **placement** (`hpu_cluster` or `eager`) |
-| **recipe** | one compiled binary — **one per maximal contiguous run of clusterable nodes** |
+| **eager placement** | an op the partitioner will not cluster; it runs outside every recipe. **Not** the same thing as eager *mode*. |
+| **lazy mode** | `PT_HPU_LAZY_MODE=1` — the legacy execution model: ops accumulate into an implicit graph closed at a mark-step. **Legacy; not the default; not a viable target.** |
+| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued; **each op still compiles to its own one-node recipe** (there is no region recipe). A reference point, never an option: N one-node recipes is N submissions and N program downloads. → *ch 6* |
+| **compiled mode** | `torch.compile(fn, backend="hpu_backend")` — **the only supported target.** Modern vLLM Gaudi is `torch.compile`-only. |
+| **recipe** | one compiled binary — **one per maximal contiguous run of clusterable nodes**. The region is partitioned *before* it becomes a recipe, so a `torch.compile` boundary is **not** a recipe boundary. → *ch 1 §1.3, ch 2 §2.2* |
 | **submission** | one Synapse `Launch` — the only unit the scheduler co-schedules *within* |
 | **engine** | TPC (24 VLIW cores) · MME (4 matmul) · DMA (8 tids = 4 cores × 2 lanes, 5 carrying HBM↔SRAM traffic) — read the dump's `engine` field; **never infer from an op name** |
 | **bundle** | a VLIW issue group of ≤4 slots inside one TPC — **the TPC cost unit**; unrelated to a dump's `bundle_index` |
@@ -27,12 +31,21 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 An `eager`-placed node runs **outside** every recipe, splits the recipe run, and emits no
 `LaunchRecipe` — a recipe/handle count is not a submission count.
 
+**The default is non-lazy.** The shipped bridge disables autoload only when `PT_HPU_LAZY_MODE=1`, and
+the vendor comment claiming "the default mode is lazy" is **stale** — an instance of the "stale claim
+to watch for" pattern below. The citations and the layer analysis are in *ch 8*.
+
 ---
 
 ## The five facts that change how you write code
 
-1. **Everything is statically compiled — there are no dynamic shapes.** A `dynamic=True` request is
-   forced to static compilation; every new shape is a new program. Design a fixed shape set. → *ch 1 §1.4*
+1. **Everything you can ship is statically compiled — there are no dynamic shapes.** A `dynamic=True`
+   request is forced to static compilation; every new shape is a new program. Design a fixed shape set.
+   → *ch 1 §1.4* — and read the layer: a **bridge** policy (**ASSUMED (vendor)** as a mechanism,
+   MEASURED as a recipe count), not a device limit. At the **Synapse** level a recipe can be declared
+   size-parametric (`DATA_TENSOR_DYNAMIC`, exact M/N/K down to 1, `synStatus 35` outside the declared
+   bound); nothing below Synapse is known — **hardware UNKNOWN**.
+   [Residency note](notes/recipe-residency-and-memory-budget.md) §9.
 2. **Integers specialize exactly like shapes.** A Python `int` in traced code joins the guard set; each
    new value compiles a new graph. There is no dynamic-argument escape hatch for ints; code computing an
    offset from a loop index is one program per iteration. → *ch 1 §1.4*
@@ -133,7 +146,7 @@ monitor wait; same-engine elementwise → fused, usually a win) — **(4)** at *
 
 ---
 
-## Writing a TPC kernel → *ch 4*
+## Writing a TPC kernel → *ch 4 (the model), ch 9 (the workflow)*
 
 - **The cost currency is the VLIW bundle, not the instruction** — the device retires ~one bundle per
   cycle (~0.556 ns at 1.8 GHz); one vector slot per bundle, so the floor is the vector-op count. Count
@@ -152,6 +165,15 @@ monitor wait; same-engine elementwise → fused, usually a win) — **(4)** at *
   local instead of `ld_g`/`st_g` global), and an instruction count cannot tell a live op from a
   dead-code-eliminated one. Compare `.text`, never `.o` md5. Per-launch overhead grows sublinearly with
   bundle count, so small-shape microbenchmarks mostly measure the residue, not the kernel.
+- **Shipping a kernel: two artifacts, and the error message is the least informative part.** The device
+  ELF is embedded as bytes by `objcopy -I binary`, so the glue's `extern` symbol is derived from the
+  *input filename* — get it wrong and the link still **succeeds**, failing only at run time.
+  `GC_KERNEL_PATH` is a colon list and **both** entries are load-bearing: the stock
+  `libtpc_kernels.so` is needed for **any** `torch.compile` region, including one with no custom op in
+  it. An **enabled** disk recipe cache cannot coexist with that list — the bridge's own env-flag
+  validation rejects it as "not a regular file" — and that cache's key is a **constant**, so a rebuilt
+  kernel is served the *stale* recipe. Gate bit-exactly on a value that is not 0 or 1, and prove the
+  gate fails. → *ch 9*
 
 ---
 
@@ -241,10 +263,10 @@ union, op count, launch count and busy fraction together → confirm in situ onc
   *arbitrary* under dynamo. Thread tensors as graph arguments. A bit-exact gate on self-consistent
   inputs cannot detect this: the required case class is **same shape, different data**. The negative
   control must fail on the pre-fix code.
-- Eager is not a cheaper version of the compiled program — it is a different one (measured ~400×); a gate
-  that never executes the compiled path cannot see that the compiled path exists. A confirmation that
-  comes back flat is a result: the span was not on the critical path, or the change moved cost into the
-  host term.
+- Eager is not a cheaper version of the compiled program — it is a different one (ch 6);
+  a gate that never executes the compiled path cannot see that the compiled path exists. A confirmation
+  that comes back flat is a result: the span was not on the critical path, or the change moved cost into
+  the host term.
 
 ---
 
