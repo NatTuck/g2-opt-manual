@@ -51,9 +51,9 @@ to watch for" pattern below. The citations and the layer analysis are in *ch 8*.
    recompiles to a graph that takes the int as a symbolic input and serves every later value, so the
    count is flat at **two** (it is one per value if you force `dynamic=False`, which our own
    benchmarking advice does). The unbounded case is a **cold process**, which re-bakes whatever value it
-   meets first. A **0-d tensor** removes the program count entirely — one recipe across values *and*
-   across processes (measured: 0 new recipes at an unseen value). Structural ints (`x[:n]`) cannot be
-   escaped and grow with distinct values. → *ch 1 §1.4, ch 8 §8.8*
+   meets first. A **0-d tensor** removes the program count entirely: one recipe across values *and*
+   across processes. Structural ints (`x[:n]`) cannot be escaped and grow with distinct values.
+   → *ch 1 §1.4, ch 8 §8.8*
 3. **The graph count multiplies: O(layers × constants × buckets) by construction, not by bug.** Check a
    large count against this arithmetic before treating it as a defect; a coalesced region spanning G
    layers still needs G graphs if it guards on per-layer ints. → *ch 1 §1.4, ch 2 §2.5*
