@@ -17,6 +17,10 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 |---|---|
 | **region** | one dynamo-traced FX graph from a `torch.compile` region |
 | **node** | one op in that graph, carrying a **placement** (`hpu_cluster` or `eager`) |
+| **eager placement** | an op the partitioner will not cluster; it runs outside every recipe. **Not** the same thing as eager *mode*. |
+| **lazy mode** | `PT_HPU_LAZY_MODE=1` — the legacy execution model: ops accumulate into an implicit graph closed at a mark-step. **Deprecated; not a target.** |
+| **eager mode** | `PT_HPU_LAZY_MODE=0` — ops execute as issued, with no recipe. A reference point, never an option (measured ~400×, ch 6). |
+| **compiled mode** | `torch.compile(fn, backend="hpu_backend")` — **the only supported target.** Modern vLLM Gaudi is `torch.compile`-only. |
 | **recipe** | one compiled binary — **one per maximal contiguous run of clusterable nodes** |
 | **submission** | one Synapse `Launch` — the only unit the scheduler co-schedules *within* |
 | **engine** | TPC (24 VLIW cores) · MME (4 matmul) · DMA (8 tids = 4 cores × 2 lanes, 5 carrying HBM↔SRAM traffic) — read the dump's `engine` field; **never infer from an op name** |
@@ -26,6 +30,14 @@ chapters. Workload-specific numbers are **[DSv4F]** (DeepSeek V4 Flash, TP4, one
 
 An `eager`-placed node runs **outside** every recipe, splits the recipe run, and emits no
 `LaunchRecipe` — a recipe/handle count is not a submission count.
+
+**"Eager" is overloaded and the two meanings are unrelated.** *Eager placement* is a property of a
+node inside a compiled region — it splits the recipe run. *Eager mode* is the deprecated execution
+model. **Lazy mode is deprecated**: modern vLLM Gaudi is `torch.compile`-only, and neither eager nor
+lazy is ever a performance proposal — both are reference points. (source read: the shipped bridge
+disables autoload *only* when `PT_HPU_LAZY_MODE=1`, i.e. the default is non-lazy; the comment in
+`bridge_config.py` claiming "the default mode is lazy" is **stale** — an instance of the
+"stale claim to watch for" pattern.)
 
 ---
 
@@ -46,6 +58,10 @@ An `eager`-placed node runs **outside** every recipe, splits the recipe run, and
    **submissions** (a region still compiles to several recipes if any node is not clusterable) and the
    **specialization count** (it does not fall while the int guards remain). Coalescing alone has measured
    *moved no operational count*. → *ch 2 §2.5*
+
+**A `torch.compile` boundary is not a recipe boundary.** The backend is
+`aot_autograd(partition_fn=hpu_partition)`: the region is partitioned first, and each maximal
+contiguous clusterable run becomes its own recipe. → *ch 4*
 
 ---
 
