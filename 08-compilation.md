@@ -5,9 +5,11 @@
 restated from the named artifact beside it, not from memory, and each carries the conditions it is
 valid under. The measured material is on the runtime this project executes on: Synapse `1.24.2-481`
 (build `79e284b`), driver `1.24.2-52a555d`, torch `2.13.0a0+git2469d18`, `habana-torch-plugin`
-`1.24.2`. The source reads are the installed bridge (`habana_frameworks`, 1.24.2) and — for Synapse
-internals — an old **1.16** snapshot (base commit `6de1f66`), which is flagged wherever it is the only
-evidence.
+`1.24.2`. The source reads are the bridge source tree at **1.24.2** — the version the running process
+loads; its `passes.py` is bit-identical to the installed `python_packages/habana_frameworks` copy — and,
+for Synapse
+internals, an old **1.16** snapshot (base commit `6de1f66`), which is flagged wherever it is the only
+evidence. Bridge paths are relative to that source root; Synapse paths to the 1.16 extraction root.
 
 **What this chapter is.** The layer *above* the device: what `@torch.compile` actually produces, how
 that reaches Synapse, what a recipe is, what a launch costs, and what any of it costs in memory. It
@@ -965,9 +967,10 @@ the first with `add = l_x_ + 1`, the second with `L_k_: "Sym(s16)"`.
 Every number in this chapter, with its source. "notes §n" is
 [`notes/recipe-residency-and-memory-budget.md`](notes/recipe-residency-and-memory-budget.md), whose
 numbering this table tracks; "notes *Provenance*" is that file's unnumbered preamble. `file:line` is a
-source read of the installed bridge (`habana_frameworks`, 1.24.2 — the tree the running process loads)
-or of the clean 1.16 Synapse extraction (base `6de1f66`), flagged as 1.16 where it matters. Rows whose
-source is another chapter are cross-references, not restatements.
+source read of the bridge source tree at 1.24.2 — the version the running process loads; Python paths
+are the installed `python_packages/habana_frameworks`, C++ paths are relative to the bridge source root
+— or of the clean 1.16 Synapse extraction (base `6de1f66`), flagged as 1.16 where it matters. Rows
+whose source is another chapter are cross-references, not restatements.
 
 | figure | source |
 |---|---|
