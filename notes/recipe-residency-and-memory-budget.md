@@ -635,8 +635,8 @@ Four findings:
 | a DSD recipe is exact inside its declared bound and rejects outside it | **Synapse** | **MEASURED** |
 | what we ship is one static recipe per shape | **bridge** | **MEASURED** at the recipe level (§7) |
 | "`dynamic=True` is turned into static compilation" | **bridge** | **ASSUMED (vendor)** — that is how `01-basics.md` §1.4.1 already tags it, and it is the right tag: it is the standard account, not something we instrumented |
-| the bridge *has* a dynamic path at all | **bridge** | **source read** — `get_dynamic_config_value()` reads dynamo's `dynamic=True` (`python_packages/habana_frameworks/torch/dynamo/compile_backend/passes.py:509-522`, the read is `:520`) and the DS/SIF path is gated on `optim_output_sif_ds` (`passes.py:2216-2222`). We have never seen it produce a dynamic recipe on the default path |
-| dynamo can emit symbolic graphs | **dynamo** | **source read** — it is `torch._dynamo.config.assume_static_by_default` that the bridge reads (`passes.py:520`) |
+| the bridge *has* a dynamic path at all | **bridge** | **source read** — `get_dynamic_config_value()` reads dynamo's `dynamic=True` (`python_packages/habana_frameworks/torch/dynamo/compile_backend/passes.py:543-556`, the read is `:554`) and the DS/SIF path is gated on `optim_output_sif_ds` (`passes.py:2260,2282`). We have never seen it produce a dynamic recipe on the default path |
+| dynamo can emit symbolic graphs | **dynamo** | **source read** — it is `torch._dynamo.config.assume_static_by_default` that the bridge reads (`passes.py:554`) |
 | the HPU itself | — | **UNKNOWN** — nothing here is below Synapse |
 
 **Read the row, not the headline.** "There are no dynamic shapes" is a **bridge** statement, tagged

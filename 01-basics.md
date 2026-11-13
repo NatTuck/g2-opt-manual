@@ -279,6 +279,13 @@ Every tensor shape is **baked into the compiled graph**. Asking for dynamic shap
 produce a shape-polymorphic graph — the request is **turned into static compilation**. So you
 cannot pass a dynamic slice bound or a dynamic shape and have one graph serve several cases.
 
+> **This is the *bridge's* behaviour, not the device's.** Measured below the bridge, Synapse compiles a
+> **size-parametric** recipe when the tensors are declared dynamic with a declared bound, and one such
+> recipe serves every size inside it (MME `M`, `N` and `K` all patchable). The constraint above is a
+> **policy** of the layer we ship, and the hardware is not implicated either way — nothing we have run
+> is below Synapse. Chapter 8 develops this;
+> [the residency note](notes/recipe-residency-and-memory-budget.md) §10 carries the measurements.
+
 **ASSUMED (vendor).** Stated here as the toolchain's behaviour; it is consistent with everything in
 §1.6–§1.9, and it is the standard account of this class of accelerator.
 
@@ -295,9 +302,15 @@ A Python `int` used inside traced code — a **layer index**, a **per-layer byte
 constant — becomes part of the compiled graph's **guard set**. Change the value, the guard fails,
 and **a new graph is compiled** — exactly as a new shape would.
 
-> **There is no dynamic-argument escape hatch for integers.** There is no "pass this int at
-> runtime" mode that keeps one graph. An `int` in traced code is a compile-time constant in the
-> same sense a shape is.
+> **There is an escape hatch, and it is not the spelling people reach for: carry the int as a tensor.**
+> An `int` in traced code is a compile-time constant in the same sense a shape is — but a **0-d tensor**
+> input is *data*, so the program count does not depend on the value at all: one recipe across values
+> **and across processes** (measured). What a Python int actually costs is **two** recipes per process,
+> not one per value: the first value is baked as a constant, the second recompiles to a graph that takes
+> the int as a symbolic input and serves every later value — unless you force `dynamic=False`, which
+> makes it one per value again. Structural uses (`x[:n]`, `x.reshape(n)`) cannot be escaped at all.
+> Chapter 8 §8.8 develops this;
+> [the residency note](notes/recipe-residency-and-memory-budget.md) §11 carries the measurements.
 
 **The consequence, stated as a rule:**
 
