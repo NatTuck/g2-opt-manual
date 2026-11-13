@@ -1,6 +1,6 @@
 # Gaudi 2 HPU Optimization Manual
 
-**Status: DRAFT.** Seven chapters are written and filled with measured material. Gaps are
+**Status: DRAFT.** Eight chapters are written and filled with measured material. Gaps are
 marked explicitly rather than left blank or guessed — each chapter carries its own
 **UNKNOWN register**, and chapter 3 also carries a **dead-end register**.
 
