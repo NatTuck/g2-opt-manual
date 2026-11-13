@@ -594,25 +594,113 @@ obvious suspect (UNKNOWN #8).
 
 ---
 
-## 8.8 Why a new shape or a new `int` is a new program
+## 8.8 Why a new shape or a new `int` is a new program — and where that stops
 
 The specialisation rule is stated once in [§1.4](01-basics.md) (static shapes, specialised integers)
 and its counting consequence in [§2.5.3](02-regions.md) (the specialisation count as a first-class
-metric). At the recipe level it has one extra edge that is easy to get backwards:
+metric). At the recipe level there are two edges that are easy to get backwards, and the second is where
+the manual's own summary has been wrong twice.
 
-- **A guard is not a node.** A Python `int` in traced code joins the guard set and produces a **new
-  compiled graph per distinct value** — but it does **not** split one compilation into more recipes,
-  because the partitioner never sees it ([§2.4](02-regions.md)'s warning, explicitly).
+### 8.8.1 A guard is not a node
+
+- **A Python `int` in traced code joins the guard set.** It can produce a new compiled graph, but it
+  does **not** split one compilation into more recipes, because the partitioner never sees it
+  ([§2.4](02-regions.md)'s warning, explicitly).
 - So the two counts move for different reasons: **recipes within one graph** are set by placement
   boundaries; **graphs per region** are set by the guard set (shape, dtype, int, and the container
   structure of the inputs).
 - The same function called at a new shape or with a new traced `int` is a **new frame** → new graphs →
   new recipes, and each new recipe is a new program image on the host and a new ring slot to wait for
-  (§8.5). (**MEASURED** in the sense that the `.recipe` count tracks it — notes §7.)
+  (§8.5).
 
-The arithmetic that makes a large count *expected* rather than a bug — O(layers × constants ×
-buckets) — is [§1.4.3](01-basics.md). This chapter adds only what the count costs: **host memory and
-disk per live recipe, nothing per recipe on the device.**
+### 8.8.2 There *is* an escape hatch, and it is a 0-d tensor
+
+Pass the varying integer as a **0-d tensor** and the value stops being part of the program. Measured —
+one compiled function, `f(t, k) = t + k`, `k` a 0-d `int64` tensor on the device, `n = 1…10`
+(**MEASURED**, §8.12's integer probe):
+
+| arm | dynamo graphs | recipes |
+|---|---|---|
+| `k` a 0-d `int64` tensor, `n = 1…10` | **1** | **1** |
+
+The graph signature is `forward(self, L_x_, L_k_: "i64[][]hpu:0")` and the body is `add = l_x_ + l_k_` —
+**the value is an operand, not a literal**. The recipe is written once and never rewritten; the first
+call is 142 ms and every later value costs 0.3–0.5 ms.
+
+**It crosses a process boundary as data.** With `delete_on_init=false` and a warm cache directory
+(**MEASURED**):
+
+| process | call | recipes after |
+|---|---|---|
+| 1: `n = 1` | 151.3 ms | **1** |
+| 2 (cold process): `n = 42`, a value never seen | **83.7 ms** | **1** — **0 new recipes** |
+
+That 83.7 ms is a real disk hit at an unseen value: nothing was compiled, the recipe was deserialised.
+A Python int at the same point does not behave this way (§8.8.3).
+
+**What it costs.** One extra `cast` node when the 0-d tensor is `int64` and the arithmetic is `f32` — an
+on-device cast, not a host sync. Both `shape ()` and `shape (1,)` are accepted; there is no rank-≥1
+requirement.
+
+### 8.8.3 A Python `int` costs **two** recipes on the default path — or one per value if you force static
+
+This is the part the manual's summary gets wrong twice, so both halves are measured (**MEASURED**,
+§8.12's integer probe; torch 2.13 / bridge 1.24.2):
+
+| arm | values | recipes |
+|---|---|---|
+| `k` a Python int, default (`dynamic=None`) | 1, 2, 3 | **2** |
+| `k` a Python int, default (`dynamic=None`) | 1…10 | **2** — flat |
+| `k` a Python int, `dynamic=True` | 1, 2, 3 | **2** |
+| `k` a Python int, **`dynamic=False`** | 1, 2, 3 | **3** — one per value |
+| `k` a Python int, `specialize_int=True` | 1, 2, 3 | **3** — one per value |
+
+**The mechanism, from the graph dump.** The **first** value is baked as a constant —
+`def forward(self, L_x_)` with `add = l_x_ + 1`. The **second** distinct value fails the guard and
+recompiles to a graph that takes the int as a **symbolic input**:
+
+```
+def forward(self, L_x_: "f32[1024][1]hpu:0", L_k_: "Sym(s16)")
+    add: "f32[1024][1]hpu:0" = l_x_ + l_k_
+```
+
+That second graph then serves every later value, which is why the count is **flat at two** from the
+second value onward. Within a process a Python int is therefore bounded at two recipes — **not** one per
+value.
+
+**But forcing static compilation restores one-per-value.** With `dynamic=False` — which is what this
+manual tells you to use for a reproducible measurement — `assume_static_by_default` is set, every
+distinct int is specialised, and three values give three recipes (`specialize_int=True` is the same arm).
+**If you benchmark with `dynamic=False`, budget one program per distinct integer.**
+
+**The unbounded case is a cold process.** The two-recipe bound is *per process*. Process 1 at `n=1`
+produces one recipe; a process 2 that meets `n=42` produces a **new** one and pays a full 186 ms
+compile, because a cold process re-bakes whatever value it meets first (measured, same cache directory
+as §8.8.2's table). So *value-per-process* — a server that restarts, a harness that forks per case —
+grows the cache without bound. That, and not the in-process count, is the scaling problem.
+
+### 8.8.4 Structural ints cannot be escaped
+
+Where the integer decides the **shape**, a tensor cannot help — the value *is* the graph. `x[:n] * 2`
+with a Python int (**MEASURED**, §8.12's integer probe):
+
+| values | dynamo graphs | recipes |
+|---|---|---|
+| `n = 1, 2, 3` | 2 | **3** |
+| `n = 1…7` | 2 | **4** |
+
+Growth with distinct values is real, and it is **not** one-per-value — in this run `n = 4, 5, 6` reused
+`n = 3`'s recipe and only `n = 7` added one. That is shape **bucketing** on the sliced extent, and the
+bucketing rule is **UNKNOWN** (UNKNOWN #9). `x.reshape(n, -1)` behaves the same way. The practical
+reading: for a *data* integer — an offset or a count that changes no shape — a 0-d tensor removes the
+program count entirely; for a *structural* integer it does not, and the only lever left is to make the
+value set small and explicit.
+
+### 8.8.5 What the counts cost
+
+The arithmetic that makes a large count *expected* rather than a bug — O(layers × constants × buckets)
+— is [§1.4.3](01-basics.md). This chapter adds only what the count costs: **host memory and disk per
+live recipe, nothing per recipe on the device** (§8.6.2).
 
 ---
 
