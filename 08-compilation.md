@@ -539,8 +539,9 @@ habana device path, the Synapse library, and one `GC_KERNEL_PATH` entry. The mul
 ERROR … Path is not a regular file`, exit 134 — so that branch is unreachable in practice.)
 
 **Measured: three arms, one filename.** One graph (`x * 2.0 + 1.0`, `fullgraph=True`, `dynamic=False`), a
-**fresh cache directory per arm**, `PT_HPU_RECIPE_CACHE_CONFIG=<dir>,true,1024,false`. All three arms
-produced the **identical** file:
+**fresh cache directory per arm**, `PT_HPU_RECIPE_CACHE_CONFIG=<dir>,true,1024,false` — `true` is
+`delete_on_init`, which is harmless *here* because each arm starts empty anyway (it is not harmless for
+a cross-run test; §8.7.4). All three arms produced the **identical** file:
 
 | arm | `GC_KERNEL_PATH` | environment | recipe file |
 |---|---|---|---|
@@ -555,10 +556,11 @@ filename in §8.8's measurements. A constant is exactly what a hash of "0, 0, 0"
 **The consequence is the opposite of the obvious one.** The cache cannot see a kernel edit or a
 configuration change, so:
 
-1. **Editing a TPC kernel and rebuilding will serve the stale recipe.** The name is unchanged, the file
-   is there, the graph is the same graph. When you iterate on a kernel, **clear the cache directory** —
-   or set the config's second field, `delete_on_init`, to `true` — as part of the rebuild. The hazard is
-   **INFERRED**, not measured end to end: see the honest limit below.
+1. **Editing a TPC kernel and rebuilding will be served the stale recipe wherever the cache hits** —
+   and it does hit (§8.8.2 measures it). The name is unchanged, the file is there, the graph is the
+   same graph. When you iterate on a kernel, **clear the cache directory** — or set the config's second
+   field, `delete_on_init`, to `true` — as part of the rebuild. The key and the hit are MEASURED; the
+   byte substitution after a rebuild is INFERRED (third tag, below).
 2. **A cache directory shared across two configurations silently mixes recipes** built under different
    compiler flags: two builds of one kernel library, one directory, one key.
 3. **Maintain your own key: one cache directory per *(build, configuration)* pair.** Nothing in the
@@ -572,21 +574,31 @@ attributes — and the driver version string. A **Synapse or driver upgrade** ch
 **kernel-library rebuild does not**. Two different things are called "the build", and only one of them
 is in the key.
 
-**The honest limit on the stale-serving half — it is INFERRED.** In this bridge configuration the disk
-cache did not *hit* even on four identical repeated runs: each run recompiled (first call 218–230 ms,
-against ~140 ms cold and ~77 ms with a recipe already on disk) and rewrote the `.recipe`, whose size
-varied between runs (3366 B, 3144 B). So the hazard is a property of a cache that *does* hit, and
-[`recipe-launch-notes.md`](notes/recipe-launch-notes.md) §4 records one that does ("0 new recipes on a
-same-config reboot"). What is unconditional, and what this section establishes, is that **the key cannot
-change when the kernel library or a hashed environment variable changes**. Whether a given configuration
-then serves the old bytes is the disk cache's business — and its key contains nothing else. **UNKNOWN:**
-why it did not hit here; a per-process component inside the serialised `RecipeArgumentSpec` is the
-obvious suspect (UNKNOWN #8).
+**Three claims, three tags — and the third is the one to run.**
+
+- **The key is constant — MEASURED.** The three arms above, and `_a16fb581eee_` in every filename this
+  project has produced.
+- **The cache hits — MEASURED.** With `delete_on_init=false`, a second process at an unseen integer
+  value created **0 new recipes** and took an 83.7 ms disk hit (§8.8.2);
+  [`recipe-launch-notes.md`](notes/recipe-launch-notes.md) §4 records the same on a same-config reboot.
+- **A rebuilt kernel is then served the old bytes — INFERRED.** The key is constant and the cache hits,
+  but nobody has rebuilt a kernel and inspected which recipe came back. That is UNKNOWN #8, and it is
+  one experiment away.
+
+**The instrument that hid this was ours.** The experiment that first concluded "the disk cache does not
+hit" ran `PT_HPU_RECIPE_CACHE_CONFIG=<dir>,true,1024,false` — and the second field is `delete_on_init`,
+which wipes the directory at **every** process start (§8.7.4). **A cache wiped at init cannot hit**, so
+that experiment could not have observed a hit whatever the truth was: it recompiled and rewrote the
+`.recipe` on all four runs (sizes 3366 B, 3144 B) because it was told to. An instrument that overwrites
+its own evidence. The same `true` is harmless in the three arms above only because each arm starts from
+a fresh directory; the cross-process arm in §8.8.2 needs `false`.
 
 ### 8.7.4 Two more traps in the same configuration string
 
 1. **The second field is `delete_recipe_cache_on_init`, and the third is MB — not entries**
-   (`bridge_config.py:71-86`: `path, delete_on_init, max_size_MB, allow_NFS`). With `true`, **every
+   (`bridge_config.py:71-86`: `path, delete_on_init, max_size_MB, allow_NFS`; the gcfg default is
+   `",false,1024,false"` at `scripts/env_flags.yaml:96-97`, so with no path there is no disk cache at
+   all). With `true`, **every
    process wipes the directory at init**, so `.recipe` counts are destroyed as evidence and
    cross-process reuse cannot be measured at all. Per-arm counts taken with `true` are fine for
    *within-process* counting and invalid for anything cross-process. The fourth field, NFS, makes the
@@ -594,10 +606,10 @@ obvious suspect (UNKNOWN #8).
 2. **The recipe filename does not determine the bytes.** The same graph compiled into two fresh cache
    directories produced the same filename at the same size — 26,270 B — and **different md5s**
    (`1ca32f92…` vs `a76dd872…`) (**MEASURED**: `md5sum` over the two `.recipe` files; reproduce with two
-   runs of §8.13's `ints.py`). The name keys graph **structure**, not content. Sharing a directory was
-   measured safe for the integer case — the 0-d operand is an input *slot* bound at launch (§8.8.2) —
-   but "same filename" is not "same recipe", and §8.7.3's whole hazard is that the name is the only
-   thing the cache checks.
+   runs of the `ints.py` listing in §8.13). The name keys graph **structure**, not content. Sharing a
+   directory was measured safe for the integer case — the 0-d operand is an input *slot* bound at launch
+   (§8.8.2) — but "same filename" is not "same recipe", and §8.7.3's whole hazard is that the name is
+   the only thing the cache checks.
 
 ---
 
@@ -624,7 +636,7 @@ the manual's own summary has been wrong twice.
 
 Pass the varying integer as a **0-d tensor** and the value stops being part of the program. Measured —
 one compiled function, `f(t, k) = t + k`, `k` a 0-d `int64` tensor on the device, `n = 1…10`
-(**MEASURED**, §8.13's integer probe):
+(**MEASURED**, the integer probe in §8.13):
 
 | arm | dynamo graphs | recipes |
 |---|---|---|
@@ -652,7 +664,7 @@ accepted; there is no rank-≥1 requirement.
 ### 8.8.3 A Python `int` costs **two** recipes on the default path — or one per value if you force static
 
 This is the part the manual's summary gets wrong twice, so both halves are measured (**MEASURED**,
-§8.13's integer probe; torch 2.13 / bridge 1.24.2):
+the integer probe in §8.13; torch 2.13 / bridge 1.24.2):
 
 | arm | values | recipes |
 |---|---|---|
@@ -689,7 +701,7 @@ grows the cache without bound. That, and not the in-process count, is the scalin
 ### 8.8.4 Structural ints cannot be escaped
 
 Where the integer decides the **shape**, a tensor cannot help — the value *is* the graph. `x[:n] * 2`
-with a Python int (**MEASURED**, §8.13's integer probe):
+with a Python int (**MEASURED**, the integer probe in §8.13):
 
 | values | dynamo graphs | recipes |
 |---|---|---|
@@ -720,7 +732,7 @@ limit is not, and we have never measured the bottom layer at all.
 | constraint | layer | status |
 |---|---|---|
 | traced frames are guarded; a break splits a frame into graphs | **dynamo** | **MEASURED** — §8.2's table, and `TORCH_LOGS=graph_code` prints each graph as it is produced |
-| each op still compiles to its own one-node recipe in eager mode | **dynamo → bridge** | **MEASURED** — 768 TPC kernel events for one eager `y.copy_(x)` ([§2.4](02-regions.md)) |
+| each op still compiles to its own one-node recipe in eager mode | **bridge** | **source read** — `graph::compile()` always calls `synGraphCompile` (`backend/synapse_helpers/graph.cpp:646`), and `eager_mode_` only chooses `synGraphCreateEager` over `synGraphCreate` (`:140-146`) and otherwise touches the recipe name (`:643`) and bookkeeping (`:685`). **MEASURED**: 768 TPC kernel events for one eager `y.copy_(x)` ([§2.4](02-regions.md)) |
 | the default is **static** compilation: a new shape is a new recipe | **bridge** | **MEASURED** at the recipe level — §8.2's table, notes §7 |
 | "`dynamic=True` is turned into static compilation" | **bridge** | **ASSUMED (vendor)** — the standard account, not something we instrumented ([§1.4.1](01-basics.md)) |
 | the bridge **has** a dynamic path — this is a *default*, not a capability limit | **bridge** | **source read** — `get_dynamic_config_value()` reads dynamo's `assume_static_by_default` (`passes.py:543-556`, the read at `:554`) and the DS/SIF path is gated on `optim_output_sif_ds` (`passes.py:2260,2282`); `force_static_compile` short-circuits both (`:523,2278`). We have never seen it produce a dynamic recipe on the default path |
@@ -776,8 +788,11 @@ expert kernel at **29 ms eager against 0.356 ms compiled** ([§6.6.1](06-fast-it
 number is not a lower bound on the compiled number and cannot stand in for it. **And eager is not
 cheaper for anything this chapter measures:** one eager op is one one-node recipe, so N ops is N
 recipes, N submissions and N program downloads (§8.5) — the limit case of the residency story, not an
-escape from it. (**MEASURED**, [§2.4](02-regions.md): one eager `y.copy_(x)` produced **768** TPC kernel
-events and zero DMA events.)
+escape from it. **Dynamo is not involved: in eager mode there is no traced frame to group, so the
+compilation is the bridge's** — `graph::compile()` always calls `synGraphCompile`
+(`backend/synapse_helpers/graph.cpp:646`), and `eager_mode_` only swaps `synGraphCreateEager` for
+`synGraphCreate` (`:140-146`) (**source read**) — and the count bears it out: one eager `y.copy_(x)`
+produced **768** TPC kernel events and zero DMA events (**MEASURED**, [§2.4](02-regions.md)).
 
 **Why lazy is legacy rather than deprecated:** the evidence proves **not the default**, not a vendor
 deprecation. `PT_HPU_LAZY_MODE` is declared `default: 0` (**source read**,
@@ -840,7 +855,7 @@ Stated rather than omitted, per the manual's convention. Each entry says what wo
 | 5 | **Steady-state launch cost for a multi-MB program** | **UNKNOWN** — every measured program is small enough that the fixed path dominates (103.6 ms first call, ~0.5–0.7 ms steady state, size-independent at 1 K vs 1 M elements) | one probe with a program large enough for PDMA bytes to show |
 | 6 | **Whether MME descriptors have their own device allocation** | **INFERRED** that they ride the ECB/dynamic-blob path into ARC HBM: the only program-data registrations in 1.16 are TPC kernels, the TPC printf buffer and H2D/static tensors | a 1.24.2 source read, or a launch of an MME-heavy graph with the device total sampled before and after |
 | 7 | **Whether `DeviceGaudi::releaseRecipeMemory` is reached at all** | **UNKNOWN** — the 1.16 tree has its definition and no caller; either it is reached through an interface not in that tree, or the Gaudi1 path leaks per-recipe memory until device teardown | a 1.24.2 source read, or a compile/launch/destroy loop watching the device total |
-| 8 | **Why the disk recipe cache did not hit across four identical runs** (§8.7.3) | **UNKNOWN** — four runs recompiled and rewrote the `.recipe` (sizes 3366 B, 3144 B); a per-process field inside the serialised `RecipeArgumentSpec` is the obvious suspect. This is the difference between "the stale-recipe hazard is live" and "the disk cache never serves anything on this configuration" | one run with the serialised spec compared byte for byte, or a `strings` diff of two runs' `.recipe` files |
+| 8 | **Whether a rebuilt kernel is served the *old* bytes** (§8.7.3) | **INFERRED** — the key is provably constant and the cache provably hits (§8.8.2), but nobody has rebuilt a kernel and inspected which recipe came back. The earlier "the cache does not hit" reading was an artifact of `delete_on_init=true`, which wipes the directory at every process start (§8.7.4) | rebuild the kernel with `delete_on_init=false`, launch the same graph, and inspect which `.recipe` is used and whether its bytes match the pre-rebuild file |
 | 9 | **The bucketing rule for a structural `int`** (§8.8.4) | **UNKNOWN** — `x[:n] * 2` gave 3 recipes for `n = 1,2,3` and 4 for `n = 1…7`, with `n = 4,5,6` reusing `n = 3`; growth is real and not one-per-value | a sweep over a wide contiguous value range, recording which recipe each value lands on |
 | 10 | **Whether a dynamic recipe is re-tiled, or only re-parameterised at the compiled maximum** (§8.9) | **UNKNOWN** — and it is the question that decides usability: a 64×64×64 GEMM run at a 512×512×512 tiling would be exact and slow | per-size efficiency of a dynamic recipe against static-per-shape |
 | 11 | **Whether an *unbounded* dynamic maximum is possible** | **expected no** — the compiler must size descriptors, the index space, data chunks and the workspace for the largest shape (8448 B dynamic against 256 B static) | a source read of the descriptor sizing, or a probe that omits `max` |
@@ -989,7 +1004,7 @@ whose source is another chapter are cross-references, not restatements.
 | 8 recipes compiled+launched → 0.0 MiB device change | MEASURED — notes §2b |
 | 24 recipes: device 96889.7 → 96889.7 MiB; host RSS 2104.6 → 2215.2 MiB (+110.6); ~4.6 MiB/recipe | MEASURED — notes §2c |
 | disk 0 → 0.4 MiB / 9 files | MEASURED — notes §2c |
-| `PT_HPU_RECIPE_CACHE_CONFIG` fields `path, delete_on_init, max_size_MB, allow_NFS`; default 1024 | source read — `bridge_config.py:71-86`; notes §2c |
+| `PT_HPU_RECIPE_CACHE_CONFIG` fields `path, delete_on_init, max_size_MB, allow_NFS`; default `",false,1024,false"` — an empty path, so the disk cache is **off** until you name a directory | source read — `bridge_config.py:71-86` (the four fields); `scripts/env_flags.yaml:96-97` (the default; `1024` at `:114` is a doc-comment example, not the default) |
 | card HBM 98304 MiB (driver) / 97376 MiB = 95.09 GiB (Synapse) / 96895.2 MiB = 94.62 GiB (torch) / 768 MiB used at idle | MEASURED — notes §2b, re-run for this chapter with `hl-smi` and `torch.hpu.mem_get_info()` on 2026-11-13 |
 | `torch.hpu.mem_get_info()` returns **bytes** (101601996800 = 96895.2 MiB) | MEASURED — re-run for this chapter |
 | idle baseline ~768 MiB | MEASURED — `01-basics.md:394` |
@@ -1007,6 +1022,7 @@ whose source is another chapter are cross-references, not restatements.
 | ~50 ms dynamo + ~52 ms bridge ≈ 100 ms per new recipe; ~28 hours for a million | MEASURED — notes §2c |
 | eager 29 ms vs compiled 0.356 ms = **81×** | MEASURED — [§6.6.1](06-fast-iteration.md) |
 | one eager `y.copy_(x)` → 768 TPC kernel events, zero DMA events | MEASURED — `02-regions.md:1198` |
+| eager mode still compiles each op: `synGraphCompile` is unconditional; `eager_mode_` only picks `synGraphCreateEager` and the recipe name | source read — `backend/synapse_helpers/graph.cpp:140-146,643,646,685` |
 | `HABANA_PGM_LRU_MAX` 100 000 eager / 30 000 lazy | source read — notes §1 (bridge) |
 | host threshold: gcfg default 0 disables the check; the bridge substitutes 90 at the first dynamic bucket | source read — `scripts/env_flags.yaml:428-430`, `misc_utils.cpp:32-34`, `hpu_recipe_cache.h:130` |
 | eviction in 512 MiB chunks (`512LL * 1024 * 1024`) | source read — `hpu_habana_launch_op_pt.cpp:4211` |
@@ -1038,12 +1054,12 @@ whose source is another chapter are cross-references, not restatements.
 | `ENABLE_WIDE_BUCKET` + experimental flags writes 138 elements at N=1 | MEASURED — notes §9.4 |
 | workspace 8448 B dynamic vs 256 B static | MEASURED — notes §9.4 |
 | a user-section intermediate → `Failed to perform DSD SIF patching` / status 35 | MEASURED — notes §9.3 |
-| 0-d `int64` tensor, `n = 1…10`: 1 graph, 1 recipe; signature `L_k_: "i64[][]hpu:0"`; 142 ms first, 0.3–0.5 ms after | MEASURED — §8.13's `ints.py` |
-| 0-d tensor across processes: 151.3 ms / 1 recipe, then 83.7 ms / **0 new recipes** at `n = 42` | MEASURED — §8.13's `ints.py` |
-| Python int: 2 recipes at `dynamic=None` (flat to 10 values) and at `dynamic=True`; 3 for `dynamic=False` and for `specialize_int=True` | MEASURED — §8.13's `ints.py` |
+| 0-d `int64` tensor, `n = 1…10`: 1 graph, 1 recipe; signature `L_k_: "i64[][]hpu:0"`; 142 ms first, 0.3–0.5 ms after | MEASURED — the `ints.py` listing in §8.13 |
+| 0-d tensor across processes: 151.3 ms / 1 recipe, then 83.7 ms / **0 new recipes** at `n = 42` | MEASURED — the `ints.py` listing in §8.13 |
+| Python int: 2 recipes at `dynamic=None` (flat to 10 values) and at `dynamic=True`; 3 for `dynamic=False` and for `specialize_int=True` | MEASURED — the `ints.py` listing in §8.13 |
 | Python-int mechanism: first graph `add = l_x_ + 1`, second `L_k_: "Sym(s16)"` | MEASURED — `TORCH_LOGS=graph_code` |
-| cold process at `n = 42` after a Python int: 186 ms, 2 recipes | MEASURED — §8.13's `ints.py` |
-| structural int `x[:n] * 2`: 3 recipes for `n = 1,2,3`, 4 for `n = 1…7` | MEASURED — §8.13's `ints.py` |
+| cold process at `n = 42` after a Python int: 186 ms, 2 recipes | MEASURED — the `ints.py` listing in §8.13 |
+| structural int `x[:n] * 2`: 3 recipes for `n = 1,2,3`, 4 for `n = 1…7` | MEASURED — the `ints.py` listing in §8.13 |
 | "one recipe per maximal contiguous run of `hpu_cluster` nodes"; 24/24 arms | MEASURED — [§2.4](02-regions.md) (cross-referenced, not restated) |
 | specialisation count as a first-class metric; thrash signature | [§2.5.3](02-regions.md) (cross-referenced) |
 | O(layers × constants × buckets) is expected | [§1.4.3](01-basics.md) (cross-referenced) |

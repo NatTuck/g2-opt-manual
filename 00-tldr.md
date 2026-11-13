@@ -43,17 +43,17 @@ to watch for" pattern below. The citations and the layer analysis are in *ch 8*.
    request is forced to static compilation; every new shape is a new program. Design a fixed shape set.
    → *ch 1 §1.4* — and read the layer: a **bridge** policy (**ASSUMED (vendor)** as a mechanism,
    MEASURED as a recipe count), not a device limit. At the **Synapse** level a recipe can be declared
-   size-parametric (`DATA_TENSOR_DYNAMIC`, exact M/N/K down to 1, `synStatus 35` outside the declared
-   bound); nothing below Synapse is known — **hardware UNKNOWN**.
+   size-parametric (`DATA_TENSOR_DYNAMIC` with a declared bound: exact inside it, rejected outside);
+   nothing below Synapse is known — **hardware UNKNOWN**. → *ch 8 §8.9*.
    [Residency note](notes/recipe-residency-and-memory-budget.md) §9.
-2. **Integers: a Python `int` is *two* recipes per process, and an escape hatch exists.** A Python
-   `int` in traced code joins the guard set — the first value is baked as a constant, the second
-   recompiles to a graph that takes the int as a symbolic input and serves every later value, so the
-   count is flat at **two** (it is one per value if you force `dynamic=False`, which our own
-   benchmarking advice does). The unbounded case is a **cold process**, which re-bakes whatever value it
-   meets first. A **0-d tensor** removes the program count entirely: one recipe across values *and*
-   across processes. Structural ints (`x[:n]`) cannot be escaped and grow with distinct values.
-   → *ch 1 §1.4, ch 8 §8.8*
+2. **Integers: a Python `int` joins the guard set — and an escape hatch exists.** The first value is
+   baked as a constant; the second distinct value recompiles to a graph that takes the int as a symbolic
+   input and serves every later value, so the count stops growing there. Force `dynamic=False` (which
+   our own benchmarking advice does) and every value is specialised again, so budget a program per
+   distinct integer. The unbounded case is a **cold process**, which re-bakes whatever value it meets
+   first. A **0-d tensor** removes the program count entirely: the value becomes an input, not a
+   literal, across processes too. Structural ints (`x[:n]`) cannot be escaped and grow with distinct
+   values. → *ch 1 §1.4, ch 8 §8.8*
 3. **The graph count multiplies: O(layers × constants × buckets) by construction, not by bug.** Check a
    large count against this arithmetic before treating it as a defect; a coalesced region spanning G
    layers still needs G graphs if it guards on per-layer ints. → *ch 1 §1.4, ch 2 §2.5*
